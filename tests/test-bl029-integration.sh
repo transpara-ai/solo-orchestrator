@@ -15,7 +15,7 @@ fail_() { echo "  [FAIL] $1 — $2"; FAILED=$((FAILED + 1)); }
 TMP=$(mktemp -d); PROJ="$TMP/p"
 ( cd /tmp && bash "$REPO_ROOT/init.sh" --non-interactive \
     --project x --project-dir "$PROJ" --no-remote-creation \
-    --platform web --language javascript --track light --deployment personal \
+    --platform web --language typescript --track light --deployment personal \
     >/dev/null 2>&1 )
 
 # T1: project has bypass-detector wired (PostToolUse + Stop).
@@ -26,11 +26,22 @@ else
   fail_ "T1" "wiring missing"
 fi
 
+# T1b (BL-035 MERGE — folded from retired tests/test-bypass-audit-schema.sh):
+# the init-written ledger's first row (.[0]) satisfies the minimum schema
+# contract (type/actor/timestamp/enforcement_level_at_event). Must run
+# BEFORE T2 resets bypass-audit.json to [] below, or the row is gone.
+if jq -e '.[0] | (.type and .actor and .timestamp and .enforcement_level_at_event)' \
+   "$PROJ/.claude/bypass-audit.json" >/dev/null 2>&1; then
+  pass "T1b: init ledger .[0] has type/actor/timestamp/enforcement_level_at_event"
+else
+  fail_ "T1b" "init ledger .[0] malformed"
+fi
+
 # T2: simulate a Claude PostToolUse with bypass-shaped output → audit row.
 ( cd "$PROJ"
   echo "[]" > .claude/bypass-audit.json
   cat <<'EOF' | CLAUDE_PROJECT_DIR="$PROJ" bash scripts/hooks/bypass-detector.sh >/dev/null 2>&1
-{"hook_event_name":"PostToolUse","tool_input":{"command":"x"},"tool_result":{"output":"alternatively, run git commit --no-verify"}}
+{"hook_event_name":"PostToolUse","tool_input":{"command":"x"},"tool_response":{"output":"alternatively, run git commit --no-verify"}}
 EOF
 )
 rows=$(jq '[.[] | select(.type=="claude_bypass_proposal")] | length' "$PROJ/.claude/bypass-audit.json")

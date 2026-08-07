@@ -18,7 +18,34 @@ if [ ! -f "$FILE" ]; then
 fi
 
 # --- File-level check 1: unreplaced __FOO__ placeholders ---
-PLACEHOLDER_LINES=$(grep -n '__[A-Z][A-Z_]*__' "$FILE" || true)
+# Audit specs-plans-uat-bugs-verify-install-uat-quality-1: strip
+# HTML and JS comments before scanning so a populated template that
+# documents placeholders inside a `<!-- ... -->` or `// ...` block
+# (the canonical pattern for explaining the substitution scheme to
+# scenario authors) doesn't trigger false positives. Line numbers
+# are preserved by blanking comment payloads in place rather than
+# deleting the lines.
+STRIPPED=$(awk '
+  BEGIN { in_html = 0 }
+  {
+    line = $0
+    # Multi-line HTML comments: <!-- ... --> spanning lines.
+    if (in_html) {
+      idx = index(line, "-->")
+      if (idx > 0) { in_html = 0; line = substr(line, idx + 3) }
+      else { print ""; next }
+    }
+    while ((s = index(line, "<!--")) > 0) {
+      e = index(substr(line, s), "-->")
+      if (e > 0) { line = substr(line, 1, s - 1) substr(line, s + e + 2) }
+      else { line = substr(line, 1, s - 1); in_html = 1; break }
+    }
+    # JS / single-line comments anywhere on the line.
+    sub("//.*", "", line)
+    print line
+  }
+' "$FILE")
+PLACEHOLDER_LINES=$(printf '%s\n' "$STRIPPED" | grep -n '__[A-Z][A-Z_]*__' || true)
 if [ -n "$PLACEHOLDER_LINES" ]; then
   COUNT=$(echo "$PLACEHOLDER_LINES" | wc -l | tr -d ' ')
   echo "$PLACEHOLDER_LINES" | while IFS= read -r line; do
@@ -64,7 +91,7 @@ VIOLATIONS=0
 VIOLATION_LINES=""
 
 # --- File-level check 2: duplicate scenario ids ---
-DUP_IDS=$(echo "$SCENARIOS_JSON" | jq -r '[.[] | .id] | group_by(.) | map(select(length > 1) | .[0]) | .[]' 2>/dev/null || true)
+DUP_IDS=$(echo "$SCENARIOS_JSON" | jq -r '[.[] | .id] | group_by(.) | map(select(length > 1) | .[0]) | .[]' 2>/dev/null || true) # lint-counter-antipattern: allow jq emits a newline-delimited string of duplicate ids (or empty), tested via `[ -n "$DUP_IDS" ]` and then iterated line-by-line; value is never used in arithmetic comparison, so a multi-line capture is the intended shape
 if [ -n "$DUP_IDS" ]; then
   while IFS= read -r id; do
     [ -z "$id" ] && continue

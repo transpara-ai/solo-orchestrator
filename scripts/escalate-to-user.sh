@@ -49,17 +49,24 @@ done
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
 [ -d "$PROJECT_ROOT/.claude" ] || { echo "[FAIL] .claude/ not found at $PROJECT_ROOT" >&2; exit 1; }
 
-# Build options JSON array.
+# Audit findings code-escalate-pending-1 & -2: delegate sentinel write to
+# pending-approval.sh --offer so the leading-id schema check AND the
+# already-pending refusal happen in one place. Previously escalate wrote
+# the sentinel directly via jq, skipping both checks — letting Claude
+# clobber a live decision and ship --recommendation values that didn't
+# match any option's leading id.
+if ! ( cd "$PROJECT_ROOT" && bash "$SCRIPT_DIR/pending-approval.sh" --offer \
+         --question "$QUESTION" \
+         --recommendation "$RECOMMENDATION" \
+         --options "${OPTIONS[@]}" ); then
+  echo "[FAIL] escalate-to-user: pending-approval.sh --offer refused; aborting before audit-row write" >&2
+  exit 1
+fi
+
+# Build options JSON array (still needed for the audit row).
 OPT_JSON=$(printf '%s\n' "${OPTIONS[@]}" | jq -R . | jq -s .)
 
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-jq -n \
-  --arg q "$QUESTION" \
-  --argjson opts "$OPT_JSON" \
-  --arg rec "$RECOMMENDATION" \
-  --arg ts "$TS" \
-  '{question: $q, options: $opts, recommendation: $rec, offered_at: $ts}' \
-  > "$PROJECT_ROOT/.claude/pending-approval.json"
 
 # Audit row — type='escalation' per Fix #2.
 LEVEL=$(jq -r '.enforcement_level // "strict"' "$PROJECT_ROOT/.claude/manifest.json" 2>/dev/null || echo "strict")
@@ -80,6 +87,18 @@ ROW=$(jq -nc \
     user_response: "PENDING",
     final_outcome: "escalated"
   }')
-bypass_audit_append "$PROJECT_ROOT" "$ROW" || true
+# D1 fix (post-PR-A): propagate audit-log write failures instead of
+# swallowing them with `|| true` and then lying with '(and audit log)'.
+# The sentinel write succeeded (pending-approval.sh --offer above), so
+# the operator-facing decision surface is intact, but the governance
+# ledger missed the row. Exit non-zero with a clear stderr message so
+# the caller can decide whether to retry or roll back the sentinel.
+if ! bypass_audit_append "$PROJECT_ROOT" "$ROW"; then
+  echo "[FAIL] escalate-to-user: pending-approval.json was written but the bypass-audit row failed to land." >&2
+  echo "  Governance log is now out of sync with the sentinel — investigate before resolving." >&2
+  echo "  Sentinel:  $PROJECT_ROOT/.claude/pending-approval.json" >&2
+  echo "  Audit log: $PROJECT_ROOT/.claude/bypass-audit.json" >&2
+  exit 1
+fi
 
 echo "[OK] escalation written to .claude/pending-approval.json (and audit log)"

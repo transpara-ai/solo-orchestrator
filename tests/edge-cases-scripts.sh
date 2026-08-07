@@ -200,35 +200,72 @@ section "E12: resume.sh with empty/missing CLAUDE.md"
 E12_DIR="$TEST_DIR/e12-no-claude"
 create_test_project "$E12_DIR"
 rm -f "$E12_DIR/CLAUDE.md"
+# BL-202: resume.sh is now state-aware — at phase 0 with no PRODUCT_MANIFESTO.md
+# it prints the Section-13 first-message instead of the classic prompt. E12's
+# contract is the CLASSIC path's robustness to a missing/empty CLAUDE.md, so
+# the fixture gets a manifesto to be genuinely mid-flight; the assertions below
+# are unchanged.
+printf '# manifesto\n' > "$E12_DIR/PRODUCT_MANIFESTO.md"
 
 result=0
 output=$( cd "$E12_DIR" && bash "$E12_DIR/scripts/resume.sh" 2>&1 </dev/null ) || result=$?
 
-# resume.sh should handle missing CLAUDE.md gracefully (not crash)
-# It may still run but show "(not found in CLAUDE.md)" for fields
-if [ "$result" -eq 0 ]; then
-  pass "E12a: resume.sh exits cleanly with missing CLAUDE.md (exit 0)"
-else
-  # Even a non-zero exit is acceptable as long as it didn't crash with a bash error
-  if echo "$output" | grep -qE "unbound variable|syntax error|command not found"; then
-    fail "E12a: resume.sh crashed with bash error when CLAUDE.md missing"
-  else
-    pass "E12a: resume.sh exited non-zero but handled missing CLAUDE.md gracefully (exit $result)"
-  fi
+# BL-037 closure: pre-fix oracle had a three-way structure where the
+# catch-all `else pass` (line 216 pre-fix) accepted any non-zero exit
+# whose stderr lacked the four magic shell-error keywords. A regression
+# where resume.sh silently truncated its prompt output mid-stream still
+# PASSed. Pin the positive contract:
+#   (1) exit 0 (resume.sh has no required-input branch — missing
+#       CLAUDE.md falls through to "(not found in CLAUDE.md)" defaults).
+#   (2) Output contains the prompt template end marker
+#       "End of resume prompt" — proves the script reached the prompt's
+#       tail and did not early-exit silently mid-output.
+#   (3) Output contains "(not found in CLAUDE.md)" — proves the
+#       fallback path actually fired (defaults rendered into prompt).
+e12a_ok=1
+if [ "$result" -ne 0 ]; then
+  fail "E12a: resume.sh must exit 0 with missing CLAUDE.md (got exit $result)"
+  e12a_ok=0
+fi
+if ! echo "$output" | grep -qF "End of resume prompt"; then
+  fail "E12a: resume.sh prompt-template tail marker absent — script bailed mid-output"
+  e12a_ok=0
+fi
+if ! echo "$output" | grep -qF "(not found in CLAUDE.md)"; then
+  fail "E12a: resume.sh missing-CLAUDE fallback string '(not found in CLAUDE.md)' not emitted"
+  e12a_ok=0
+fi
+if [ "$e12a_ok" -eq 1 ]; then
+  pass "E12a: resume.sh exit=0, prompt tail emitted, and (not found in CLAUDE.md) fallback fired"
 fi
 
 # Test with empty CLAUDE.md
 E12B_DIR="$TEST_DIR/e12-empty-claude"
 create_test_project "$E12B_DIR"
+printf '# manifesto\n' > "$E12B_DIR/PRODUCT_MANIFESTO.md"   # BL-202: keep E12b on the classic path (see E12a note)
 : > "$E12B_DIR/CLAUDE.md"
 
 result=0
 output=$( cd "$E12B_DIR" && bash "$E12B_DIR/scripts/resume.sh" 2>&1 </dev/null ) || result=$?
 
-if echo "$output" | grep -qE "unbound variable|syntax error|command not found"; then
-  fail "E12b: resume.sh crashed with bash error on empty CLAUDE.md"
-else
-  pass "E12b: resume.sh handles empty CLAUDE.md without crashing"
+# BL-037 closure: empty CLAUDE.md exercises the same fallback as
+# missing CLAUDE.md (grep returns nothing → default placeholder).
+# Same positive contract as E12a.
+e12b_ok=1
+if [ "$result" -ne 0 ]; then
+  fail "E12b: resume.sh must exit 0 with empty CLAUDE.md (got exit $result)"
+  e12b_ok=0
+fi
+if ! echo "$output" | grep -qF "End of resume prompt"; then
+  fail "E12b: resume.sh prompt-template tail marker absent — script bailed mid-output"
+  e12b_ok=0
+fi
+if ! echo "$output" | grep -qF "(not found in CLAUDE.md)"; then
+  fail "E12b: resume.sh empty-CLAUDE fallback string '(not found in CLAUDE.md)' not emitted"
+  e12b_ok=0
+fi
+if [ "$e12b_ok" -eq 1 ]; then
+  pass "E12b: resume.sh exit=0, prompt tail emitted, and (not found in CLAUDE.md) fallback fired"
 fi
 
 
@@ -615,42 +652,96 @@ with open('$E21_DIR/.claude/intake-progress.json', 'w') as f:
     json.dump(data, f, indent=2)
 "
 
-  # The --resume flag calls run_script_mode which enters interactive prompts
-  # that hang on /dev/null input. Instead of running the full wizard, we
-  # verify the resume logic by testing load_progress directly: source the
-  # wizard functions and confirm LAST_SECTION and COMPLETED_SECTIONS are
-  # set correctly from the progress file.
+  # Audit closure (tests-edge-cases-9 / S3): the previous E21 was a
+  # tautology — it wrote last_section=2 into progress JSON and then
+  # asserted (in pure Python) that 2+1==3, never invoking the real
+  # intake-wizard.sh load_progress bash function. We now execute the
+  # actual function: extract load_progress from scripts/intake-wizard.sh
+  # via awk, define a print_warn stub for its single dependency, source
+  # it with PROGRESS_FILE pointed at our test JSON, and assert against
+  # the real shell variables (LAST_SECTION, COMPLETED_SECTIONS) the
+  # function sets. The --resume handler at intake-wizard.sh:1742-1750
+  # uses those same variables to compute next_section, so this directly
+  # exercises the code path the test name advertises.
   result=0
   output=$(
     cd "$E21_DIR"
-    # Directly test the resume logic using python3 to read the progress file
-    python3 -c "
-import json
-with open('$E21_DIR/.claude/intake-progress.json') as f:
-    data = json.load(f)
-last = data['last_section']
-completed = data['completed_sections']
-next_section = last + 1
-print(f'LAST_SECTION={last}')
-print(f'COMPLETED={completed}')
-print(f'NEXT_SECTION={next_section}')
-assert last == 2, f'Expected last_section=2, got {last}'
-assert completed == [1, 2], f'Expected [1,2], got {completed}'
-assert next_section == 3, f'Expected next=3, got {next_section}'
-print('RESUME_OK')
-" 2>&1
-  ) || result=$?
+    # Extract the load_progress function from the real wizard source.
+    extract_file=$(mktemp)
+    awk '/^load_progress\(\) \{/,/^\}/' "$REPO_DIR/scripts/intake-wizard.sh" > "$extract_file"
+    # Minimal print_warn stub (load_progress's only dependency).
+    print_warn() { echo "WARN: $1"; }
+    PROGRESS_FILE="$E21_DIR/.claude/intake-progress.json"
+    # shellcheck disable=SC1090
+    source "$extract_file"
+    rm -f "$extract_file"
+    # Drive the real function and emit its observable state.
+    if load_progress; then
+      next_section=$((LAST_SECTION + 1))
+      echo "LP_LAST_SECTION=$LAST_SECTION"
+      echo "LP_COMPLETED=[$COMPLETED_SECTIONS]"
+      echo "LP_NEXT_SECTION=$next_section"
+      echo "LP_PROJECT_NAME=$PROJECT_NAME"
+      [ "$LAST_SECTION" = "2" ] && [ "$next_section" = "3" ] \
+        && [[ "$COMPLETED_SECTIONS" == *1* ]] && [[ "$COMPLETED_SECTIONS" == *2* ]] \
+        && [ "$PROJECT_NAME" = "TestProject" ] \
+        && echo "RESUME_OK"
+    else
+      echo "LP_FAILED rc=$?"
+    fi
+  ) 2>&1 || result=$?
 
-  if echo "$output" | grep -q "RESUME_OK"; then
-    pass "E21: Resume logic correctly computes next_section=3 from last_section=2"
+  if echo "$output" | grep -q "^RESUME_OK$" \
+     && echo "$output" | grep -q "^LP_LAST_SECTION=2$" \
+     && echo "$output" | grep -q "^LP_NEXT_SECTION=3$"; then
+    pass "E21: load_progress (real bash function) sets LAST_SECTION=2 and next_section=3"
   else
-    fail "E21: Resume logic should compute section 3, got: $output"
+    fail "E21: load_progress should set LAST_SECTION=2/next=3, got: $output"
   fi
 
-  if echo "$output" | grep -q "NEXT_SECTION=3"; then
-    pass "E21: Progress file correctly reports sections 1,2 completed, next=3"
+  if echo "$output" | grep -qE "LP_COMPLETED=\[.*1.*2.*\]"; then
+    pass "E21: load_progress populates COMPLETED_SECTIONS with 1 and 2 from JSON"
   else
-    fail "E21: Progress file should report next section 3"
+    fail "E21: COMPLETED_SECTIONS should contain 1 and 2, got: $output"
+  fi
+
+  # Negative variant: malformed JSON should make load_progress fail
+  # (python3 inside the function raises) — proving the real bash
+  # function is what's running, not a python re-implementation.
+  E21B_DIR="$TEST_DIR/e21-bad-json"
+  create_test_project "$E21B_DIR"
+  echo '{NOT VALID JSON' > "$E21B_DIR/.claude/intake-progress.json"
+
+  result=0
+  output=$(
+    set +e  # we WANT to observe load_progress's failure exit code
+    extract_file=$(mktemp)
+    awk '/^load_progress\(\) \{/,/^\}/' "$REPO_DIR/scripts/intake-wizard.sh" > "$extract_file"
+    print_warn() { echo "WARN: $1"; }
+    PROGRESS_FILE="$E21B_DIR/.claude/intake-progress.json"
+    LAST_SECTION=0
+    COMPLETED_SECTIONS=""
+    # shellcheck disable=SC1090
+    source "$extract_file"
+    rm -f "$extract_file"
+    load_progress 2>&1
+    rc=$?
+    echo "LP_RC=$rc"
+    echo "LP_LAST_SECTION=$LAST_SECTION"
+  ) || result=$?
+
+  # On malformed JSON the python helper inside load_progress raises
+  # (json.JSONDecodeError) — visible in the captured stderr — and
+  # writes nothing to the tmpfile that gets sourced, so LAST_SECTION
+  # stays at its pre-call default (0). The function's trailing
+  # `rm -f` returns 0, so we can't rely on rc alone; we assert the
+  # real, observable side-effects (default state + python traceback)
+  # that prove the actual bash function ran, not a python re-impl.
+  if echo "$output" | grep -q "^LP_LAST_SECTION=0$" \
+     && echo "$output" | grep -qE "JSONDecodeError|Traceback"; then
+    pass "E21: malformed progress JSON exercises real load_progress (LAST_SECTION stays 0, python raises)"
+  else
+    fail "E21: malformed JSON should leave LAST_SECTION=0 with python traceback, got: $output"
   fi
 else
   skip "E21: python3 not available"
@@ -658,9 +749,21 @@ fi
 
 
 # ================================================================
-# E22: check-versions.sh with no network (offline mode)
+# E22: check-versions.sh under stubbed-offline network
 # ================================================================
-section "E22: check-versions.sh offline (no network)"
+# Audit closure (tests-edge-cases-10 / S3): the previous E22 advertised
+# "offline (no network)" but its setup comment admitted it could not
+# disable network and instead relied on a 7-way grep alternation
+# (version check|[OK]|installed|up to date|not installed|WARN|Summary)
+# that matched essentially any plausible output — a regression that
+# broke offline detection or per-tool reporting would still trip a
+# token and PASS. We now actually stub network at the PATH layer
+# (curl → exit 1) and tighten the success assertion to a conjunction:
+# the script must (a) print the canonical header, (b) emit the
+# "Network unavailable — latest version check skipped" marker from
+# check-versions.sh:294, AND (c) print the Summary footer with the
+# pass count. Any of those three breaking now fails the test.
+section "E22: check-versions.sh under stubbed-offline network"
 
 if command -v jq &>/dev/null; then
   E22_DIR="$TEST_DIR/e22-offline"
@@ -681,24 +784,52 @@ if command -v jq &>/dev/null; then
 }
 EOF
 
-  # The script checks network by pinging registry.npmjs.org.
-  # We simulate offline by pointing to a non-existent DNS.
-  # The script itself handles network unavailability gracefully.
-  # We test by running it with a very short timeout to an unreachable host.
-  # Since we can't truly disable network, we verify the script handles the
-  # "network unavailable" path by checking it doesn't crash.
+  # Stub network: prepend a temp bin to PATH with a curl that exits 1
+  # so check-versions.sh's network probe at line 291
+  # `(curl -s --max-time 3 "https://registry.npmjs.org" >/dev/null 2>&1)`
+  # observes a real failure and takes the offline branch.
+  E22_STUB_BIN="$TEST_DIR/e22-stub-bin"
+  mkdir -p "$E22_STUB_BIN"
+  cat > "$E22_STUB_BIN/curl" << 'EOF'
+#!/usr/bin/env bash
+# stub: simulate DNS/connect failure for E22 offline scenario
+exit 1
+EOF
+  chmod +x "$E22_STUB_BIN/curl"
 
   result=0
-  output=$( cd "$E22_DIR" && bash "$E22_DIR/scripts/check-versions.sh" 2>&1 </dev/null ) || result=$?
+  output=$(
+    cd "$E22_DIR"
+    PATH="$E22_STUB_BIN:$PATH" bash "$E22_DIR/scripts/check-versions.sh" 2>&1 </dev/null
+  ) || result=$?
 
-  # The script should report installed versions regardless of network
-  if echo "$output" | grep -qiE "version check|\[OK\]|installed|up to date|not installed|WARN|Summary"; then
-    pass "E22: check-versions.sh reports tool status"
+  # Real assertion 1: canonical header must be present (regression
+  # guard for the script's own banner / structural output).
+  if echo "$output" | grep -qE "Solo Orchestrator.*Version Check"; then
+    pass "E22: check-versions.sh prints canonical 'Version Check' header"
   else
-    fail "E22: check-versions.sh should report installed tool versions, got: $(echo "$output" | head -5)"
+    fail "E22: expected 'Version Check' header, got: $(echo "$output" | head -5)"
   fi
 
-  # The script should not crash with an unbound variable or syntax error
+  # Real assertion 2: with curl stubbed to fail, the script must take
+  # its offline branch and emit the explicit marker. This pins down
+  # the network-unavailability code path the section name claims.
+  if echo "$output" | grep -qE "Network unavailable.*latest version check skipped"; then
+    pass "E22: stubbed-offline run emits the 'Network unavailable' marker"
+  else
+    fail "E22: offline branch should emit 'Network unavailable', got: $(echo "$output" | head -10)"
+  fi
+
+  # Real assertion 3: the Summary footer must be present with the
+  # 'up to date' phrase from check-versions.sh:435. A regression that
+  # broke the loop or dropped the summary line would no longer pass.
+  if echo "$output" | grep -qE "── Summary ──" && echo "$output" | grep -qE "up to date"; then
+    pass "E22: check-versions.sh prints Summary footer with 'up to date' count"
+  else
+    fail "E22: expected Summary footer + 'up to date' count, got: $(echo "$output" | tail -10)"
+  fi
+
+  # Sanity guard retained: should not crash with bash errors.
   if echo "$output" | grep -qE "unbound variable|syntax error"; then
     fail "E22: check-versions.sh crashed with bash error"
   else
@@ -736,11 +867,17 @@ if command -v jq &>/dev/null; then
     fail "E23: resolve-tools.sh should fail with invalid JSON in tool-matrix"
   fi
 
-  if echo "$output" | grep -qiE "error|parse|invalid|fail"; then
-    pass "E23: Output indicates JSON parsing error"
+  # Audit closure (tests-edge-cases-11 / S3): the previous E23 had
+  # identical pass() calls in both branches of the error-string check,
+  # so a regression that silenced jq's error output would still PASS.
+  # The else-branch comment also misled — stderr IS captured into
+  # $output via `2>&1` on the bash invocation above, so any real jq
+  # error must surface here. We now require a jq-specific error
+  # signature and fail() when absent.
+  if echo "$output" | grep -qE "jq:|parse error|Invalid|invalid"; then
+    pass "E23: Output indicates jq parse error (signature present in captured stderr+stdout)"
   else
-    # jq typically outputs error messages to stderr which we captured
-    pass "E23: resolve-tools.sh failed (jq errors may be on stderr)"
+    fail "E23: expected jq-style error signature in output, got: $(echo "$output" | head -5)"
   fi
 else
   skip "E23: jq not available"
@@ -799,34 +936,79 @@ cat > "$E25_DIR/.claude/phase-state.json" << 'EOF'
 }
 EOF
 
-# Test validate.sh — should not crash
+# BL-037 closure: pre-fix oracle for E25a/b/c was a magic-keyword
+# negative oracle (`grep -qE "unbound variable|syntax error|command not
+# found"`) that PASSed on any output not matching those four strings —
+# including a silent early-bail before phase 99 was ever inspected.
+# Pin POSITIVE substrings that prove the script (a) actually read the
+# phase-state file, (b) recognized the bogus phase 99 value, and (c)
+# reached a known sub-section that depends on the phase value.
+
+# Test validate.sh — should not crash AND must echo the parsed phase 99.
 result=0
 output=$( cd "$E25_DIR" && bash "$E25_DIR/scripts/validate.sh" 2>&1 </dev/null ) || result=$?
 
+e25a_ok=1
 if echo "$output" | grep -qE "unbound variable|syntax error|command not found"; then
   fail "E25a: validate.sh crashed with bash error on phase 99"
-else
-  pass "E25a: validate.sh does not crash with current_phase=99"
+  e25a_ok=0
+fi
+# validate.sh:158 prints `[INFO] Project phase: <N> (source: phase-state.json)`
+# and earlier echoes `[OK] Phase state file found (current_phase: <N>)`.
+# Either is a positive proof that the script read the file and parsed
+# the value as 99.
+if ! echo "$output" | grep -qE "(current_phase:[[:space:]]*99|Project phase:[[:space:]]*99)"; then
+  fail "E25a: validate.sh did not echo parsed current_phase=99 (script did not reach phase-state inspection)"
+  e25a_ok=0
+fi
+if [ "$e25a_ok" -eq 1 ]; then
+  pass "E25a: validate.sh parsed and echoed current_phase=99 without bash error"
 fi
 
-# Test check-phase-gate.sh — should not crash
+# Test check-phase-gate.sh — should not crash AND must explicitly
+# reference current_phase=99 in at least one WARN about an unrecorded
+# gate (the script's behavior at phase >=1 echoes the parsed phase
+# back in `Phase N→M: current_phase is <N>` messages).
 result=0
 output=$( cd "$E25_DIR" && bash "$E25_DIR/scripts/check-phase-gate.sh" 2>&1 </dev/null ) || result=$?
 
+e25b_ok=1
 if echo "$output" | grep -qE "unbound variable|syntax error|command not found"; then
   fail "E25b: check-phase-gate.sh crashed with bash error on phase 99"
-else
-  pass "E25b: check-phase-gate.sh does not crash with current_phase=99"
+  e25b_ok=0
+fi
+# check-phase-gate.sh:158 prints `Current phase: <N>` and the
+# Phase 1→2/2→3/3→4 sub-checks each echo `current_phase is 99` when
+# the gate date is missing. Either path proves the script read 99 and
+# routed into the phase>=1 branch.
+if ! echo "$output" | grep -qE "(Current phase:[[:space:]]*99|current_phase is 99)"; then
+  fail "E25b: check-phase-gate.sh did not echo parsed phase 99 (script did not reach gate inspection)"
+  e25b_ok=0
+fi
+if [ "$e25b_ok" -eq 1 ]; then
+  pass "E25b: check-phase-gate.sh parsed phase=99 and routed into gate inspection without bash error"
 fi
 
-# Test resume.sh — should not crash
+# Test resume.sh — should exit 0 AND emit "**Phase:** 99" in the prompt
+# (proves the parsed phase reached the template substitution).
 result=0
 output=$( cd "$E25_DIR" && bash "$E25_DIR/scripts/resume.sh" 2>&1 </dev/null ) || result=$?
 
+e25c_ok=1
 if echo "$output" | grep -qE "unbound variable|syntax error|command not found"; then
   fail "E25c: resume.sh crashed with bash error on phase 99"
-else
-  pass "E25c: resume.sh does not crash with current_phase=99"
+  e25c_ok=0
+fi
+if [ "$result" -ne 0 ]; then
+  fail "E25c: resume.sh must exit 0 on phase 99 (graceful render); got exit $result"
+  e25c_ok=0
+fi
+if ! echo "$output" | grep -qE '\*\*Phase:\*\*[[:space:]]*99'; then
+  fail "E25c: resume.sh did not render '**Phase:** 99' in prompt — value did not reach template"
+  e25c_ok=0
+fi
+if [ "$e25c_ok" -eq 1 ]; then
+  pass "E25c: resume.sh exit=0 and rendered '**Phase:** 99' into the resume prompt"
 fi
 
 
@@ -837,136 +1019,257 @@ fi
 # ================================================================
 section "BL-009: UAT template quality + platform-aware authoring"
 
-_uat_run_init_copy_block() {
-  # Args: work-dir, platform
-  # Source helpers and execute just the UAT copy block of init.sh against the
-  # work dir. Extracting the subset keeps the test fast; full init.sh run
-  # would require mocking prerequisites and a full intake flow.
-  local work="$1" platform="$2"
-  (
-    cd "$work"
-    # shellcheck disable=SC1091
-    source "$REPO_DIR/scripts/lib/helpers.sh"
-    export SCRIPT_DIR="$REPO_DIR"
-    export PLATFORM="$platform"
-    mkdir -p tests/uat/templates tests/uat/sessions tests/uat/examples
-    cp "$SCRIPT_DIR/templates/uat/test-session-template.md"   tests/uat/templates/test-session-template.md
-    cp "$SCRIPT_DIR/templates/uat/test-session-template.html" tests/uat/templates/test-session-template.html
-    if [ "$PLATFORM" != "other" ] && \
-       [ -f "$SCRIPT_DIR/templates/uat/references/${PLATFORM}-pre-flight.html" ] && \
-       [ -f "$SCRIPT_DIR/templates/uat/references/${PLATFORM}-scenario.json" ]; then
-      cp "$SCRIPT_DIR/templates/uat/references/${PLATFORM}-pre-flight.html" \
-         tests/uat/examples/pre-flight-reference.html
-      cp "$SCRIPT_DIR/templates/uat/references/${PLATFORM}-scenario.json" \
-         tests/uat/examples/scenario-reference.json
-    fi
-  )
+# audit tests-edge-cases-22 / tests-edge-cases-23 (closure):
+# Pre-fix this section called _uat_run_init_copy_block, an in-test
+# duplicate of init.sh's UAT copy block. The shadow helper meant E26-E32
+# never exercised init.sh / upgrade-project.sh — if init.sh deleted its
+# entire UAT copy block, every E26-E32 case still passed. Verified RED
+# on origin/main by removing init.sh:1187-1207 — all 7 cases still
+# returned [PASS].
+#
+# The rewrite below drives the real init.sh --non-interactive code path
+# (E26-E30) and the real scripts/upgrade-project.sh UAT migration block
+# (E31, E32). That removes the shadow code and gives the BL-009 spec
+# real regression coverage: deleting init.sh's copy block or breaking
+# upgrade-project.sh's UAT migration now flips E26-E32 to FAIL.
+
+# Helper: run real init.sh --non-interactive for the given platform into
+# the supplied --project-dir. Uses --no-remote-creation so the test never
+# touches a real GitHub/GitLab/Bitbucket account. Captures stderr on
+# failure so the diagnostic survives the assertion below.
+#
+# Note: init.sh's "Proceed with this plan?" prompt only fires when a tool
+# in the install plan is missing on the test host (e.g. mobile platform
+# needs Android Studio). With closed stdin and `set -e`, the `read -rp`
+# at init.sh:736 would EOF and abort. We pipe a stream of "Y" answers so
+# the plan proceeds regardless of host state — this isolates the test
+# from the test host's tool inventory.
+_uat_real_init() {
+  local work="$1" platform="$2" project="$3"
+  local logfile="$work/init-${platform}.log"
+  # init.sh's Pass-2 platform×language validator (init.sh:3447) walks
+  # templates/pipelines/ci/github/*.yml and reads each file's
+  # `# solo-orchestrator: platforms=` marker. Only `other.yml` lists
+  # `other` in its marker, so `--platform other` must pair with
+  # `--language other`; `typescript.yml` (web/desktop/mobile/mcp_server)
+  # is correct for every other platform we exercise here. Without this
+  # gate, E30 trips Pass-2 with rc=1 before the UAT branch ever runs
+  # (BL-065 characterization, 2026-06-30).
+  local language=typescript
+  [ "$platform" = other ] && language=other
+  # Feed a finite stream of "Y" answers from process substitution so
+  # init.sh's "Proceed with this plan?" / install confirms auto-pass
+  # without breaking `set -o pipefail` (yes(1) gets SIGPIPE and the
+  # 141 exit code propagates through pipefail; printf does not).
+  ( cd "$work" && \
+    bash "$REPO_DIR/init.sh" --non-interactive \
+        --project "$project" \
+        --platform "$platform" \
+        --deployment personal \
+        --language "$language" \
+        --git-host github \
+        --visibility private \
+        --no-remote-creation \
+        --project-dir "$work/$project" \
+        --allow-existing-dir \
+        < <(printf 'Y\nY\nY\nY\nY\nY\nY\nY\nY\nY\n') ) > "$logfile" 2>&1
 }
 
-# Case 1: init for web platform copies web reference pair
+# Case 1: real init.sh for web platform copies web reference pair
 _uat_work=$(mktemp -d)
-_uat_run_init_copy_block "$_uat_work" "web"
-if [ -f "$_uat_work/tests/uat/examples/pre-flight-reference.html" ] && \
-   [ -f "$_uat_work/tests/uat/examples/scenario-reference.json" ] && \
-   grep -qi 'browser\|devtools\|app url' "$_uat_work/tests/uat/examples/pre-flight-reference.html"; then
-  pass "E26: UAT init for 'web' copies web-specific reference pair"
+if _uat_real_init "$_uat_work" "web" "e26-web" && \
+   [ -f "$_uat_work/e26-web/tests/uat/examples/pre-flight-reference.html" ] && \
+   [ -f "$_uat_work/e26-web/tests/uat/examples/scenario-reference.json" ] && \
+   grep -qi 'browser\|devtools\|app url' "$_uat_work/e26-web/tests/uat/examples/pre-flight-reference.html"; then
+  pass "E26: real init.sh --platform web copies web-specific UAT reference pair"
 else
-  fail "E26: UAT init for 'web' failed — refs missing or not web-specific"
+  fail "E26: real init.sh --platform web failed — refs missing or not web-specific (log: $_uat_work/init-web.log)"
 fi
 rm -rf "$_uat_work"
 
-# Case 2: init for desktop
+# BL-037 closure (E27/E28/E29): the audit flagged asymmetry between
+# E26 (which checks BOTH `pre-flight-reference.html` AND
+# `scenario-reference.json`) and E27/E28/E29 (which only checked
+# `pre-flight-reference.html`). A regression in init.sh's UAT copy
+# block that dropped the scenario-reference.json copy would have left
+# E27/E28/E29 silently green. Each case below now asserts both halves
+# of the reference pair as a hard requirement, mirroring E26's shape.
+
+# Case 2: real init.sh for desktop
 _uat_work=$(mktemp -d)
-_uat_run_init_copy_block "$_uat_work" "desktop"
-if [ -f "$_uat_work/tests/uat/examples/pre-flight-reference.html" ] && \
-   grep -qi 'terminal\|project root\|venv\|runtime' "$_uat_work/tests/uat/examples/pre-flight-reference.html"; then
-  pass "E27: UAT init for 'desktop' copies desktop-specific reference pair"
+if _uat_real_init "$_uat_work" "desktop" "e27-desktop" && \
+   [ -f "$_uat_work/e27-desktop/tests/uat/examples/pre-flight-reference.html" ] && \
+   [ -f "$_uat_work/e27-desktop/tests/uat/examples/scenario-reference.json" ] && \
+   grep -qi 'terminal\|project root\|venv\|runtime' "$_uat_work/e27-desktop/tests/uat/examples/pre-flight-reference.html"; then
+  pass "E27: real init.sh --platform desktop copies desktop-specific UAT reference pair (BOTH halves: pre-flight-reference.html + scenario-reference.json)"
 else
-  fail "E27: UAT init for 'desktop' failed"
+  fail "E27: real init.sh --platform desktop failed — refs missing (one or both halves of the pair) or pre-flight not desktop-specific (log: $_uat_work/init-desktop.log)"
 fi
 rm -rf "$_uat_work"
 
-# Case 3: init for mobile
+# Case 3: real init.sh for mobile
 _uat_work=$(mktemp -d)
-_uat_run_init_copy_block "$_uat_work" "mobile"
-if [ -f "$_uat_work/tests/uat/examples/pre-flight-reference.html" ] && \
-   grep -qi 'device\|simulator\|testflight\|android' "$_uat_work/tests/uat/examples/pre-flight-reference.html"; then
-  pass "E28: UAT init for 'mobile' copies mobile-specific reference pair"
+if _uat_real_init "$_uat_work" "mobile" "e28-mobile" && \
+   [ -f "$_uat_work/e28-mobile/tests/uat/examples/pre-flight-reference.html" ] && \
+   [ -f "$_uat_work/e28-mobile/tests/uat/examples/scenario-reference.json" ] && \
+   grep -qi 'device\|simulator\|testflight\|android' "$_uat_work/e28-mobile/tests/uat/examples/pre-flight-reference.html"; then
+  pass "E28: real init.sh --platform mobile copies mobile-specific UAT reference pair (BOTH halves: pre-flight-reference.html + scenario-reference.json)"
 else
-  fail "E28: UAT init for 'mobile' failed"
+  fail "E28: real init.sh --platform mobile failed — refs missing (one or both halves of the pair) or pre-flight not mobile-specific (log: $_uat_work/init-mobile.log)"
 fi
 rm -rf "$_uat_work"
 
-# Case 4: init for mcp_server
+# Case 4: real init.sh for mcp_server
 _uat_work=$(mktemp -d)
-_uat_run_init_copy_block "$_uat_work" "mcp_server"
-if [ -f "$_uat_work/tests/uat/examples/pre-flight-reference.html" ] && \
-   grep -qi 'mcp\|inspector\|json-rpc\|tool call' "$_uat_work/tests/uat/examples/pre-flight-reference.html"; then
-  pass "E29: UAT init for 'mcp_server' copies mcp-specific reference pair"
+if _uat_real_init "$_uat_work" "mcp_server" "e29-mcp" && \
+   [ -f "$_uat_work/e29-mcp/tests/uat/examples/pre-flight-reference.html" ] && \
+   [ -f "$_uat_work/e29-mcp/tests/uat/examples/scenario-reference.json" ] && \
+   grep -qi 'mcp\|inspector\|json-rpc\|tool call' "$_uat_work/e29-mcp/tests/uat/examples/pre-flight-reference.html"; then
+  pass "E29: real init.sh --platform mcp_server copies mcp-specific UAT reference pair (BOTH halves: pre-flight-reference.html + scenario-reference.json)"
 else
-  fail "E29: UAT init for 'mcp_server' failed"
+  fail "E29: real init.sh --platform mcp_server failed — refs missing (one or both halves of the pair) or pre-flight not mcp-specific (log: $_uat_work/init-mcp_server.log)"
 fi
 rm -rf "$_uat_work"
 
-# Case 5: init for 'other' skips reference copy
+# Case 5: real init.sh for 'other' skips reference copy but keeps templates
 _uat_work=$(mktemp -d)
-_uat_run_init_copy_block "$_uat_work" "other"
-if [ -f "$_uat_work/tests/uat/templates/test-session-template.html" ] && \
-   [ ! -f "$_uat_work/tests/uat/examples/pre-flight-reference.html" ] && \
-   [ ! -f "$_uat_work/tests/uat/examples/scenario-reference.json" ]; then
-  pass "E30: UAT init for 'other' skips ref copy, keeps source templates"
+if _uat_real_init "$_uat_work" "other" "e30-other" && \
+   [ -f "$_uat_work/e30-other/tests/uat/templates/test-session-template.html" ] && \
+   [ ! -f "$_uat_work/e30-other/tests/uat/examples/pre-flight-reference.html" ] && \
+   [ ! -f "$_uat_work/e30-other/tests/uat/examples/scenario-reference.json" ]; then
+  pass "E30: real init.sh --platform other skips ref copy, keeps source templates"
 else
-  fail "E30: UAT init for 'other' incorrect state (ref files present or template missing)"
+  fail "E30: real init.sh --platform other produced wrong state (refs present or template missing) (log: $_uat_work/init-other.log)"
 fi
 rm -rf "$_uat_work"
 
-# Case 6: upgrade refreshes templates on pre-migration layout
-_uat_work=$(mktemp -d)
-mkdir -p "$_uat_work/.claude" "$_uat_work/tests/uat/templates"
-cat > "$_uat_work/.claude/intake-progress.json" <<JSON
-{"answers": {"platform": "desktop", "project_name": "uat-upgrade-test"}}
+# Helper: seed intake-progress.json with the platform key that
+# upgrade-project.sh's UAT migration block reads. init.sh writes
+# tool-preferences.json but not intake-progress.json (audit-trail gap
+# tracked in code-upgrade-project; not the focus of this audit closure).
+# This keeps the E31/E32 cases focused on the BL-009 UAT migration
+# contract, not the unrelated intake-progress drift.
+_uat_seed_intake_progress() {
+  local proj="$1" platform="$2"
+  mkdir -p "$proj/.claude"
+  cat > "$proj/.claude/intake-progress.json" <<JSON
+{
+  "version": 1,
+  "started_at": "2026-04-23T00:00:00Z",
+  "answers": {"platform": "$platform", "project_name": "$(basename "$proj")"}
+}
 JSON
-echo "<!-- OLD TEMPLATE, no __TESTER_PRE_FLIGHT__ placeholder -->" \
-  > "$_uat_work/tests/uat/templates/test-session-template.html"
-(
-  cd "$_uat_work"
-  cp "$REPO_DIR/templates/uat/test-session-template.html" \
-     tests/uat/templates/test-session-template.html
-  cp "$REPO_DIR/templates/uat/test-session-template.md" \
-     tests/uat/templates/test-session-template.md
-  mkdir -p tests/uat/examples
-  cp "$REPO_DIR/templates/uat/references/desktop-pre-flight.html" \
-     tests/uat/examples/pre-flight-reference.html
-  cp "$REPO_DIR/templates/uat/references/desktop-scenario.json" \
-     tests/uat/examples/scenario-reference.json
-)
-if grep -q '__TESTER_PRE_FLIGHT__' "$_uat_work/tests/uat/templates/test-session-template.html" && \
-   [ -f "$_uat_work/tests/uat/examples/pre-flight-reference.html" ]; then
-  pass "E31: UAT upgrade refreshes source templates with new placeholder"
+}
+
+# Case 6: real upgrade-project.sh UAT migration refreshes a pre-migration tree.
+# Initialize via real init.sh (with --track light so the subsequent
+# upgrade-project.sh --track standard does real work and reaches the UAT
+# migration block at scripts/upgrade-project.sh:2093). Then simulate a
+# pre-BL-009 project by overwriting the source template with stub content
+# and removing the reference pair. The upgrade-project.sh UAT migration
+# block must restore them.
+_uat_real_init_light_impl() {
+  local work="$1" platform="$2" project="$3"
+  local logfile="$work/init-${platform}-light.log"
+  ( cd "$work" && \
+    bash "$REPO_DIR/init.sh" --non-interactive \
+        --project "$project" \
+        --platform "$platform" \
+        --deployment personal \
+        --language typescript \
+        --track light \
+        --git-host github \
+        --visibility private \
+        --no-remote-creation \
+        --project-dir "$work/$project" \
+        --allow-existing-dir \
+        < <(printf 'Y\nY\nY\nY\nY\nY\nY\nY\nY\nY\n') ) > "$logfile" 2>&1
+}
+
+_uat_work=$(mktemp -d)
+if ! _uat_real_init_light_impl "$_uat_work" "desktop" "e31-upgrade"; then
+  fail "E31: setup init.sh failed (log: $_uat_work/init-desktop-light.log)"
 else
-  fail "E31: UAT upgrade didn't refresh templates or copy references"
+  _proj="$_uat_work/e31-upgrade"
+  _uat_seed_intake_progress "$_proj" "desktop"
+  # Regression to "pre-migration" state: clobber the source template
+  # with a stub that DOES NOT contain the production placeholder, then
+  # delete the reference pair so the upgrade has visible work to do.
+  # BL-036 fix: the prior stub embedded '__TESTER_PRE_FLIGHT__' in its
+  # comment text, which trivially satisfied the post-condition grep
+  # even when upgrade-project.sh's UAT migration block was disabled
+  # (mutation-test escape). The new stub uses a string that cannot
+  # collide with the production marker.
+  echo "OLD STUB TEMPLATE - pre-migration sentinel" \
+    > "$_proj/tests/uat/templates/test-session-template.html"
+  rm -f "$_proj/tests/uat/examples/pre-flight-reference.html" \
+        "$_proj/tests/uat/examples/scenario-reference.json"
+  # Drive the real upgrade-project.sh UAT migration block.
+  # --track light → standard is a real upgrade target so the script
+  # reaches the post-validation sweep that includes UAT migration.
+  ( cd "$_proj" && \
+    bash "$REPO_DIR/scripts/upgrade-project.sh" \
+        --non-interactive --track standard ) > "$_uat_work/upgrade-e31.log" 2>&1 || true
+  # Positive assertion: production template is multi-hundred lines and
+  # contains the __TESTER_PRE_FLIGHT__ placeholder at least twice
+  # (canonical shape from templates/uat/test-session-template.html).
+  # BL-036: pin the count, not just presence, so a stub that mentions
+  # the placeholder string once still flips RED.
+  e31_tpl="$_proj/tests/uat/templates/test-session-template.html"
+  e31_count=0
+  if [ -f "$e31_tpl" ]; then
+    e31_count=$(grep -c '__TESTER_PRE_FLIGHT__' "$e31_tpl" 2>/dev/null) || e31_count=0
+  fi
+  if [ "$e31_count" -ge 2 ] && \
+     [ -f "$_proj/tests/uat/examples/pre-flight-reference.html" ] && \
+     [ -f "$_proj/tests/uat/examples/scenario-reference.json" ] && \
+     grep -qi 'terminal\|project root\|venv\|runtime' "$_proj/tests/uat/examples/pre-flight-reference.html"; then
+    pass "E31: real upgrade-project.sh UAT migration refreshes stub template + reference pair (placeholder count=$e31_count, expected >=2)"
+  else
+    fail "E31: upgrade-project.sh UAT migration didn't restore template/refs (placeholder count=$e31_count; log: $_uat_work/upgrade-e31.log)"
+  fi
 fi
 rm -rf "$_uat_work"
 
-# Case 7: upgrade is idempotent
+# Case 7: E32 — UAT migration is idempotent. Drive the real UAT migration
+# block twice against the same tree (via two upgrade-project.sh runs that
+# each reach the migration block) and verify the resulting trees are
+# byte-identical. The pre-fix version asserted cp's idempotency
+# (tautology); the new version asserts the framework's idempotency by
+# comparing run-1 output to run-2 output.
 _uat_work=$(mktemp -d)
-mkdir -p "$_uat_work/.claude"
-cat > "$_uat_work/.claude/intake-progress.json" <<JSON
-{"answers": {"platform": "desktop"}}
-JSON
-for _i in 1 2; do
-  (
-    cd "$_uat_work"
-    mkdir -p tests/uat/templates tests/uat/examples
-    cp "$REPO_DIR/templates/uat/test-session-template.html" tests/uat/templates/test-session-template.html
-    cp "$REPO_DIR/templates/uat/references/desktop-pre-flight.html" tests/uat/examples/pre-flight-reference.html
-  )
-done
-if diff -q "$_uat_work/tests/uat/templates/test-session-template.html" \
-           "$REPO_DIR/templates/uat/test-session-template.html" >/dev/null 2>&1; then
-  pass "E32: UAT upgrade migration is idempotent"
+if ! _uat_real_init_light_impl "$_uat_work" "desktop" "e32-idem"; then
+  fail "E32: setup init.sh failed (log: $_uat_work/init-desktop-light.log)"
 else
-  fail "E32: UAT upgrade migration produced diverging content on re-run"
+  _proj="$_uat_work/e32-idem"
+  _uat_seed_intake_progress "$_proj" "desktop"
+  # Snapshot UAT subtree after a forced "pre-migration" state to ensure
+  # the first upgrade-project.sh has real work.
+  echo "<!-- OLD TEMPLATE -->" > "$_proj/tests/uat/templates/test-session-template.html"
+  rm -f "$_proj/tests/uat/examples/"*.html "$_proj/tests/uat/examples/"*.json 2>/dev/null || true
+  # Run 1: light → standard. This runs the migration block.
+  ( cd "$_proj" && \
+    bash "$REPO_DIR/scripts/upgrade-project.sh" \
+        --non-interactive --track standard ) > "$_uat_work/upgrade-run1.log" 2>&1 || true
+  _snap1="$_uat_work/snap1"
+  mkdir -p "$_snap1"
+  cp -R "$_proj/tests/uat" "$_snap1/"
+  # Run 2: standard → full. Different target so upgrade-project.sh
+  # again reaches the post-validation sweep (UAT migration). Anything
+  # the migration does on this second invocation that mutates the UAT
+  # subtree differently from run-1 is drift.
+  ( cd "$_proj" && \
+    bash "$REPO_DIR/scripts/upgrade-project.sh" \
+        --non-interactive --track full ) > "$_uat_work/upgrade-run2.log" 2>&1 || true
+  _snap2="$_uat_work/snap2"
+  mkdir -p "$_snap2"
+  cp -R "$_proj/tests/uat" "$_snap2/"
+  # Compare snapshots — they must be byte-identical for idempotency.
+  if diff -ru "$_snap1/uat" "$_snap2/uat" > "$_uat_work/snapshot.diff" 2>&1; then
+    pass "E32: upgrade-project.sh UAT migration is idempotent (run-1 and run-2 produce identical trees)"
+  else
+    fail "E32: upgrade-project.sh UAT migration is NOT idempotent — run-2 diverged from run-1 (see $_uat_work/snapshot.diff)"
+  fi
 fi
 rm -rf "$_uat_work"
 
@@ -1233,17 +1536,45 @@ else
   fail "E49: --validate-only created project dir (should not have)"
 fi
 
-# E50: Mobile + organizational + private_poc + kotlin → forces visibility=private.
+# E50: Mobile + organizational + sponsored_poc + kotlin → forces visibility=private.
+# (Originally written against organizational+private_poc, which is rejected
+#  per docs/governance-framework.md §2.5 line 257 + BL-016 spec §6.2 line 217.
+#  Rewritten 2026-06-30 to use sponsored_poc — the gov_mode that IS valid for
+#  organizational deployments — so the assertion still exercises the
+#  organizational→visibility=private force on the mobile+kotlin combo it pins.
+#  Closes BL-039; companion E50b below pins the rejection contract directly.)
 _e50_dir="$TEST_DIR/e50"
 mkdir -p "$_e50_dir"
 _e50_out=$(cd "$_e50_dir" && "$INIT_SH" --non-interactive --validate-only \
-  --project uat-e50 --platform mobile --deployment organizational --gov-mode private_poc --language kotlin \
+  --project uat-e50 --platform mobile --deployment organizational --gov-mode sponsored_poc --language kotlin \
   --project-dir "$_e50_dir/proj" 2>&1)
 _e50_rc=$?
-if [ "$_e50_rc" = "0" ] && echo "$_e50_out" | grep -q '"gov_mode": "private_poc"' && echo "$_e50_out" | grep -q '"visibility": "private"'; then
-  pass "E50: organizational + private_poc forces visibility=private"
+if [ "$_e50_rc" = "0" ] && echo "$_e50_out" | grep -q '"gov_mode": "sponsored_poc"' && echo "$_e50_out" | grep -q '"visibility": "private"'; then
+  pass "E50: mobile + organizational + sponsored_poc forces visibility=private"
 else
-  fail "E50: expected gov_mode=private_poc and visibility=private, got: $_e50_out"
+  fail "E50: expected exit 0 with gov_mode=sponsored_poc and visibility=private, got rc=$_e50_rc out=$_e50_out"
+fi
+
+# E50b: Mobile + organizational + private_poc → rejected (baseline §2.5 tier rule).
+# Pins the contract from docs/governance-framework.md:257 ("The
+# organizational/private_poc shape is not a valid tier; init.sh rejects it in
+# non-interactive mode") so a future regression that re-permits this combo
+# surfaces here instead of silently scaffolding an invalid tier.
+_e50b_dir="$TEST_DIR/e50b"
+mkdir -p "$_e50b_dir"
+# Wrap in `if/else` so `set -e` does not abort the suite — the rejection IS
+# the contract we're pinning, so init.sh's non-zero exit is the GREEN path.
+if _e50b_out=$(cd "$_e50b_dir" && "$INIT_SH" --non-interactive --validate-only \
+  --project uat-e50b --platform mobile --deployment organizational --gov-mode private_poc --language kotlin \
+  --project-dir "$_e50b_dir/proj" 2>&1); then
+  _e50b_rc=0
+else
+  _e50b_rc=$?
+fi
+if [ "$_e50b_rc" != "0" ] && echo "$_e50b_out" | grep -q 'gov-mode=private_poc is not valid for --deployment=organizational'; then
+  pass "E50b: organizational + private_poc rejected with baseline §2.5 message"
+else
+  fail "E50b: expected non-zero exit with baseline §2.5 rejection, got rc=$_e50b_rc out=$_e50b_out"
 fi
 
 # E51: git-host=other + remote-url + attested → validate succeeds.
@@ -1332,8 +1663,7 @@ _e56_rc=0
 (cd "$_e56_dir" && "$INIT_SH" --non-interactive \
   --project uat-e56 --platform web --deployment personal --language typescript \
   --project-dir "$_e56_proj" \
-  --git-host other --remote-url https://example.com/fake.git \
-  --branch-protection-attested >/dev/null 2>&1) || _e56_rc=$?
+  --git-host github --no-remote-creation >/dev/null 2>&1) || _e56_rc=$?
 _e56_test_interval=""
 if [ -f "$_e56_proj/.claude/build-progress.json" ]; then
   _e56_test_interval=$(jq -r '.test_interval // empty' "$_e56_proj/.claude/build-progress.json" 2>/dev/null || echo "")
@@ -1364,8 +1694,7 @@ _e57_rc=0
 (cd "$_e57_dir" && "$INIT_SH" --non-interactive \
   --project uat-e57 --platform web --deployment organizational --gov-mode production \
   --language typescript --project-dir "$_e57_proj" \
-  --git-host other --remote-url https://example.com/fake.git \
-  --branch-protection-attested >/dev/null 2>&1) || _e57_rc=$?
+  --git-host github --no-remote-creation >/dev/null 2>&1) || _e57_rc=$?
 _e57_poc=""
 if [ -f "$_e57_proj/.claude/phase-state.json" ]; then
   _e57_poc=$(jq -r '.poc_mode' "$_e57_proj/.claude/phase-state.json" 2>/dev/null || echo "missing")
@@ -1378,31 +1707,109 @@ fi
 
 # E58: project-local invocation of upgrade-project.sh must exit rc=0.
 # Regression guard for T1-B from 2026-04-26 UAT triage. The BL-009/BL-015
-# helper-refresh block at scripts/upgrade-project.sh:1471 did
-# `cp $SCRIPT_DIR/$helper scripts/$helper` where $SCRIPT_DIR resolved to the
-# project's own scripts/ dir when invoked as `bash scripts/upgrade-project.sh`
-# from the project root. BSD cp returns non-zero on identical source/dest,
-# and `set -euo pipefail` aborted before "Upgrade complete." State changes
-# succeeded but the wrapper signaled failure.
+# helper-refresh block (scripts/upgrade-project.sh, "Refreshing framework
+# helper scripts") did `cp $SCRIPT_DIR/$helper scripts/$helper` where
+# $SCRIPT_DIR resolved to the project's own scripts/ dir when invoked as
+# `bash scripts/upgrade-project.sh` from the project root. BSD cp returns
+# non-zero on identical source/dest, and `set -euo pipefail` aborted before
+# "Upgrade complete." The fix guards the no-op with a `-ef` same-file test;
+# this case keeps that path honest by driving a REAL init scaffold + a
+# project-local upgrade to completion.
+#
+# STALE-TEST repair (BL-039 / baseline §2.5, 2026-07): the prior init baseline
+# was `--deployment organizational --gov-mode private_poc`, which init.sh now
+# correctly REJECTS at Pass-2 validation (init.sh:3648 — "Private POC is always
+# a personal deployment"; the same rule E50b guards). init exited rc=1 so the
+# upgrade never ran and E58 failed on init_rc, not on the T1-B path it exists
+# to guard. The baseline is realigned to a valid personal project that then
+# crosses to organizational/sponsored_poc via --to-sponsored-poc — an
+# org-crossing project-local upgrade that E60 (--to-private-poc stays personal)
+# does not cover. Hermetic: --no-remote-creation (the old form passed a live
+# --remote-url with no --no-remote-creation — a latent network hazard that only
+# never fired because §2.5 rejected it earlier). The personal→organizational
+# ZDR gate (tier-crosscheck-6) is satisfied by seeding phase1_artifacts, mirror-
+# ing E58b.
 _e58_dir="$TEST_DIR/e58"
 mkdir -p "$_e58_dir"
 _e58_proj="$_e58_dir/uat-e58"
 _e58_init_rc=0
 (cd "$_e58_dir" && "$INIT_SH" --non-interactive \
-  --project uat-e58 --platform web --deployment organizational --gov-mode private_poc \
+  --project uat-e58 --platform web --deployment personal \
   --language typescript --project-dir "$_e58_proj" \
-  --git-host other --remote-url https://example.com/fake.git \
-  --branch-protection-attested >/dev/null 2>&1) || _e58_init_rc=$?
+  --git-host github --no-remote-creation >/dev/null 2>&1) || _e58_init_rc=$?
+# Seed phase1_artifacts so the personal→organizational ZDR gate
+# (tier-crosscheck-6 in upgrade-project.sh) does not block the deployment flip.
+_e58_pstate="$_e58_proj/.claude/process-state.json"
+if [ "$_e58_init_rc" = "0" ] && [ -f "$_e58_pstate" ]; then
+  _e58_tmp="$_e58_pstate.tmp"
+  if jq '.phase1_artifacts = ((.phase1_artifacts // {}) + {data_classification:"internal", zdr_attested:true})' \
+       "$_e58_pstate" > "$_e58_tmp" 2>/dev/null; then
+    mv "$_e58_tmp" "$_e58_pstate"
+  else
+    rm -f "$_e58_tmp"
+  fi
+fi
 _e58_upgrade_rc=0
 if [ "$_e58_init_rc" = "0" ] && [ -d "$_e58_proj/scripts" ]; then
   (cd "$_e58_proj" && bash scripts/upgrade-project.sh --to-sponsored-poc >/dev/null 2>&1) || _e58_upgrade_rc=$?
 else
   _e58_upgrade_rc=255
 fi
-if [ "$_e58_upgrade_rc" = "0" ]; then
-  pass "E58: project-local upgrade-project.sh --to-sponsored-poc exits 0 (T1-B regression guard)"
+_e58_deploy=""
+_e58_poc=""
+if [ -f "$_e58_proj/.claude/phase-state.json" ]; then
+  _e58_deploy=$(jq -r '.deployment // empty' "$_e58_proj/.claude/phase-state.json" 2>/dev/null || echo "")
+  _e58_poc=$(jq -r '.poc_mode // empty' "$_e58_proj/.claude/phase-state.json" 2>/dev/null || echo "")
+fi
+if [ "$_e58_upgrade_rc" = "0" ] && \
+   [ "$_e58_deploy" = "organizational" ] && \
+   [ "$_e58_poc" = "sponsored_poc" ]; then
+  pass "E58: project-local upgrade-project.sh --to-sponsored-poc (personal→org) exits 0 + flips to organizational/sponsored_poc (T1-B project-local cp guard)"
 else
-  fail "E58: expected rc=0 from project-local upgrade-project.sh, got rc=$_e58_upgrade_rc (init_rc=$_e58_init_rc)"
+  fail "E58: expected rc=0 deployment=organizational poc_mode=sponsored_poc; got rc=$_e58_upgrade_rc deployment='$_e58_deploy' poc_mode='$_e58_poc' (init_rc=$_e58_init_rc)"
+fi
+
+# E58b: --to-sponsored-poc on a genuinely PERSONAL project succeeds AND flips
+# phase-state to deployment=organizational + poc_mode=sponsored_poc (R3-A guard).
+# Folded from the retired tests/test-upgrade-personal-to-sponsored-poc.sh (BL-035
+# wiring B MERGE). The R3-A defect: the guard at upgrade-project.sh checked only
+# `[ -z "$CURRENT_POC_MODE" ]` — personal projects always have poc_mode=null but
+# deployment=personal, so the guard mistook them for production and refused with
+# "Cannot downgrade a production project to POC mode." This uses a hand-seeded
+# fixture (not real init.sh) so it isolates the guard + phase-state transition
+# without an init scaffold. E58 (above) only asserts rc=0 from an org/private_poc
+# baseline; E58b adds the personal-baseline transition assertion that made the
+# orphan's T1 unique. (Its T2 dup'd E27's production-block coverage and T3 dup'd
+# E60's --to-private-poc path, so only T1 is folded here.)
+_e58b_dir="$TEST_DIR/e58b"
+_e58b_proj="$_e58b_dir/p"
+mkdir -p "$_e58b_proj/.claude"
+cat > "$_e58b_proj/.claude/manifest.json" <<'JSON'
+{"frameworkVersion":"test","mode":"personal","host":"other"}
+JSON
+cat > "$_e58b_proj/.claude/phase-state.json" <<'JSON'
+{"track":"light","deployment":"personal","poc_mode":null,"current_phase":1,"phases":{}}
+JSON
+cat > "$_e58b_proj/.claude/tool-preferences.json" <<'JSON'
+{"context":{"track":"light","platform":"web","os":"darwin"},"preferences":{}}
+JSON
+cat > "$_e58b_proj/.claude/intake-progress.json" <<'JSON'
+{"track":"light","deployment":"personal"}
+JSON
+# tier-crosscheck-6: seed phase1_artifacts so the personal→organizational
+# refusal (in --to-sponsored-poc, which flips deployment) doesn't fire.
+cat > "$_e58b_proj/.claude/process-state.json" <<'JSON'
+{"phase1_artifacts":{"data_classification":"internal","zdr_attested":true}}
+JSON
+( cd "$_e58b_proj" && git init -q && git remote add origin https://example.com/fake.git ) >/dev/null 2>&1
+_e58b_rc=0
+( cd "$_e58b_proj" && bash "$REPO_DIR/scripts/upgrade-project.sh" --to-sponsored-poc </dev/null >/dev/null 2>&1 ) || _e58b_rc=$?
+_e58b_deploy=$(jq -r '.deployment // empty' "$_e58b_proj/.claude/phase-state.json" 2>/dev/null || echo "")
+_e58b_poc=$(jq -r '.poc_mode // empty' "$_e58b_proj/.claude/phase-state.json" 2>/dev/null || echo "")
+if [ "$_e58b_rc" = "0" ] && [ "$_e58b_deploy" = "organizational" ] && [ "$_e58b_poc" = "sponsored_poc" ]; then
+  pass "E58b: --to-sponsored-poc on personal baseline → rc=0 + deployment=organizational + poc_mode=sponsored_poc (R3-A guard)"
+else
+  fail "E58b: expected rc=0 deployment=organizational poc_mode=sponsored_poc; got rc=$_e58b_rc deployment='$_e58b_deploy' poc_mode='$_e58b_poc'"
 fi
 
 # E59: --non-interactive --platform mcp_server produces the platform module,
@@ -1420,8 +1827,7 @@ _e59_init_rc=0
 (cd "$_e59_dir" && "$INIT_SH" --non-interactive \
   --project uat-e59 --platform mcp_server --deployment personal \
   --language python --project-dir "$_e59_proj" \
-  --git-host other --remote-url https://example.com/fake.git \
-  --branch-protection-attested >/dev/null 2>&1) || _e59_init_rc=$?
+  --git-host github --no-remote-creation >/dev/null 2>&1) || _e59_init_rc=$?
 _e59_module_present=false
 _e59_release_present=false
 _e59_uat_ref_present=false
@@ -1440,10 +1846,18 @@ else
 fi
 
 # E60: upgrade-project.sh --to-private-poc takes a personal project to
-# organizational/private_poc. T1-D regression guard for the missing
+# personal/private_poc. T1-D regression guard for the missing
 # personal -> private_poc CLI path. Before this fix, intake-wizard.sh
 # --upgrade-deployment private_poc was rejected (only personal|organizational
 # accepted) and upgrade-project.sh had no --to-private-poc flag.
+#
+# BL-079 (tier-crosscheck-3, 2026-06): Private POC is ALWAYS a personal
+# deployment per baseline §2.5 (upgrade-project.sh:756-787 sets
+# TARGET_DEPLOYMENT=personal). The prior expectation of deployment=
+# organizational asserted the pre-fix "impossible organizational/private_poc"
+# shape and was stale/RED against current product. Aligned with the correct
+# product contract (and orphan test-poc-modes.sh T5, which asserts the same
+# personal-stays-personal outcome).
 _e60_dir="$TEST_DIR/e60"
 mkdir -p "$_e60_dir"
 _e60_proj="$_e60_dir/uat-e60"
@@ -1451,8 +1865,7 @@ _e60_init_rc=0
 (cd "$_e60_dir" && "$INIT_SH" --non-interactive \
   --project uat-e60 --platform web --deployment personal \
   --language typescript --project-dir "$_e60_proj" \
-  --git-host other --remote-url https://example.com/fake.git \
-  --branch-protection-attested >/dev/null 2>&1) || _e60_init_rc=$?
+  --git-host github --no-remote-creation >/dev/null 2>&1) || _e60_init_rc=$?
 _e60_upgrade_rc=0
 if [ "$_e60_init_rc" = "0" ] && [ -d "$_e60_proj/scripts" ]; then
   (cd "$_e60_proj" && bash scripts/upgrade-project.sh --to-private-poc >/dev/null 2>&1) || _e60_upgrade_rc=$?
@@ -1467,10 +1880,10 @@ if [ -f "$_e60_proj/.claude/phase-state.json" ]; then
 fi
 if [ "$_e60_upgrade_rc" = "0" ] && \
    [ "$_e60_poc_mode" = "private_poc" ] && \
-   [ "$_e60_deployment" = "organizational" ]; then
-  pass "E60: upgrade-project.sh --to-private-poc takes personal -> organizational/private_poc (T1-D regression guard)"
+   [ "$_e60_deployment" = "personal" ]; then
+  pass "E60: upgrade-project.sh --to-private-poc takes personal -> personal/private_poc (T1-D regression guard)"
 else
-  fail "E60: expected rc=0 poc_mode=private_poc deployment=organizational; got rc=$_e60_upgrade_rc poc_mode='$_e60_poc_mode' deployment='$_e60_deployment'"
+  fail "E60: expected rc=0 poc_mode=private_poc deployment=personal; got rc=$_e60_upgrade_rc poc_mode='$_e60_poc_mode' deployment='$_e60_deployment'"
 fi
 
 # E61: intake-wizard.sh --to-private-poc from a project subdir, invoked via
@@ -1485,8 +1898,7 @@ _e61_init_rc=0
 (cd "$_e61_dir" && "$INIT_SH" --non-interactive \
   --project uat-e61 --platform web --deployment personal \
   --language typescript --project-dir "$_e61_proj" \
-  --git-host other --remote-url https://example.com/fake.git \
-  --branch-protection-attested >/dev/null 2>&1) || _e61_init_rc=$?
+  --git-host github --no-remote-creation >/dev/null 2>&1) || _e61_init_rc=$?
 _e61_subdir="$_e61_proj/docs"
 mkdir -p "$_e61_subdir"
 _e61_wizard_rc=0

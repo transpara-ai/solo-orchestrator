@@ -12,45 +12,75 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/helpers.sh"
 
-# UAT 2026-04-25 fix (U-N): refuse to operate inside the framework repo.
-guard_not_in_framework || exit 1
+# audit tests-full-known-bugs-2 (closure): allow this file to be sourced
+# by tests without triggering the wizard's project-root discovery,
+# CWD anchor, and main() loop. The guard `return 0 2>/dev/null` succeeds
+# only when the script is being sourced — in normal `bash intake-wizard.sh`
+# invocations it errors out, the negation flips, and the original setup
+# block runs unchanged. This unblocks tests/known-bugs-test-suite.sh from
+# replicating save_answer / init_progress / save_section / _request_pause
+# inline; the tests can now source the file and exercise the real
+# functions, closing the regression-coverage gap the audit cited.
+#
+# PR #104 verifier follow-up (Wave 4 minor #4): the probe was previously
+# the unscoped global `_intake_wizard_sourced`, which leaked into the
+# caller's variable namespace. Renamed to `__SOLO_INTAKE_WIZARD_SOURCED__`
+# (caps + double-underscore prefix is the project convention for
+# module-private globals).
+__SOLO_INTAKE_WIZARD_SOURCED__=0
+(return 0 2>/dev/null) && __SOLO_INTAKE_WIZARD_SOURCED__=1
 
-# UAT 2026-04-26 fix (U-G / T1-D): walk up from CWD looking for .claude/.
-# The previous implementation hardcoded PROJECT_ROOT="$SCRIPT_DIR/.." which
-# resolved to the framework dir when invoked via bash $FRAMEWORK/scripts/
-# intake-wizard.sh, breaking --upgrade-deployment / --to-sponsored-poc /
-# --to-private-poc / --resume. Same shape as scripts/upgrade-project.sh's
-# find_project_root().
-find_project_root_for_intake() {
-  local dir="$PWD"
-  while [ "$dir" != "/" ]; do
-    if [ -f "$dir/.claude/phase-state.json" ]; then
-      echo "$dir"
-      return 0
-    fi
-    dir="$(dirname "$dir")"
-  done
-  return 1
-}
-if PROJECT_ROOT="$(find_project_root_for_intake)"; then
-  :
-else
-  print_fail "Could not find project root (no .claude/phase-state.json in CWD or parents)."
-  print_info "Run intake-wizard.sh from your project directory."
-  exit 1
+if [ "$__SOLO_INTAKE_WIZARD_SOURCED__" -ne 1 ]; then
+  # UAT 2026-04-25 fix (U-N): refuse to operate inside the framework repo.
+  guard_not_in_framework || exit 1
+
+  # UAT 2026-04-26 fix (U-G / T1-D): walk up from CWD looking for .claude/.
+  # The previous implementation hardcoded PROJECT_ROOT="$SCRIPT_DIR/.." which
+  # resolved to the framework dir when invoked via bash $FRAMEWORK/scripts/
+  # intake-wizard.sh, breaking --upgrade-deployment / --to-sponsored-poc /
+  # --to-private-poc / --resume. Same shape as scripts/upgrade-project.sh's
+  # find_project_root().
+  find_project_root_for_intake() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+      if [ -f "$dir/.claude/phase-state.json" ]; then
+        echo "$dir"
+        return 0
+      fi
+      dir="$(dirname "$dir")"
+    done
+    return 1
+  }
+  if PROJECT_ROOT="$(find_project_root_for_intake)"; then
+    :
+  else
+    print_fail "Could not find project root (no .claude/phase-state.json in CWD or parents)."
+    print_info "Run intake-wizard.sh from your project directory."
+    exit 1
+  fi
+
+  # All passthrough exec's below use relative `scripts/...` paths, and several
+  # wizard sections write into the project's working files. Anchor CWD to the
+  # resolved project root so those paths are unambiguous regardless of where
+  # the wizard was invoked from.
+  cd "$PROJECT_ROOT"
 fi
 
-# All passthrough exec's below use relative `scripts/...` paths, and several
-# wizard sections write into the project's working files. Anchor CWD to the
-# resolved project root so those paths are unambiguous regardless of where
-# the wizard was invoked from.
-cd "$PROJECT_ROOT"
-
-# Templates ship with the framework, not the project.
+# Templates ship with the framework, not the project. Defining this
+# outside the sourced/standalone branch keeps the constant available
+# to functions that tests may reach for (e.g. render_intake_file).
 FRAMEWORK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PROGRESS_FILE="$PROJECT_ROOT/.claude/intake-progress.json"
-INTAKE_FILE="$PROJECT_ROOT/PROJECT_INTAKE.md"
+# When sourced for unit tests PROJECT_ROOT isn't resolved (no walk to a
+# .claude/phase-state.json from the test's CWD). Default to empty so the
+# top-level assignment doesn't trip `set -u` in the test harness; tests
+# override PROGRESS_FILE/INTAKE_FILE before calling save_answer etc.
+PROGRESS_FILE="${PROJECT_ROOT:-}/.claude/intake-progress.json"
+INTAKE_FILE="${PROJECT_ROOT:-}/PROJECT_INTAKE.md"
+# BL-204-PREFILL: the framework manifest is where the git host chosen during
+# init already lives. Declared beside PROGRESS_FILE (and overridable the same
+# way) so run_section_1_repo_setup can be exercised in isolation by tests.
+MANIFEST_FILE="${MANIFEST_FILE:-${PROJECT_ROOT:-}/.claude/manifest.json}"
 SUGGESTIONS_DIR="$FRAMEWORK_ROOT/templates/intake-suggestions"
 
 # Project context (loaded from progress file or phase-state.json)
@@ -67,15 +97,25 @@ COMPLETED_SECTIONS=""
 # ================================================================
 # UTILITY: Prompt for text input with optional default
 # ================================================================
+# Audit code-intake-wizard-5: every prompt helper short-circuits at
+# entry if the pause sentinel is already set, so once the user types
+# "pause" no further read calls fire in the same section. Combined
+# with the sentinel-check in save_answer, this prevents the empty-
+# string overwrites that the audit cited (one save_answer per
+# remaining prompt corrupting another previously-saved key).
 prompt_input() {
+  if [ -f "${_PAUSE_FILE:-/dev/null/sentinel-cannot-exist}" ]; then
+    echo ""
+    return
+  fi
   local prompt="$1"
   local default="${2:-}"
   local result
   if [ -n "$default" ]; then
-    read -rp "$(echo -e "  ${BOLD}$prompt${NC} [$default]: ")" result
+    read -rp "$(echo -e "  ${BOLD}$prompt${NC} [$default]: ")" result # lint-raw-read-prompt: allow intake-wizard.sh defines its own prompt_input with pause-file semantics (overrides lib/helpers.sh::prompt_input); this IS the wizard's centralized prompt helper
     result="${result:-$default}"
   else
-    read -rp "$(echo -e "  ${BOLD}$prompt${NC}: ")" result
+    read -rp "$(echo -e "  ${BOLD}$prompt${NC}: ")" result # lint-raw-read-prompt: allow intake-wizard.sh defines its own prompt_input with pause-file semantics (overrides lib/helpers.sh::prompt_input); this IS the wizard's centralized prompt helper
   fi
   if [ "$result" = "pause" ] || [ "$result" = "PAUSE" ] || [ "$result" = "Pause" ]; then
     _request_pause
@@ -89,6 +129,10 @@ prompt_input() {
 # UTILITY: Prompt for numbered choice
 # ================================================================
 prompt_choice() {
+  if [ -f "${_PAUSE_FILE:-/dev/null/sentinel-cannot-exist}" ]; then
+    echo ""
+    return
+  fi
   local prompt="$1"
   shift
   local options=("$@")
@@ -98,7 +142,7 @@ prompt_choice() {
   done
   local choice
   while true; do
-    read -rp "$(echo -e "  ${BOLD}Select [1-${#options[@]}]${NC}: ")" choice
+    read -rp "$(echo -e "  ${BOLD}Select [1-${#options[@]}]${NC}: ")" choice # lint-raw-read-prompt: allow intake-wizard.sh defines its own prompt_choice with pause-file semantics; this IS the wizard's centralized numbered-choice helper
     if [ "$choice" = "pause" ] || [ "$choice" = "PAUSE" ] || [ "$choice" = "Pause" ]; then
       _request_pause
       echo ""
@@ -116,6 +160,10 @@ prompt_choice() {
 # UTILITY: Prompt with ? for suggestions
 # ================================================================
 prompt_with_suggestions() {
+  if [ -f "${_PAUSE_FILE:-/dev/null/sentinel-cannot-exist}" ]; then
+    echo ""
+    return
+  fi
   local prompt="$1"
   local suggestion_key="$2"
   local default="${3:-}"
@@ -123,9 +171,9 @@ prompt_with_suggestions() {
 
   while true; do
     if [ -n "$default" ]; then
-      read -rp "$(echo -e "  ${BOLD}$prompt${NC} [? for suggestions, default: $default]: ")" result
+      read -rp "$(echo -e "  ${BOLD}$prompt${NC} [? for suggestions, default: $default]: ")" result # lint-raw-read-prompt: allow intake-wizard.sh prompt_with_suggestions — wizard-specific helper with `?`-trigger semantics that don't fit lib/helpers.sh shape
     else
-      read -rp "$(echo -e "  ${BOLD}$prompt${NC} [? for suggestions]: ")" result
+      read -rp "$(echo -e "  ${BOLD}$prompt${NC} [? for suggestions]: ")" result # lint-raw-read-prompt: allow intake-wizard.sh prompt_with_suggestions — wizard-specific helper with `?`-trigger semantics that don't fit lib/helpers.sh shape
     fi
 
     if [ "$result" = "pause" ] || [ "$result" = "PAUSE" ] || [ "$result" = "Pause" ]; then
@@ -223,6 +271,21 @@ PYEOF
 
 # Pause detection: prompt functions write a sentinel file when the user
 # types "pause". The section runner checks for this file after each prompt.
+#
+# PR #104 verifier follow-up (Wave 4 major #3): the verifier flagged
+# both `_PAUSE_FILE` allocation and the EXIT trap as module-load-time
+# side effects. The allocation is kept unconditional because:
+#   (a) it's a pure variable assignment — no /tmp file is created until
+#       _request_pause() touches it, which only the wizard's prompt loop
+#       calls; sourcing the file alone does NOT touch the filesystem.
+#   (b) the `$$` interpolation captures the sourcing process's PID, so
+#       parallel test runs cannot collide.
+#   (c) tests/known-bugs-test-suite.sh:615 (BUG-8) sources this file
+#       under `set -u` and reads $_PAUSE_FILE directly; gating the
+#       allocation would force every sourced caller to fallback-default
+#       it, undermining the source-real-functions rewrite that closed
+#       tests-full-known-bugs-2.
+# The real clobber risk is the EXIT trap (see below) — that IS gated.
 _PAUSE_FILE="/tmp/.solo-intake-pause-$$"
 
 _request_pause() {
@@ -240,8 +303,20 @@ check_pause_requested() {
   fi
 }
 
-# Clean up pause file on exit
-trap 'rm -f "$_PAUSE_FILE"' EXIT
+# Clean up pause file on exit.
+#
+# PR #104 verifier follow-up (Wave 4 major #3): the trap is gated on
+# __SOLO_INTAKE_WIZARD_SOURCED__ -ne 1. Pre-fix the trap ran at
+# module-load time even when sourced and silently clobbered any pre-
+# existing EXIT trap in the caller's shell — same defect class as the
+# original BUG-8 the main-guard pattern (lines 27, 2009) was added to
+# fix. Tests escaped today only because each `source` lives inside its
+# own `( ... )` subshell. Gating the trap eliminates the clobber surface
+# for any future caller that does not subshell-wrap. Sourced callers
+# that want pause-file cleanup must register their own trap.
+if [ "${__SOLO_INTAKE_WIZARD_SOURCED__:-0}" -ne 1 ]; then
+  trap 'rm -f "$_PAUSE_FILE"' EXIT
+fi
 
 # ================================================================
 # PROGRESS: Initialize progress file
@@ -291,12 +366,108 @@ with open(path, 'w') as f:
 " "$section_num" "$PROGRESS_FILE"
   fi
   print_ok "Section $section_num saved."
+  # Audit code-intake-wizard-1: re-render the human-readable appendix in
+  # PROJECT_INTAKE.md so the file stays in sync with the JSON progress
+  # after every section. Failure to render must not block the wizard.
+  render_intake_file || true
+}
+
+# ================================================================
+# RENDER: Materialize answers from intake-progress.json into
+# PROJECT_INTAKE.md as a fenced "Intake Answers (Auto-Populated)"
+# appendix. Idempotent — replaces any prior fenced block. Creates
+# PROJECT_INTAKE.md (from template if available, otherwise a minimal
+# header) when missing. Skips silently if jq or the progress file is
+# absent — the wizard remains usable on minimal systems.
+# ================================================================
+render_intake_file() {
+  command -v jq >/dev/null 2>&1 || return 0
+  [ -f "$PROGRESS_FILE" ] || return 0
+
+  if [ ! -f "$INTAKE_FILE" ]; then
+    local template="$FRAMEWORK_ROOT/templates/project-intake.md"
+    if [ -f "$template" ]; then
+      local today
+      today=$(date -u +%Y-%m-%d)
+      sed "s/__DATE__/$today/g" "$template" > "$INTAKE_FILE"
+    else
+      printf '# Project Intake\n\n_Auto-created by intake-wizard.sh._\n' > "$INTAKE_FILE"
+    fi
+  fi
+
+  local begin_marker="<!-- INTAKE_ANSWERS_BEGIN -->"
+  local end_marker="<!-- INTAKE_ANSWERS_END -->"
+  local appendix tmp
+  appendix=$(mktemp)
+  tmp=$(mktemp)
+
+  {
+    printf '%s\n' "$begin_marker"
+    printf '\n## Intake Answers (Auto-Populated)\n\n'
+    printf '_Generated by `scripts/intake-wizard.sh` from `.claude/intake-progress.json`._\n'
+    printf '_Last updated: %s_\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '### Project Context\n\n'
+    printf '| Field | Value |\n|---|---|\n'
+    jq -r '
+      def row(label; val): "| " + label + " | " + ((val // "") | tostring) + " |";
+      row("Project name"; .project_name),
+      row("Description"; .description),
+      row("Platform"; .platform),
+      row("Track"; .track),
+      row("Deployment"; .deployment),
+      row("Language"; .language),
+      row("POC mode"; (.poc_mode // "N/A")),
+      row("Last section saved"; (.last_section | tostring)),
+      row("Completed sections"; ((.completed_sections // []) | map(tostring) | join(", ")))
+    ' "$PROGRESS_FILE"
+    printf '\n### Answers\n\n'
+
+    local count
+    count=$(jq -r '(.answers // {}) | length' "$PROGRESS_FILE")
+    if [ "${count:-0}" -gt 0 ]; then
+      printf '| Key | Value |\n|---|---|\n'
+      jq -r '
+        (.answers // {})
+        | to_entries
+        | sort_by(.key)
+        | .[]
+        | "| `" + .key + "` | " + ((.value // "") | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) + " |"
+      ' "$PROGRESS_FILE"
+    else
+      printf '_No answers recorded yet._\n'
+    fi
+    printf '\n%s\n' "$end_marker"
+  } > "$appendix"
+
+  # Strip any previous fenced block, then append the fresh one.
+  awk -v b="$begin_marker" -v e="$end_marker" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    skip != 1 { print }
+  ' "$INTAKE_FILE" > "$tmp"
+
+  # Trim trailing blank lines, then append.
+  awk 'BEGIN{blank=0} /^$/{blank++; next} {while(blank-->0) print ""; blank=0; print} END{print ""}' "$tmp" > "$INTAKE_FILE"
+  cat "$appendix" >> "$INTAKE_FILE"
+
+  rm -f "$tmp" "$appendix"
 }
 
 # ================================================================
 # PROGRESS: Save an answer to the progress file
 # ================================================================
+# Audit code-intake-wizard-5: bail out early when the pause sentinel
+# exists. Before this guard, callers like `problem=$(prompt_input ...)`
+# followed by `save_answer "problem_statement" "$problem"` would write
+# the empty string returned by the paused prompt, corrupting whatever
+# the user had previously saved. The guard combined with the early-
+# exit checks in prompt_input/prompt_choice/prompt_with_suggestions
+# makes pause immediate at the granularity of the next prompt.
 save_answer() {
+  if [ -f "${_PAUSE_FILE:-/dev/null/sentinel-cannot-exist}" ]; then
+    return
+  fi
   local key="$1"
   local value="$2"
   if command -v python3 &>/dev/null; then
@@ -359,8 +530,9 @@ load_project_context() {
   if [ -f "$phase_file" ] && command -v jq &>/dev/null; then
     PROJECT_NAME=$(jq -r '.project // empty' "$phase_file" 2>/dev/null)
     TRACK=$(jq -r '.track // empty' "$phase_file" 2>/dev/null)
-    DEPLOYMENT=$(jq -r '.deployment // empty' "$phase_file" 2>/dev/null)
-    POC_MODE=$(jq -r '.poc_mode // empty' "$phase_file" 2>/dev/null)
+    # BL-095: parse via the # BL-095-STATE-READERS fence (lib/helpers-core.sh).
+    DEPLOYMENT=$(soif_read_deployment "$phase_file")
+    POC_MODE=$(soif_read_poc_mode "$phase_file")
     [ "$POC_MODE" = "null" ] && POC_MODE=""
   fi
 
@@ -405,17 +577,90 @@ run_section_1() {
   repo_url=$(prompt_input "Repository URL (if already created, or Enter to skip)" "")
   save_answer "repo_url" "${repo_url:-TBD}"
 
+  run_section_1_repo_setup
+
+  save_section 1
+  echo ""
+}
+
+# ================================================================
+# BL-204-VISIBILITY-EXPLAIN — plain-language private vs public
+# ================================================================
+# BL-204 finding 6: the visibility prompt was a bare `private|public` with
+# zero explanation, and choosing "private" on a free-tier personal GitHub
+# account silently forfeits branch protection — a cost that only surfaces
+# much later in the run, as an attestation prompt the user has no context
+# for. Say it HERE, where the choice is actually made.
+_bl204_explain_visibility() {
+  print_info "Who can see this code?"
+  print_info "  private — only you and the people you invite can see the code. Most projects."
+  print_info "  public  — anyone on the internet can read the code. Only you can change it."
+  print_info ""
+  print_info "One trade-off worth knowing before you choose:"
+  print_info "  On a free personal GitHub account, a PRIVATE repo cannot have branch protection"
+  print_info "  (the safety rail that stops accidental force-pushes and deletions of main)."
+  print_info "  If you pick private on a free account, the framework will later ask you to"
+  print_info "  attest that you follow those rules by hand instead. A PUBLIC repo on the same"
+  print_info "  free account gets the real thing, and so does a private repo on a paid plan."
+}
+
+# ================================================================
+# SECTION 1 (repo half): git host + repository visibility
+# ================================================================
+# Split out of run_section_1 by BL-204 so the whole repo-setup exchange —
+# the "why", the prefill, the probe, the visibility explanation — is one
+# reviewable unit that tests can drive in isolation.
+run_section_1_repo_setup() {
+  # BL-204-REMOTE-WHY (finding 8): say why any of this matters BEFORE asking
+  # which host. Pre-fix this framing existed ONLY inside the data-loss warning
+  # arm, i.e. only after something had already gone wrong.
+  print_info "About the next two questions: your remote is your backup."
+  print_info "It is the copy of this project that lives somewhere other than this machine."
+  print_info "If this disk dies and there is no remote, every bit of the work is gone."
+  echo ""
+
   # --- Git host selection (spec 2026-04-21 host-aware repo gate) ---
-  local git_host
-  git_host=$(prompt_choice "Git host for this project:" \
-    "github" \
-    "gitlab" \
-    "bitbucket" \
-    "other")
+  # BL-204-PREFILL (finding 7): the host was already chosen during init and
+  # recorded in .claude/manifest.json — by the time this wizard runs the
+  # remote usually EXISTS. Asking again, blind, reads to a novice as "my
+  # earlier answer didn't save". Show what is remembered and confirm it.
+  local git_host="" remembered_host="" host_was_remembered=0
+  if [ -f "$MANIFEST_FILE" ] && command -v jq >/dev/null 2>&1; then
+    :  # guard: keeps the block well-formed when the marked read is excised
+    remembered_host=$(jq -r '.host // empty' "$MANIFEST_FILE" 2>/dev/null || echo "")  # BL-204-PREFILL-READ
+  fi
+  if [ -n "$remembered_host" ]; then
+    host_was_remembered=1
+    print_info "Remembered from your setup answers — git host: $remembered_host"
+    print_info "(recorded in .claude/manifest.json; you are confirming it, not re-answering it)"
+    local host_confirm
+    host_confirm=$(prompt_choice "Keep '$remembered_host' as the git host?" \
+      "keep it" \
+      "change it")
+    if [ "$host_confirm" = "change it" ]; then
+      host_was_remembered=0
+      git_host=$(prompt_choice "Git host for this project:" \
+        "github" \
+        "gitlab" \
+        "bitbucket" \
+        "other")
+    else
+      git_host="$remembered_host"
+    fi
+  else
+    git_host=$(prompt_choice "Git host for this project:" \
+      "github" \
+      "gitlab" \
+      "bitbucket" \
+      "other")
+  fi
   save_answer "git_host" "$git_host"
 
-  # Probe CLI availability for first-class hosts (github/gitlab/bitbucket)
-  if [ "$git_host" != "other" ]; then
+  # BL-204-PROBE-AT-SELECT (wizard half of finding 5): probe only when the
+  # host is genuinely being CHOSEN here. A remembered host means init already
+  # created the remote against it, so a second probe is noise at best and, if
+  # the CLI has since been uninstalled, an alarming false problem.
+  if [ "$host_was_remembered" -eq 0 ] && [ "$git_host" != "other" ]; then
     local dispatcher="$SCRIPT_DIR/lib/host.sh"
     local driver="$SCRIPT_DIR/host-drivers/$git_host.sh"
     if [ -f "$dispatcher" ] && [ -f "$driver" ]; then
@@ -442,7 +687,14 @@ run_section_1() {
             save_answer "git_host" "$git_host"
             ;;
           continue)
-            echo "Continuing intake — CLI will be verified again at init.sh." >&2
+            # BL-204 finding 5: the pre-fix line here promised the CLI would
+            # "be verified again at init.sh". That is backwards — this wizard
+            # runs AFTER init, so nothing downstream re-verifies. Name the
+            # actual remediation instead.
+            echo "Continuing intake — the wizard itself does not need the host CLI." >&2
+            echo "Setting up the remote already happened during setup. If that step did" >&2
+            echo "not finish, install and authenticate the CLI, then run:" >&2
+            echo "  bash scripts/check-gate.sh --repair" >&2
             ;;
         esac
       fi
@@ -451,12 +703,32 @@ run_section_1() {
   fi
 
   # --- Repository visibility ---
-  local repo_visibility
-  repo_visibility=$(prompt_choice "Repository visibility:" "private" "public")
+  # BL-204-PREFILL (finding 7): visibility lives only in
+  # .claude/intake-progress.json::answers.repo_visibility — the manifest never
+  # records it. Same confirm-don't-re-ask treatment as the host above; the two
+  # halves prefill independently because their sources are independent.
+  local repo_visibility="" remembered_visibility=""
+  if [ -f "$PROGRESS_FILE" ] && command -v jq >/dev/null 2>&1; then
+    :  # guard: keeps the block well-formed when the marked read is excised
+    remembered_visibility=$(jq -r '.answers.repo_visibility // empty' "$PROGRESS_FILE" 2>/dev/null || echo "")  # BL-204-PREFILL-READ
+  fi
+  if [ -n "$remembered_visibility" ]; then
+    print_info "Remembered from your setup answers — repository visibility: $remembered_visibility"
+    local vis_confirm
+    vis_confirm=$(prompt_choice "Keep '$remembered_visibility' as the repository visibility?" \
+      "keep it" \
+      "change it")
+    if [ "$vis_confirm" = "change it" ]; then
+      _bl204_explain_visibility
+      repo_visibility=$(prompt_choice "Repository visibility:" "private" "public")
+    else
+      repo_visibility="$remembered_visibility"
+    fi
+  else
+    _bl204_explain_visibility
+    repo_visibility=$(prompt_choice "Repository visibility:" "private" "public")
+  fi
   save_answer "repo_visibility" "$repo_visibility"
-
-  save_section 1
-  echo ""
 }
 
 # ================================================================
@@ -764,8 +1036,107 @@ run_section_5() {
   backup=$(prompt_with_suggestions "Backup requirements" "backup_strategy" "Daily automated backups")
   save_answer "backup" "$backup"
 
+  # 5.5 Phase 1 Data Classification & ZDR Attestation (tier-crosscheck-6)
+  #
+  # docs/governance-framework.md § VII line 299 declares a Mandatory ZDR
+  # gate at Phase 1: projects classified Internal or higher MUST use the
+  # ZDR or self-hosted deployment path. The gate was documented but
+  # never enforced; this section captures the two values that
+  # scripts/check-phase-gate.sh now reads as a Phase 1→2 invariant
+  # (the same way it treats github_free_tier branch-protection
+  # attestation, PR #75). 7-tier taxonomy mirrors
+  # templates/project-intake.md:209.
+  if [ ! -f "${_PAUSE_FILE:-/dev/null/sentinel-cannot-exist}" ]; then
+    echo ""
+    print_info "5.5 Data Classification & ZDR Attestation (Phase 1 invariant — tier-crosscheck-6)"
+    echo ""
+    local data_classification
+    data_classification=$(prompt_choice "Highest classification of any data this system handles:" \
+      "public" "internal" "confidential" "pii" "financial" "health" "regulated")
+    save_answer "data_classification" "$data_classification"
+
+    local zdr_attested="false" zdr_attestation_reason=""
+    if [ "$data_classification" = "public" ]; then
+      print_info "  Public data: ZDR not required (governance-framework.md § VII line 297-299)."
+      zdr_attested="false"
+    else
+      if prompt_yes_no "Is ZDR (Zero Data Retention) or self-hosted LLM in place for this project? [Y/n]" "Y"; then
+        zdr_attested="true"
+      else
+        zdr_attested="false"
+        zdr_attestation_reason=$(prompt_input "Documented exception (required when ZDR not attested) — e.g. 'customer SOW requires retention'" "")
+        if [ -z "$zdr_attestation_reason" ]; then
+          print_warn "ZDR not attested AND no documented exception — Phase 1→2 gate will FAIL until this is set."
+          print_warn "Run: bash scripts/reconfigure-project.sh --field zdr_attestation_reason --new \"<text>\""
+        fi
+      fi
+    fi
+    save_answer "zdr_attested" "$zdr_attested"
+    save_answer "zdr_attestation_reason" "$zdr_attestation_reason"
+
+    # Mirror the captured values into .claude/process-state.json so
+    # scripts/check-phase-gate.sh can read them as a Phase 1→2 invariant.
+    # This is the canonical location for Phase 1 artifacts; the
+    # answers/ copy in intake-progress.json is for resume/audit only.
+    persist_phase1_artifacts "$data_classification" "$zdr_attested" "$zdr_attestation_reason"
+  fi
+
   save_section 5
   echo ""
+}
+
+# ================================================================
+# PHASE 1 ARTIFACTS: persist data_classification + ZDR attestation
+# into .claude/process-state.json::phase1_artifacts.
+# ================================================================
+# tier-crosscheck-6: the gate at scripts/check-phase-gate.sh reads from
+# this canonical location. The function is idempotent — re-running with
+# the same values is a no-op write; running with different values
+# overwrites in-place. process-state.json is initialized at init.sh
+# time (.phase2_init etc.); we add phase1_artifacts when absent.
+persist_phase1_artifacts() {
+  local classification="$1"
+  local attested="$2"
+  local reason="$3"
+  local pstate="${PROJECT_ROOT:-.}/.claude/process-state.json"
+  if [ ! -f "$pstate" ]; then
+    print_warn "  $pstate not found — skipping phase1_artifacts persistence."
+    print_info "  Run scripts/init.sh in this project to create it, then re-run intake."
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    print_warn "  jq not available — skipping phase1_artifacts persistence (data captured in intake-progress.json)."
+    return 0
+  fi
+  local jq_bool="false"
+  case "$attested" in
+    true|True|TRUE) jq_bool="true" ;;
+  esac
+  local tmp
+  tmp=$(mktemp)
+  # PR #105 verifier follow-up: the prior implementation ran
+  # `jq ... > tmp && mv tmp pstate` followed by an unconditional
+  # `print_ok` — a malformed process-state.json produced "Phase 1
+  # artifacts persisted" on stdout and rc=0 even though jq's parse
+  # error went to stderr and the file was unchanged. Capture both
+  # exit codes and refuse to print success unless the chain actually
+  # succeeded.
+  if ! jq --arg c "$classification" --argjson a "$jq_bool" --arg r "$reason" \
+       '.phase1_artifacts = ((.phase1_artifacts // {}) +
+          {data_classification: $c, zdr_attested: $a, zdr_attestation_reason: $r})' \
+       "$pstate" > "$tmp"; then
+    rm -f "$tmp"
+    print_fail "  Phase 1 artifacts persistence failed: jq could not parse $pstate" >&2
+    echo "  Remediation: inspect $pstate for malformed JSON (truncation, stray characters)." >&2
+    echo "  If the file is unrecoverable, restore from a .bak or re-run scripts/init.sh." >&2
+    return 1
+  fi
+  if ! mv "$tmp" "$pstate"; then
+    rm -f "$tmp"
+    print_fail "  Phase 1 artifacts persistence failed: mv into $pstate failed (cross-filesystem? read-only?)" >&2
+    return 1
+  fi
+  print_ok "  Phase 1 artifacts persisted to process-state.json (classification=$classification, zdr_attested=$attested)"
 }
 
 # ================================================================
@@ -810,6 +1181,14 @@ run_section_6() {
   print_info "Every honest 'No' adds automated coverage. Every dishonest 'Yes' creates a gap."
   echo ""
 
+  # Audit code-intake-wizard-6: capture the template's third column
+  # ("Automated Tooling Required?") so Phase 3 enforcement and Phase 2
+  # exit peer-review (baseline §3.3 / §3.4 — Security row drives the
+  # organizational peer-review gate) have a recorded source of truth.
+  # For Partially/No answers we present a framework-default tooling
+  # bundle per domain; the operator presses Enter to accept the default
+  # or overrides with free text. Yes answers store "N/A" so the
+  # rendered table is column-complete.
   local domains=("Product/UX Logic" "Frontend Code" "Backend/API Design" "Database Design" "Security" "DevOps/Infrastructure" "Accessibility" "Performance" "Mobile")
   for domain in "${domains[@]}"; do
     local assessment
@@ -822,6 +1201,31 @@ run_section_6() {
     local key
     key=$(echo "$domain" | tr '/ ' '_' | tr '[:upper:]' '[:lower:]')
     save_answer "competency_$key" "$assessment"
+
+    # Tooling capture (third column). Skip silently after a pause.
+    if [ -f "${_PAUSE_FILE:-/dev/null/sentinel-cannot-exist}" ]; then
+      continue
+    fi
+    local tooling
+    if [ "$assessment" = "Yes" ]; then
+      tooling="N/A"
+    else
+      local default_tooling
+      case "$key" in
+        product_ux_logic)      default_tooling="UX heuristic review + usability test script" ;;
+        frontend_code)         default_tooling="ESLint + Prettier + axe-core + Playwright" ;;
+        backend_api_design)    default_tooling="OpenAPI contract tests + Postman/Newman + schemathesis" ;;
+        database_design)       default_tooling="SQL linter (sqlfluff) + schema-migration tests + EXPLAIN review" ;;
+        security)              default_tooling="gitleaks + Semgrep + Snyk (SCA + container)" ;;
+        devops_infrastructure) default_tooling="tflint + checkov + IaC plan review + GitHub Actions linter" ;;
+        accessibility)         default_tooling="axe-core + Lighthouse a11y audit + screen-reader smoke test" ;;
+        performance)           default_tooling="Lighthouse perf + k6 (load) + Web Vitals dashboard" ;;
+        mobile)                default_tooling="Detox/XCUITest + device farm (BrowserStack/Sauce) + crash reporting" ;;
+        *)                     default_tooling="Recommended automated tooling (TBD — define before Phase 3)" ;;
+      esac
+      tooling=$(prompt_input "  Automated tooling for $domain" "$default_tooling")
+    fi
+    save_answer "competency_${key}_tooling" "$tooling"
   done
 
   # 6.3 Development Environment
@@ -899,14 +1303,22 @@ run_section_6() {
       mobile_offline=$(prompt_with_suggestions "Offline strategy" "offline_strategy" "Offline tolerant")
       save_answer "mobile_offline" "$mobile_offline"
       ;;
-    cli)
-      local cli_distribution
-      cli_distribution=$(prompt_with_suggestions "Distribution method" "distribution" "")
-      save_answer "cli_distribution" "$cli_distribution"
+    mcp_server)
+      # Audit specs-plans-init-intake-noninteractive-3: aligns wizard with the
+      # 2026-04-25 non-interactive spec + the shipped mcp_server.json
+      # suggestion file (the older `cli` branch referenced a never-created
+      # cli.json and silently fell through).
+      local mcp_server_transport
+      mcp_server_transport=$(prompt_with_suggestions "Transport" "transport" "")
+      save_answer "mcp_server_transport" "$mcp_server_transport"
 
-      local cli_ui
-      cli_ui=$(prompt_with_suggestions "Interface style" "ui_framework" "")
-      save_answer "cli_ui" "$cli_ui"
+      local mcp_server_sdk
+      mcp_server_sdk=$(prompt_with_suggestions "MCP SDK" "mcp_sdk" "")
+      save_answer "mcp_server_sdk" "$mcp_server_sdk"
+
+      local mcp_server_persistence
+      mcp_server_persistence=$(prompt_with_suggestions "Persistence" "persistence" "")
+      save_answer "mcp_server_persistence" "$mcp_server_persistence"
       ;;
   esac
 
@@ -1251,10 +1663,101 @@ run_section_11() {
 }
 
 # ================================================================
-# SECTION 12: Agent Initialization Prompt (auto-generated)
+# SECTION 11.5: Testing & Bug Tracking (Audit code-intake-wizard-2)
+# Pre-fix, the wizard jumped from Section 11 to 12 entirely, leaving
+# the five testing/bug-tracking template fields blank. Tier-aware
+# defaults: Standard/Full set testing_interval=2 features and the
+# SEV SLAs (24h critical / 7d high / best-effort low). Light skips
+# UAT prompts and defaults human_tester_count=1.
 # ================================================================
+run_section_11_5() {
+  print_step "Section 11.5: Testing & Bug Tracking"
+  echo ""
+
+  local track
+  track=$(jq -r '.track // .answers.track // "standard"' "$PROGRESS_FILE" 2>/dev/null || echo "standard")
+
+  local interval sev_critical sev_high sev_low tester_count uat_role bug_tool
+  case "$track" in
+    light)
+      interval=$(prompt_input "Test session interval (every N features)" "5")
+      tester_count=$(prompt_input "Number of human testers" "1")
+      # Light track skips formal SEV SLAs + UAT role prompts.
+      sev_critical="best-effort"
+      sev_high="best-effort"
+      sev_low="best-effort"
+      uat_role="self"
+      ;;
+    *)
+      # Standard / Full
+      interval=$(prompt_input "Test session interval (every N features)" "2")
+      tester_count=$(prompt_input "Number of human testers" "1")
+      sev_critical=$(prompt_input "SEV-Critical fix SLA" "24 hours")
+      sev_high=$(prompt_input "SEV-High fix SLA" "7 days")
+      sev_low=$(prompt_input "SEV-Low fix SLA" "best-effort")
+      uat_role=$(prompt_input "UAT responsibility (self / sponsor / pilot user)" "self")
+      ;;
+  esac
+  bug_tool=$(prompt_input "Bug tracking tool" "GitHub Issues")
+
+  save_answer "testing_interval"   "$interval"
+  # BL-203-INTERVAL-PLUMB — the recorded answer must also reach the ENFORCED
+  # field (.claude/build-progress.json::test_interval); saving it into the
+  # intake record alone is the silent no-op BL-203 documents. test-gate.sh
+  # --set-interval is the single writer.
+  if [ -f "scripts/test-gate.sh" ]; then
+    if bash scripts/test-gate.sh --set-interval "$interval" >/dev/null 2>&1; then
+      print_info "Enforced testing interval set to every $interval feature(s)."
+    else
+      print_warn "Could not update the enforced interval — run: bash scripts/test-gate.sh --set-interval $interval"
+    fi
+  else
+    # R-BL203-7: an absent writer must not become the silent no-op again.
+    print_warn "scripts/test-gate.sh not found — the enforced interval is unchanged. Run: bash scripts/test-gate.sh --set-interval $interval"
+  fi
+  save_answer "human_tester_count" "$tester_count"
+  save_answer "sev_critical_sla"   "$sev_critical"
+  save_answer "sev_high_sla"       "$sev_high"
+  save_answer "sev_low_sla"        "$sev_low"
+  save_answer "uat_role"           "$uat_role"
+  save_answer "bug_tracking_tool"  "$bug_tool"
+
+  # Persist as integer 115 so save_section's int() cast and the
+  # completed_sections.sort() stay homogeneous. 115 sits between 11 and 12
+  # which preserves "what's next" arithmetic in resume logic.
+  save_section 115
+  echo ""
+}
+
+# ================================================================
+# SECTION 12: Tooling Configuration (auto-populated)
+# ================================================================
+# Audit code-intake-wizard-3: align wizard numbering with the template
+# (templates/project-intake.md §12 = Tooling Configuration, §13 =
+# Agent Initialization Prompt). The wizard previously skipped §12 and
+# called the agent-prompt section "12", which corrupted the section
+# semantics for anyone who paused at "Section 12" and later opened
+# PROJECT_INTAKE.md expecting their work in template §12.
+#
+# This wizard step is informational only — actual content is written
+# by init.sh based on the tool installation matrix (see template
+# §12's auto-populated marker and .claude/tool-preferences.json).
 run_section_12() {
-  print_step "Section 12: Agent Initialization Prompt"
+  print_step "Section 12: Tooling Configuration"
+  print_info "Auto-populated by init.sh from .claude/tool-preferences.json"
+  print_info "and the tool installation matrix — skipping interactive prompts."
+  save_section 12
+  echo ""
+}
+
+# ================================================================
+# SECTION 13: Agent Initialization Prompt (auto-generated)
+# ================================================================
+# Audit code-intake-wizard-3: this used to be `run_section_12` and
+# was labelled "Section 12: Agent Initialization Prompt", which
+# misaligned with templates/project-intake.md (§13 in the template).
+run_section_13() {
+  print_step "Section 13: Agent Initialization Prompt"
   print_info "Auto-generating from your answers..."
 
   # Read accessibility answers for the prompt
@@ -1280,8 +1783,8 @@ PYEOF
 )
   fi
 
-  print_ok "Section 12 auto-generated."
-  save_section 12
+  print_ok "Section 13 auto-generated."
+  save_section 13
   echo ""
 }
 
@@ -1300,7 +1803,17 @@ run_script_mode() {
   print_info "Type '?' at prompts marked with [? for suggestions] to see options."
   echo ""
 
-  local sections=(1 2 3 4 5 6 7 8 9 10 11 12)
+  # Section IDs: 1..11, 115 (Testing & Bug Tracking), 12, 13.
+  # The 115 ID encodes "between 11 and 12" while keeping the value an
+  # integer for save_section / is_section_complete; the runner maps it
+  # back to function name run_section_11_5 below.
+  #
+  # Audit code-intake-wizard-3: §12 (Tooling Configuration, auto-
+  # populated) and §13 (Agent Initialization Prompt, auto-generated)
+  # are now distinct wizard steps that mirror the template's
+  # numbering, instead of the old single "Section 12" that ran §13's
+  # content.
+  local sections=(1 2 3 4 5 6 7 8 9 10 11 115 12 13)
   for section in "${sections[@]}"; do
     if [ "$section" -lt "$start_section" ]; then
       continue
@@ -1311,17 +1824,32 @@ run_script_mode() {
       continue
     fi
 
-    "run_section_$section"
+    # Map 115 → run_section_11_5; all other ids match function names verbatim.
+    case "$section" in
+      115) "run_section_11_5" ;;
+      *)   "run_section_$section" ;;
+    esac
     check_pause_requested
   done
+
+  # Final render — ensures the appendix reflects every saved answer
+  # even if save_section's per-section render was skipped.
+  render_intake_file || true
 
   echo ""
   echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
   echo -e "${GREEN}${BOLD}║              Intake Complete!                           ║${NC}"
   echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
   echo ""
-  print_ok "PROJECT_INTAKE.md answers saved to $PROGRESS_FILE"
-  print_info "Review PROJECT_INTAKE.md, then start Claude Code and begin Phase 0."
+  print_ok "Answers saved to $PROGRESS_FILE"
+  print_ok "PROJECT_INTAKE.md updated with 'Intake Answers (Auto-Populated)' appendix"
+  print_ok "Done — your answers are recorded in the appendix at the end of PROJECT_INTAKE.md."
+  echo ""
+  echo "  Next: open Claude Code and give it the project."
+  echo "    1. Type:  claude"
+  echo "    2. It will sit there quietly until you send a message — that's normal."
+  echo "    3. Paste the first message printed by:  bash scripts/resume.sh"
+  echo "       (it prints your project's own Section 13 initialization prompt)"
   echo ""
 }
 
@@ -1355,7 +1883,7 @@ PROMPTEOF
 
 ## Instructions
 
-1. Walk through PROJECT_INTAKE.md section by section (Sections 1-12).
+1. Walk through PROJECT_INTAKE.md section by section (Sections 1-13).
 2. Section 1 is mostly pre-filled from context above — confirm and fill remaining fields (target platforms, codename, repo URL).
 3. For each field, explain its purpose briefly, then ask the question.
 4. When the user says "I'm not sure" or asks for help, offer 2-3 options ranked by fit for their project type ($PLATFORM, $LANGUAGE, $TRACK), with a one-sentence explanation of why each fits.
@@ -1368,8 +1896,10 @@ PROMPTEOF
    - **Sponsored POC:** Organization knows. AI deployment path + sponsor + time allocation required. Insurance, liability, ITSM, exit criteria, backup maintainer deferred. Constraints: no production deployment, no real user data, no external users. All technical work is production-grade.
    - **Private POC:** Personal exploration. All pre-conditions deferred. Same constraints as Sponsored POC.
 8. Write completed sections into PROJECT_INTAKE.md progressively as you go.
-9. Section 12 (Agent Initialization Prompt): auto-generate from the answers. Do not ask the user to write this.
-10. At the end, summarize what was filled in and flag any fields left blank.
+9. Section 12 (Tooling Configuration) is auto-populated by \`init.sh\` from \`.claude/tool-preferences.json\` — do not prompt the user; confirm the section is recorded and move on.
+10. Section 13 (Agent Initialization Prompt): auto-generate from the answers. Do not ask the user to write this.
+11. At the end, summarize what was filled in and flag any fields left blank.
+12. After Section 11.5's testing interval is answered, run \`bash scripts/test-gate.sh --set-interval N\` (N = the answer) — the recorded answer does not reach the enforced gate by itself (BL-203), and this path never runs the wizard's own plumbing. This heredoc is UNQUOTED (context values substitute), so backticks here MUST stay escaped or they execute at prompt-generation time (review R-BL203-1).
 
 ## Suggestion Data
 
@@ -1409,9 +1939,10 @@ PROMPTEOF
   echo "    2. Generate prompt file only"
   echo "       INTAKE_GUIDED_PROMPT.md is ready for you to review first."
   echo "       When ready: claude \"Read INTAKE_GUIDED_PROMPT.md and begin\""
+  echo "       (a blank Claude Code screen means it is ready and waiting, not stuck)"
   echo ""
   local launch_choice
-  read -rp "$(echo -e "  ${BOLD}Select [1-2]${NC}: ")" launch_choice
+  read -rp "$(echo -e "  ${BOLD}Select [1-2]${NC}: ")" launch_choice # lint-raw-read-prompt: allow intake-wizard.sh interactive-only launch-mode choice (1 = launch Claude, 2 = generate prompt file); wizard is interactive-only by design
 
   if [ "$launch_choice" = "1" ]; then
     if command -v claude &>/dev/null; then
@@ -1419,7 +1950,8 @@ PROMPTEOF
       cd "$PROJECT_ROOT"
       exec claude "Read INTAKE_GUIDED_PROMPT.md and follow its instructions to help me fill out PROJECT_INTAKE.md."
     else
-      print_warn "Claude Code not found. Install it first, then run:"
+      print_warn "Claude Code isn't installed on this computer."
+      print_info "Install it from https://claude.com/claude-code, then run:"
       echo "  claude \"Read INTAKE_GUIDED_PROMPT.md and begin\""
     fi
   else
@@ -1451,9 +1983,12 @@ run_upgrade_to_production() {
   print_info "Upgrading to Production Build. You'll resolve deferred pre-conditions."
   echo ""
 
-  # Re-run Section 8 in production mode
+  # Re-run Section 8 in production mode. Preserve current DEPLOYMENT —
+  # personal/Private POC upgrades to personal/Production; organizational/
+  # Sponsored POC upgrades to organizational/Production. Prior behavior
+  # forced DEPLOYMENT=organizational, which silently converted personal
+  # POC projects to organizational on the upgrade.
   POC_MODE=""
-  DEPLOYMENT="organizational"
   run_section_8
 
   # Update progress file
@@ -1524,7 +2059,7 @@ ask_project_context() {
     echo "  Deployment: $DEPLOYMENT"
     [ -n "$POC_MODE" ] && echo "  POC Mode:   ${POC_MODE//_/ }"
     echo ""
-    read -rp "$(echo -e "${BOLD}Is this correct? [Y/n]${NC}: ")" confirm
+    read -rp "$(echo -e "${BOLD}Is this correct? [Y/n]${NC}: ")" confirm # lint-raw-read-prompt: allow intake-wizard.sh interactive-only summary confirmation; wizard is interactive-only by design
     if [[ "$confirm" =~ ^[Nn] ]]; then
       print_info "You can change fields in the intake wizard Section 1."
       print_info "Structural changes (platform, language, track) will trigger project reconfiguration."
@@ -1540,7 +2075,11 @@ ask_project_context() {
     PROJECT_DESCRIPTION=$(prompt_input "One-sentence description" "")
   fi
   if [ -z "$PLATFORM" ]; then
-    PLATFORM=$(prompt_choice "Platform:" "web" "desktop" "mobile" "cli" "other")
+    # Audit specs-plans-init-intake-noninteractive-3: the shipped suggestion
+    # files cover web/desktop/mobile/mcp_server (not `cli`). Keep the prompt
+    # aligned with the actually-shipped set so prompt_with_suggestions can
+    # resolve the correct platform suggestions file.
+    PLATFORM=$(prompt_choice "Platform:" "web" "desktop" "mobile" "mcp_server" "other")
   fi
   if [ -z "$TRACK" ]; then
     TRACK=$(prompt_choice "Track:" "light" "standard" "full")
@@ -1569,11 +2108,106 @@ main() {
       echo "  --upgrade-deployment T  Upgrade deployment (personal|organizational)"
       echo "  --to-private-poc        Upgrade Personal -> Private POC"
       echo "  --to-sponsored-poc      Upgrade Personal/Private POC -> Sponsored POC"
-      echo "  --to-sponsored-poc      Convert to sponsored POC"
+      echo ""
+      echo "Phase 1 ZDR/classification non-interactive flags (tier-crosscheck-6):"
+      echo "  --data-classification VALUE        Set data_classification (one of:"
+      echo "                                     public, internal, confidential, pii,"
+      echo "                                     financial, health, regulated)"
+      echo "  --zdr-attested                     Mark zdr_attested=true"
+      echo "  --zdr-attestation-reason \"<text>\"  Record a documented exception"
+      echo ""
       echo "  --help                  Show this help"
       exit 0
       ;;
+    --data-classification|--zdr-attested|--zdr-attestation-reason|--data-classification=*|--zdr-attestation-reason=*)
+      # tier-crosscheck-6 non-interactive write path. Parsed below
+      # (after PROJECT_ROOT is resolved) so the helper can read/write
+      # .claude/process-state.json + .claude/intake-progress.json.
+      ;;
   esac
+
+  # Collect tier-crosscheck-6 CLI flags. We re-scan "$@" so flags can
+  # appear anywhere on the line (and so --resume / --upgrade-* paths
+  # above keep working unchanged).
+  TC6_CLASSIFICATION=""
+  TC6_ATTESTED=""
+  TC6_REASON=""
+  TC6_PROVIDED=0
+  _tc6_args=("$@")
+  _i=0
+  while [ "$_i" -lt "${#_tc6_args[@]}" ]; do
+    case "${_tc6_args[$_i]}" in
+      --data-classification)
+        TC6_CLASSIFICATION="${_tc6_args[$((_i + 1))]:-}"; TC6_PROVIDED=1
+        _i=$((_i + 2)); continue ;;
+      --data-classification=*)
+        TC6_CLASSIFICATION="${_tc6_args[$_i]#--data-classification=}"; TC6_PROVIDED=1
+        _i=$((_i + 1)); continue ;;
+      --zdr-attested)
+        TC6_ATTESTED="true"; TC6_PROVIDED=1
+        _i=$((_i + 1)); continue ;;
+      --zdr-attestation-reason)
+        TC6_REASON="${_tc6_args[$((_i + 1))]:-}"; TC6_PROVIDED=1
+        _i=$((_i + 2)); continue ;;
+      --zdr-attestation-reason=*)
+        TC6_REASON="${_tc6_args[$_i]#--zdr-attestation-reason=}"; TC6_PROVIDED=1
+        _i=$((_i + 1)); continue ;;
+    esac
+    _i=$((_i + 1))
+  done
+  if [ "$TC6_PROVIDED" = "1" ]; then
+    # Validate classification value (if provided).
+    if [ -n "$TC6_CLASSIFICATION" ]; then
+      TC6_CLASSIFICATION_CANON=$(printf '%s' "$TC6_CLASSIFICATION" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      case "$TC6_CLASSIFICATION_CANON" in
+        public|internal|confidential|pii|financial|health|regulated)
+          TC6_CLASSIFICATION="$TC6_CLASSIFICATION_CANON" ;;
+        *)
+          echo "Error: --data-classification '$TC6_CLASSIFICATION' is not in the 7-tier taxonomy."
+          echo "       Allowed: public, internal, confidential, pii, financial, health, regulated"
+          exit 1 ;;
+      esac
+    fi
+    # When the operator supplies any tier-crosscheck-6 flag, treat it
+    # as a one-shot write to process-state.json and exit cleanly. The
+    # wizard's interactive flow is intentionally NOT entered.
+    if command -v jq >/dev/null 2>&1 && [ -f .claude/process-state.json ]; then
+      _tc6_attested_json="false"
+      [ "$TC6_ATTESTED" = "true" ] && _tc6_attested_json="true"
+      _tc6_tmp=$(mktemp)
+      # PR #105 verifier follow-up: the prior implementation chained
+      # `jq ... > tmp && mv tmp pstate` and then unconditionally printed
+      # "Phase 1 artifacts updated" + exit 0. A malformed
+      # process-state.json produced jq's parse error on stderr, the
+      # success message on stdout, and rc=0 — operator told the write
+      # succeeded when nothing had been written. Surface failure now.
+      if ! jq --arg c "$TC6_CLASSIFICATION" --argjson a "$_tc6_attested_json" --arg r "$TC6_REASON" \
+           '.phase1_artifacts = ((.phase1_artifacts // {}) +
+              (if $c != "" then {data_classification: $c} else {} end) +
+              (if $a == true then {zdr_attested: true} else {} end) +
+              (if $r != "" then {zdr_attestation_reason: $r} else {} end))' \
+           .claude/process-state.json > "$_tc6_tmp"; then
+        rm -f "$_tc6_tmp"
+        echo "[FAIL] intake-wizard.sh: could not update .claude/process-state.json — jq parse failure." >&2
+        echo "  Remediation: inspect .claude/process-state.json for malformed JSON (truncation, stray characters)." >&2
+        echo "  If the file is unrecoverable, restore from a .bak or re-run scripts/init.sh." >&2
+        exit 1
+      fi
+      if ! mv "$_tc6_tmp" .claude/process-state.json; then
+        rm -f "$_tc6_tmp"
+        echo "[FAIL] intake-wizard.sh: mv into .claude/process-state.json failed (cross-filesystem? read-only?)." >&2
+        exit 1
+      fi
+      echo "Phase 1 artifacts updated in .claude/process-state.json:"
+      echo "  data_classification    = '${TC6_CLASSIFICATION:-(unchanged)}'"
+      echo "  zdr_attested           = '${TC6_ATTESTED:-(unchanged)}'"
+      echo "  zdr_attestation_reason = '${TC6_REASON:-(unchanged)}'"
+      exit 0
+    else
+      echo "Error: jq + .claude/process-state.json required for --data-classification / --zdr-* flags." >&2
+      exit 1
+    fi
+  fi
 
   # Check we're in a project directory
   if [ ! -f "$INTAKE_FILE" ]; then
@@ -1595,10 +2229,18 @@ main() {
       exit 0
       ;;
     --upgrade-to-production)
+      # Audit specs-plans-init-intake-noninteractive-8 (Option C):
+      # delegate the canonical state mutation to upgrade-project.sh, then
+      # sync intake-progress.json's poc_mode mirror so the wizard's own
+      # state file stays consistent with phase-state.json.
       if [ -x "scripts/upgrade-project.sh" ]; then
-        exec bash scripts/upgrade-project.sh --to-production
+        bash scripts/upgrade-project.sh --to-production || exit $?
+        if command -v jq &>/dev/null && [ -f "$PROGRESS_FILE" ]; then
+          tmp=$(mktemp)
+          jq '.poc_mode = null' "$PROGRESS_FILE" > "$tmp" && mv "$tmp" "$PROGRESS_FILE"
+        fi
       else
-        run_upgrade_to_production  # fallback to built-in
+        run_upgrade_to_production  # fallback when canonical script missing
       fi
       exit 0
       ;;
@@ -1644,6 +2286,23 @@ main() {
       ;;
   esac
 
+  # PR-#96 verifier follow-up: the 8 `read -rp` allowlist entries in
+  # this file (lines 85/88/115/144/146/1658/1774/1923) cite
+  # "interactive-only by design" as the reason. That documented intent,
+  # but until now nothing in the wizard ACTUALLY refused to run without
+  # a TTY — so a CI / piped-stdin invocation would block on the first
+  # prompt or auto-empty-input through every section, corrupting
+  # intake-progress.json. Enforce the contract right before the
+  # interactive mode-selection prompt below, AFTER the flag-driven
+  # passthroughs (--resume / --upgrade-* / --to-*-poc / --help) so
+  # those scripted CI use-cases keep working. Operators driving the
+  # wizard via canned input must opt in via SOIF_NONINTERACTIVE=1.
+  if [ ! -t 0 ] && [ -z "${SOIF_NONINTERACTIVE:-}" ]; then
+    print_fail "intake-wizard requires a TTY on stdin (or set SOIF_NONINTERACTIVE=1 to drive it from a harness)."
+    echo "  Detected non-TTY stdin (CI=${CI:-unset}). The wizard's read prompts would block or auto-empty-input through every section, corrupting .claude/intake-progress.json." >&2
+    exit 1
+  fi
+
   # Mode selection
   echo ""
   echo -e "${BOLD}How would you like to fill out the Project Intake?${NC}"
@@ -1665,7 +2324,7 @@ main() {
   echo ""
 
   local mode
-  read -rp "$(echo -e "${BOLD}Select [1-3]${NC}: ")" mode
+  read -rp "$(echo -e "${BOLD}Select [1-3]${NC}: ")" mode # lint-raw-read-prompt: allow intake-wizard.sh interactive-only mode selection (1=wizard, 2=AI prompt, 3=manual); wizard is interactive-only by design
 
   case "$mode" in
     1)
@@ -1700,6 +2359,8 @@ main() {
       ;;
     3)
       print_info "No problem. Open PROJECT_INTAKE.md in your editor when ready."
+      print_info "When you've filled it in, run: bash scripts/resume.sh"
+      print_info "That prints the exact message to paste into Claude Code to begin."
       print_info "See docs/reference/user-guide.md Section 3 for field-by-field guidance."
       ;;
     *)
@@ -1709,4 +2370,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${__SOLO_INTAKE_WIZARD_SOURCED__:-0}" -ne 1 ]; then
+  main "$@"
+fi

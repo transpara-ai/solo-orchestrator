@@ -28,13 +28,13 @@ This module covers MCP (Model Context Protocol) servers: services that expose to
 
 | Component | Recommended | Alternatives | Notes |
 |---|---|---|---|
-| **MCP SDK (TypeScript)** | `@modelcontextprotocol/server` + `@modelcontextprotocol/node` (modular) | `@modelcontextprotocol/sdk` (legacy monolithic) | The TypeScript SDK was split into modular packages (`core`, `client`, `server`, `node`). New projects should use the modular packages. The legacy monolithic `@modelcontextprotocol/sdk` package still works for existing code. |
+| **MCP SDK (TypeScript)** | `@modelcontextprotocol/sdk` (1.29.0 stable) | `@modelcontextprotocol/server` + `@modelcontextprotocol/node` (2.0.0-alpha.2 — **not production-ready**) | The TypeScript SDK is being modularized but the modular packages are still alpha pre-releases as of 2026-06. New projects should use the stable monolithic `@modelcontextprotocol/sdk` package. Re-evaluate when the modular packages reach 2.0.0 GA. |
 | **MCP SDK (alternatives)** | `mcp` (Python), `rmcp` (Rust) | `mcp-golang` (Go) | Python SDK is mature; Rust SDK is official. |
 | **Transport: Local** | stdio | — | Standard for Claude Code integration; server launched per-session |
 | **Transport: Remote** | Streamable HTTP (`NodeStreamableHTTPServerTransport`) | WebSocket (not standard MCP) | For centralized hosting, homelab, multi-client access. SSE transport was removed from the MCP SDK — use Streamable HTTP for all remote servers. |
 | **Schema Validation** | Zod | JSON Schema (manual) | Zod provides TypeScript type inference and runtime validation from a single source |
 
-**Solo Orchestrator recommendation:** TypeScript with the modular MCP packages (`@modelcontextprotocol/server` for server-side, `@modelcontextprotocol/node` for Node HTTP transport). Support stdio for development and local use. Add Streamable HTTP transport if multi-client or remote hosting is a requirement. The legacy `@modelcontextprotocol/sdk` package still works but is being phased out; new projects should use the modular packages from the start.
+**Solo Orchestrator recommendation:** TypeScript with the stable `@modelcontextprotocol/sdk` package (1.29.0). Support stdio for development and local use; add Streamable HTTP transport if multi-client or remote hosting is required. The modular packages (`@modelcontextprotocol/server` + `@modelcontextprotocol/node`) are the eventual replacement but are currently 2.0.0-alpha pre-releases and not yet production-ready; revisit once they reach GA.
 
 ### 1.2 Server Architecture
 
@@ -90,17 +90,20 @@ If the server needs to perform periodic work (monitoring, data refresh):
 
 ### 2.1 Pre-Build Setup (MCP-Specific)
 
+**CDF profile mapping:** When `solo-orchestrator init --platform mcp_server` runs, it invokes the Development Guardrails for Claude Code (CDF) framework's init with `--profile web-api`. CDF ships four profiles (`web-app`, `web-api`, `desktop-app`, `mobile-app`); there is no dedicated `mcp-server` profile upstream. MCP servers are JSON-RPC services over stdio or Streamable HTTP, which makes the `web-api` profile the closest fit for CDF's hook tuning (request/response logging, error envelopes, structured tool catalogues). The Solo discovery JSON still records `targetPlatform: "MCP server (JSON-RPC)"` so the project's actual nature is visible to operators. If a dedicated CDF `mcp-server` profile ships in the future, this mapping will be updated in `init.sh` and the project's `.claude/manifest.json` regenerated on the next `solo-orchestrator upgrade-project` run.
+
 In addition to the Builder's Guide Pre-Build Setup:
 
-**MCP SDK (modular — recommended for new projects):**
-```bash
-npm install @modelcontextprotocol/server @modelcontextprotocol/node
-# Add @modelcontextprotocol/client only if the same package also consumes MCP servers
-```
-
-**MCP SDK (legacy monolithic — still functional for existing code):**
+**MCP SDK (stable monolithic — recommended for new projects):**
 ```bash
 npm install @modelcontextprotocol/sdk
+```
+
+**MCP SDK (modular preview — 2.0.0-alpha as of 2026-06, not production-ready):**
+```bash
+npm install @modelcontextprotocol/server @modelcontextprotocol/node
+# Add @modelcontextprotocol/client only if the same package also consumes MCP servers.
+# Use only for evaluation; switch back to @modelcontextprotocol/sdk for shipped code.
 ```
 
 **Zod (schema validation):**
@@ -449,7 +452,7 @@ MCP-SERVER-SPECIFIC REQUIREMENTS:
 
 | Tool | Install | Purpose |
 |---|---|---|
-| MCP SDK (modular) | `npm install @modelcontextprotocol/server @modelcontextprotocol/node` | MCP server framework — new projects |
+| MCP SDK (stable monolithic) | `npm install @modelcontextprotocol/sdk` | MCP server framework — new projects (1.29.0 stable; modular pre-releases not yet production-ready) |
 | MCP SDK (legacy) | `npm install @modelcontextprotocol/sdk` | Monolithic package — existing projects only |
 | MCP Inspector | `npx @modelcontextprotocol/inspector` | Interactive MCP testing/debugging |
 | Zod | `npm install zod` | Schema validation and TypeScript inference |

@@ -57,10 +57,44 @@ trap cleanup EXIT
 # ================================================================
 # Helper: build stdin input for init.sh
 # Args: project_name description platform_num track_num deploy_num lang_num project_dir confirm
-# Platform choices:  desktop(1) mobile(2) web(3) other(4)
-# Track choices:     light(1) standard(2) full(3)
-# Deploy choices:    personal(1) organizational(2)
-# Language choices:  csharp(1) dart(2) go(3) java(4) kotlin(5) other(6) python(7) rust(8) swift(9) typescript(10)
+#       (gov_num defaults to 1 = Private POC for personal / Sponsored POC for organizational;
+#        override with the BUILD_INIT_INPUT_GOV_NUM env var on the same line if you need
+#        Production Build (2) — used by track=light callers since Production+Light triggers a
+#        re-prompt loop at init.sh:446.)
+#
+# Prompt order in init.sh (after commit 061c454 added platform filtering
+# and 2026-06 audit-code-init-sh-4 added the always-on governance dialog):
+#   1. project_name      (init.sh:338)
+#   2. description       (init.sh:341)
+#   3. platform_num      (init.sh:370 — see platform list below)
+#   4. track_num         (init.sh:379 — light(1) standard(2) full(3))
+#   5. deploy_num        (init.sh:387 — personal(1) organizational(2))
+#   6. gov_num           (init.sh:426/434 — see Governance note below)
+#   7. lang_num          (init.sh:502 — platform-filtered, see below)
+#   8. project_dir       (init.sh:558)
+#   9. confirm Y/n       (init.sh review prompt)
+#
+# Platform choices (init.sh:343-368 auto-discovers from docs/platform-modules/
+# and templates/pipelines/release/github/, then appends 'other' as fallback):
+#   desktop(1) mcp_server(2) mobile(3) web(4) other(5)
+# Language choices are PLATFORM-FILTERED (init.sh:468-500 reads the
+# `# solo-orchestrator: platforms=...` marker from each CI template and
+# only offers languages whose marker includes the selected platform;
+# 'other' is always appended last as a fallback). Per-platform lists:
+#   platform=web:        csharp(1) go(2) java(3) kotlin(4) python(5) rust(6) typescript(7) other(8)
+#   platform=desktop:    csharp(1) go(2) java(3) kotlin(4) python(5) rust(6) swift(7) typescript(8) other(9)
+#   platform=mobile:     dart(1) kotlin(2) swift(3) typescript(4) other(5)
+#   platform=mcp_server: go(1) python(2) rust(3) typescript(4) other(5)
+#   platform=other:      other(1)
+# Governance mode choices (init.sh:426/434, depends on deployment):
+#   deploy=personal:       Private POC(1) Production Build(2)
+#   deploy=organizational: Sponsored POC(1) Production Build(2)
+# A previous revision of this helper listed an unfiltered language menu
+# (csharp=1 ... rust=8 ... typescript=10) and omitted gov_num — that was
+# the pre-filtering / pre-governance-dialog layout. Tests that still
+# passed pre-filtering numbers landed on the wrong language (or an
+# invalid combo) and aborted before reaching dry-run summary; this is
+# the bonus fix shipped alongside the catch-all PASS closures.
 # ================================================================
 build_init_input() {
   local project_name="$1"
@@ -71,12 +105,14 @@ build_init_input() {
   local lang_num="$6"
   local project_dir="$7"
   local confirm="${8:-Y}"
+  local gov_num="${BUILD_INIT_INPUT_GOV_NUM:-1}"
   printf '%s\n' \
     "$project_name" \
     "$description" \
     "$platform_num" \
     "$track_num" \
     "$deploy_num" \
+    "$gov_num" \
     "$lang_num" \
     "$project_dir" \
     "$confirm"
@@ -89,44 +125,86 @@ build_dryrun_input() {
 
 # ================================================================
 # E1: Project name with apostrophe and spaces
-# Expected: sanitized to lowercase-no-spaces
+#
+# Two distinct, path-dependent contracts — both are current, intended
+# product behavior (verified 2026-07-06):
+#   • Interactive TTY: collect_project_info() sanitizes with
+#     `tr '[:upper:]' '[:lower:]' | tr ' ' '-'` (init.sh:481), so
+#     "Derek's Cool App" -> "derek's-cool-app" (apostrophe preserved)
+#     and is shown verbatim in the DRY RUN SUMMARY "Name:" line.
+#   • Non-interactive --project: the flag value is taken verbatim with
+#     NO sanitizer and is schema-validated against ^[a-z][a-z0-9-]*$
+#     (init.sh:3502). An apostrophe+space name is therefore REJECTED
+#     with a clear error — the flag path must not persist an
+#     unsanitized name to a directory/manifest.
+#
+# BL-040 HARNESS NOTE: earlier revisions PIPED the name on stdin
+# (printf ... | init.sh --dry-run) and grepped for "derek" /
+# "derek's-cool-app". That never exercised name handling at all:
+# scripts/lib/helpers-core.sh:prompt_input() returns its DEFAULT
+# (empty string) whenever stdin is not a TTY, so the piped
+# "Derek's Cool App" was discarded and PROJECT_NAME stayed empty — the
+# greps could never match regardless of product correctness. This is
+# the same TTY-gated defect E2 was migrated off of. The name only
+# reaches PROJECT_NAME through a real TTY or the non-interactive
+# --project flag; the assertions below use the latter, which is the
+# sole deterministic, hermetic, bash-only channel. (Supersedes the
+# stdin-piped assertions and audit finding tests-edge-cases-1.)
 # ================================================================
 section "E1: Project Name with Apostrophe + Spaces"
 
 E1_DIR="$TEST_DIR/e1-project"
-E1_INPUT=$(build_init_input "Derek's Cool App" "A test project" 3 2 1 8 "$E1_DIR" "Y")
-E1_EXTRA_INPUT="${E1_INPUT}
-Y"
 
 echo ""
 echo "  Input project name: Derek's Cool App"
 
-# Use --dry-run to avoid interactive prerequisite prompts consuming stdin
-e1_output=$(printf '%s\n' "$E1_INPUT" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
+# E1a: apostrophe+space name on the non-interactive --project path must
+# be rejected by schema validation (no sanitizer on the flag path).
+e1_reject_exit=0
+e1_reject_output=$(bash "$REPO_DIR/init.sh" \
+  --dry-run \
+  --non-interactive \
+  --project "Derek's Cool App" \
+  --description "A test project" \
+  --platform web \
+  --deployment personal \
+  --language rust \
+  --project-dir "$E1_DIR" 2>&1) || e1_reject_exit=$?
 
-# Check the output for the sanitized project name
-# init.sh does: tr '[:upper:]' '[:lower:]' | tr ' ' '-'
-# So "Derek's Cool App" -> "derek's-cool-app"
-if echo "$e1_output" | grep -qi "derek"; then
-  pass "E1: init.sh accepted name with apostrophe+spaces"
+if [ "$e1_reject_exit" -ne 0 ] \
+   && echo "$e1_reject_output" | grep -qiE "invalid --project name|must start with a lowercase letter"; then
+  pass "E1: non-interactive --project rejects apostrophe+space name with clear error"
 else
-  fail "E1: init.sh did not process name with apostrophe+spaces"
+  fail "E1: non-interactive --project did NOT reject apostrophe+space name (exit=$e1_reject_exit)"
 fi
 
-# Verify dry-run summary shows the sanitized name
-# init.sh does: tr '[:upper:]' '[:lower:]' | tr ' ' '-'
-# So "Derek's Cool App" -> "derek's-cool-app"
-if echo "$e1_output" | grep -qi "derek"; then
-  pass "E1: dry-run output contains sanitized project name"
+# E1b: dry-run name preservation — a valid (pre-sanitized) name is
+# echoed VERBATIM in the DRY RUN SUMMARY "Name:" line. Anchored,
+# fixed-name grep so a regression that drops the summary line or
+# rewrites/re-cases the name fails RED. This is the core BL-040
+# dry-run-name-preservation invariant.
+E1B_NAME="dereks-cool-app"
+e1b_output=$(bash "$REPO_DIR/init.sh" \
+  --dry-run \
+  --non-interactive \
+  --project "$E1B_NAME" \
+  --description "A test project" \
+  --platform web \
+  --deployment personal \
+  --language rust \
+  --project-dir "$E1_DIR" 2>&1) || true
+
+if echo "$e1b_output" | grep -qE "^[[:space:]]*Name:[[:space:]]+dereks-cool-app[[:space:]]*$"; then
+  pass "E1: dry-run summary preserves the project name verbatim ('$E1B_NAME')"
 else
-  fail "E1: dry-run output does not contain sanitized project name"
+  fail "E1: dry-run summary did not preserve the project name verbatim ('$E1B_NAME')"
 fi
 
-# Verify dry-run completed
-if echo "$e1_output" | grep -qi "DRY RUN SUMMARY"; then
-  pass "E1: dry-run completed with apostrophe+space name"
+# E1c: dry-run completed for the valid-name run.
+if echo "$e1b_output" | grep -qi "DRY RUN SUMMARY"; then
+  pass "E1: dry-run completed with valid project name"
 else
-  fail "E1: dry-run did not complete with apostrophe+space name"
+  fail "E1: dry-run did not complete with valid project name"
 fi
 
 # ================================================================
@@ -142,7 +220,7 @@ echo ""
 echo "  Malicious description: $E2_MALICIOUS_DESC"
 
 # Use dry-run to test safely (avoids filesystem creation, faster)
-e2_input=$(build_dryrun_input "e2-injection-test" "$E2_MALICIOUS_DESC" 3 2 1 8 "$E2_DIR" "Y")
+e2_input=$(build_dryrun_input "e2-injection-test" "$E2_MALICIOUS_DESC" 4 2 1 6 "$E2_DIR" "Y")
 e2_output=$(printf '%s\n' "$e2_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
 
 # The description should appear as literal text in the output, not as expanded commands
@@ -157,19 +235,116 @@ else
   pass "E2: backtick command substitution was NOT executed"
 fi
 
-# Verify the literal text appears somewhere (in the dry-run summary)
-if echo "$e2_output" | grep -qF '$(whoami)'; then
-  pass "E2: \$(whoami) treated as literal text"
+# BL-040 (2026-06-30) restored assertion: dry_run_summary now echoes
+# the operator-supplied description, so the literal "$(whoami)" and
+# "`id`" from the malicious input must appear verbatim in the dry-run
+# preview. The original E2 stdin-piped harness CANNOT verify this
+# because scripts/lib/helpers.sh:prompt_input() returns the default
+# (empty string) whenever stdin is not a TTY — the piped malicious
+# description never reaches PROJECT_DESCRIPTION, so a regression that
+# silently dropped the description would still "PASS" the stdin path.
+# Use the non-interactive --description flag instead; the value lands
+# in PROJECT_DESCRIPTION via ARG_DESCRIPTION (init.sh:3540), bypassing
+# the TTY-gated prompt. Fails RED on origin/main (no Description line
+# in summary), GREEN after the dry_run_summary fix. Grep with -F so
+# the $( and ` metacharacters are matched literally, not as regex.
+E2_NI_DIR="$TEST_DIR/e2-ni-project"
+e2_ni_output=$(bash "$REPO_DIR/init.sh" \
+  --dry-run \
+  --non-interactive \
+  --project "e2-injection-ni" \
+  --description "$E2_MALICIOUS_DESC" \
+  --platform web \
+  --deployment personal \
+  --language python \
+  --project-dir "$E2_NI_DIR" 2>&1) || true
+
+if echo "$e2_ni_output" | grep -qF '$(whoami)' \
+   && echo "$e2_ni_output" | grep -qF '`id`'; then
+  pass "E2: non-interactive dry-run echoes malicious description as literal text"
 else
-  # It might not appear in output if it's only stored; that's still safe
-  pass "E2: \$(whoami) not found in output (not executed, safe)"
+  fail "E2: non-interactive dry-run did not echo literal '\$(whoami) \`id\`' (BL-040 regression)"
 fi
 
-# If dry-run completed without crashing, that's a good sign
+# Belt-and-suspenders: even on the non-interactive path, neither
+# command substitution should fire — no uid= or root: leaking into
+# the summary output.
+if echo "$e2_ni_output" | grep -qE 'uid=|root:'; then
+  fail "E2: command substitution leaked into non-interactive dry-run output"
+else
+  pass "E2: non-interactive dry-run treats description as literal (no command substitution)"
+fi
+
+# If interactive dry-run completed without crashing, that's a good sign
 if echo "$e2_output" | grep -qi "DRY RUN"; then
   pass "E2: init.sh completed dry-run with malicious description"
 else
   fail "E2: init.sh did not complete dry-run with malicious description"
+fi
+
+# ----------------------------------------------------------------
+# E2b: Empty description renders cleanly in dry-run summary
+# Expected: dry_run_summary omits the "Description:" line when the
+# value is empty (operator-friendly: no blank label).
+# ----------------------------------------------------------------
+E2B_DIR="$TEST_DIR/e2b-project"
+e2b_input=$(build_dryrun_input "e2b-empty-desc" "" 4 2 1 6 "$E2B_DIR" "Y")
+e2b_output=$(printf '%s\n' "$e2b_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
+
+# Must still complete dry-run when description is empty
+if echo "$e2b_output" | grep -qi "DRY RUN SUMMARY"; then
+  pass "E2b: dry-run completes with empty description"
+else
+  fail "E2b: dry-run did NOT complete with empty description"
+fi
+
+# Description label must be omitted entirely (no dangling "Description: " line)
+if echo "$e2b_output" | grep -q "^  Description:"; then
+  fail "E2b: empty description should be omitted from summary (found dangling label)"
+else
+  pass "E2b: dry-run summary omits Description label when value is empty"
+fi
+
+# ----------------------------------------------------------------
+# E2c: Multi-line description normalizes to a single summary line
+# Expected: dry_run_summary collapses embedded newlines/tabs into
+# spaces so the summary stays one-line-per-field. Multi-line input
+# is reachable through the non-interactive --description flag
+# (interactive prompt_input is a single read -rp).
+# ----------------------------------------------------------------
+E2C_DIR="$TEST_DIR/e2c-project"
+# shellcheck disable=SC2034
+E2C_DESC=$'line-one-marker\nline-two-marker'
+
+e2c_output=$(bash "$REPO_DIR/init.sh" \
+  --dry-run \
+  --non-interactive \
+  --project "e2c-multiline" \
+  --description "$E2C_DESC" \
+  --platform web \
+  --deployment personal \
+  --language python \
+  --project-dir "$E2C_DIR" 2>&1) || true
+
+# Both halves of the multi-line value must appear in the dry-run
+# output (proves the whole description survived the echo).
+if echo "$e2c_output" | grep -qF "line-one-marker" \
+   && echo "$e2c_output" | grep -qF "line-two-marker"; then
+  pass "E2c: dry-run echoes both halves of multi-line description"
+else
+  fail "E2c: dry-run dropped part of multi-line description"
+fi
+
+# Both markers must land on the SAME line after newline normalization
+# (the description should not bleed across multiple summary lines and
+# break the column layout). awk is shell-safe across BSD and GNU.
+if echo "$e2c_output" | awk '
+  /line-one-marker/ && /line-two-marker/ { found=1; exit }
+  END { exit !found }
+'; then
+  pass "E2c: multi-line description rendered on a single summary line"
+else
+  fail "E2c: multi-line description not collapsed onto a single summary line"
 fi
 
 # ================================================================
@@ -185,7 +360,7 @@ git -C "$E3_DIR" init -q
 echo ""
 echo "  Pre-existing .git in: $E3_DIR"
 
-e3_input=$(build_init_input "e3-existing-git" "Test existing git" 3 1 1 8 "$E3_DIR" "Y")
+e3_input=$(build_init_input "e3-existing-git" "Test existing git" 4 1 1 6 "$E3_DIR" "Y")
 e3_output=$(printf '%s\n' "$e3_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
 
 # Pre-existing .git should still be there
@@ -213,11 +388,16 @@ section "E4: Double Init in Same Directory"
 E4_DIR="$TEST_DIR/e4-double-init"
 
 echo ""
-echo "  Testing two sequential dry-runs targeting: $E4_DIR"
+echo "  Testing two sequential --non-interactive dry-runs targeting: $E4_DIR"
+echo "  (stdin-piped names never reach PROJECT_NAME — see E1 HARNESS NOTE —"
+echo "   so the --project flag is the deterministic channel for this check.)"
 
 # First dry-run
-e4_input=$(build_init_input "e4-double" "First run" 3 1 1 8 "$E4_DIR" "Y")
-e4_run1=$(printf '%s\n' "$e4_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
+e4_run1=$(bash "$REPO_DIR/init.sh" \
+  --dry-run --non-interactive \
+  --project "e4-double" --description "First run" \
+  --platform web --deployment personal --language rust \
+  --project-dir "$E4_DIR" 2>&1) || true
 
 if echo "$e4_run1" | grep -qi "DRY RUN SUMMARY"; then
   pass "E4: first dry-run completed successfully"
@@ -225,9 +405,12 @@ else
   fail "E4: first dry-run did not complete"
 fi
 
-# Second dry-run — same target directory
-e4_input2=$(build_init_input "e4-double" "Second run" 3 1 1 8 "$E4_DIR" "Y")
-e4_run2=$(printf '%s\n' "$e4_input2" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
+# Second dry-run — same target directory, same project name
+e4_run2=$(bash "$REPO_DIR/init.sh" \
+  --dry-run --non-interactive \
+  --project "e4-double" --description "Second run" \
+  --platform web --deployment personal --language rust \
+  --project-dir "$E4_DIR" 2>&1) || true
 
 if echo "$e4_run2" | grep -qi "DRY RUN SUMMARY"; then
   pass "E4: second dry-run completed (idempotent input handling)"
@@ -235,9 +418,12 @@ else
   fail "E4: second dry-run failed"
 fi
 
-# Both runs should show the same project name
-if echo "$e4_run1" | grep -q "e4-double" && echo "$e4_run2" | grep -q "e4-double"; then
-  pass "E4: both runs accepted the same project name"
+# Both runs must echo the SAME project name in the summary "Name:" line
+# (preservation across repeated runs — the BL-040 invariant). Anchored,
+# fixed-name grep so a dropped/rewritten name fails RED.
+if echo "$e4_run1" | grep -qE "^[[:space:]]*Name:[[:space:]]+e4-double[[:space:]]*$" \
+   && echo "$e4_run2" | grep -qE "^[[:space:]]*Name:[[:space:]]+e4-double[[:space:]]*$"; then
+  pass "E4: both runs preserved the same project name in the summary"
 else
   fail "E4: project name not preserved across runs"
 fi
@@ -259,10 +445,10 @@ section "E5: Other Platform + Other Language"
 E5_DIR="$TEST_DIR/e5-other-other"
 
 echo ""
-echo "  Platform: other (4), Language: other (5)"
+echo "  Platform: other (5), Language: other (1, only choice when platform=other)"
 
 # Use dry-run to avoid interactive prerequisite prompts consuming stdin
-e5_input=$(build_init_input "e5-other-combo" "All other test" 4 2 1 5 "$E5_DIR" "Y")
+e5_input=$(build_init_input "e5-other-combo" "All other test" 5 2 1 1 "$E5_DIR" "Y")
 e5_output=$(printf '%s\n' "$e5_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
 
 if echo "$e5_output" | grep -qi "DRY RUN SUMMARY"; then
@@ -278,23 +464,33 @@ else
   fail "E5: dry-run output does not show platform=other"
 fi
 
-# Verify the other.yml CI template exists in the repo
-if [ -f "$REPO_DIR/templates/pipelines/ci/other.yml" ]; then
-  pass "E5: other.yml CI template exists in repo"
-  if grep -qi "TODO\|placeholder\|REPLACE\|your.*language\|your.*build" "$REPO_DIR/templates/pipelines/ci/other.yml"; then
+# Verify the other.yml CI template exists in the repo. After the 2026-04
+# CI-pipeline reorganization, CI templates moved from templates/pipelines/ci/
+# directly into per-host subfolders (github/, gitlab/, bitbucket/). The
+# GitHub variant is canonical per spec 2026-04-21.
+if [ -f "$REPO_DIR/templates/pipelines/ci/github/other.yml" ]; then
+  pass "E5: other.yml CI template exists in repo (github canonical)"
+  if grep -qi "TODO\|placeholder\|REPLACE\|your.*language\|your.*build" "$REPO_DIR/templates/pipelines/ci/github/other.yml"; then
     pass "E5: other.yml template has placeholder steps"
   else
     fail "E5: other.yml template missing placeholder steps"
   fi
 else
-  fail "E5: other.yml CI template does not exist in repo"
+  fail "E5: other.yml CI template does not exist at templates/pipelines/ci/github/other.yml"
 fi
 
-# Verify no release pipeline template for "other"
-if [ ! -f "$REPO_DIR/templates/pipelines/release/other.yml" ]; then
-  pass "E5: no release.yml template for 'other' platform (expected)"
+# Verify no release pipeline template for "other" at the canonical
+# github-hosted location (release templates moved into per-host subfolders
+# alongside CI templates in the same 2026-04 reorganization). Both
+# branches previously called pass(), which masked a regression where a
+# release.yml for 'other' might silently appear. Make the else branch a
+# real failure: per baseline §3, the 'other' platform deliberately has
+# no release pipeline so the user must wire deployment themselves.
+# (Bonus catch — same catch-all PASS family as findings 1-5.)
+if [ ! -f "$REPO_DIR/templates/pipelines/release/github/other.yml" ]; then
+  pass "E5: no release.yml template for 'other' platform (expected — github canonical)"
 else
-  pass "E5: release.yml template exists for 'other' (fallback)"
+  fail "E5: release.yml template exists for 'other' at github/other.yml — unexpected (baseline says manual deploy)"
 fi
 
 # Verify no platform module for "other"
@@ -321,7 +517,7 @@ E6_DIR="$TEST_DIR/e6-no-network"
 E6_FAKE_HOME="$TEST_DIR/e6-fake-home"
 mkdir -p "$E6_FAKE_HOME"
 
-e6_input=$(build_init_input "e6-offline" "Offline test" 3 1 1 8 "$E6_DIR" "Y")
+e6_input=$(build_init_input "e6-offline" "Offline test" 4 1 1 6 "$E6_DIR" "Y")
 
 # Use dry-run + fake HOME + timeout to avoid hanging
 e6_output=$(printf '%s\n' "$e6_input" | HOME="$E6_FAKE_HOME" bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
@@ -351,7 +547,7 @@ E7_DIR="$TEST_DIR/e7-sigint"
 echo ""
 echo "  Starting init.sh --dry-run in background, sending SIGINT after 1 second..."
 
-e7_input=$(build_init_input "e7-sigint-test" "Interrupt test" 3 2 1 8 "$E7_DIR" "Y")
+e7_input=$(build_init_input "e7-sigint-test" "Interrupt test" 4 2 1 6 "$E7_DIR" "Y")
 
 # Start dry-run in background, send SIGINT after 1 second
 printf '%s\n' "$e7_input" | bash "$REPO_DIR/init.sh" --dry-run >"$TEST_DIR/e7-output1.txt" 2>&1 &
@@ -365,7 +561,7 @@ echo "  First run interrupted."
 
 # Re-run to verify init.sh is not left in a broken state
 echo "  Re-running init.sh --dry-run to verify recovery..."
-e7_input2=$(build_init_input "e7-sigint-test" "Recovery test" 3 2 1 8 "$E7_DIR" "Y")
+e7_input2=$(build_init_input "e7-sigint-test" "Recovery test" 4 2 1 6 "$E7_DIR" "Y")
 e7_rerun_exit=0
 printf '%s\n' "$e7_input2" | bash "$REPO_DIR/init.sh" --dry-run >"$TEST_DIR/e7-output2.txt" 2>&1 || e7_rerun_exit=$?
 
@@ -375,16 +571,43 @@ else
   fail "E7: re-run after SIGINT failed to start"
 fi
 
-# Dry-run should not leave partial state
+# Dry-run should not leave partial state, even when interrupted by SIGINT.
+# Both branches previously called pass(), so this assertion was a no-op
+# (the else branch even acknowledged the directory "should not have created
+# it" yet still emitted PASS). Make the else branch a real failure so the
+# dry-run-is-non-destructive invariant is actually enforced.
+# (Closes audit finding tests-edge-cases-3.)
 if [ ! -d "$E7_DIR" ]; then
   pass "E7: no partial directory left after interrupted dry-run"
 else
-  pass "E7: directory exists but dry-run should not have created it"
+  ls -la "$E7_DIR" 2>/dev/null || true
+  fail "E7: interrupted dry-run created $E7_DIR — non-destructive invariant violated"
 fi
 
 # ================================================================
 # E8: Read-only directory
 # Expected: fail with clear error message
+#
+# Closes audit finding tests-edge-cases-4. The original test ran init.sh
+# only in --dry-run mode against a chmod 444 parent and then asserted four
+# things, all of which routed to pass() under any observable state:
+#   - exit non-zero -> pass; exit zero + dir absent -> pass; (dir present
+#     was the only fail branch, and dry-run never creates dirs);
+#   - grep for permission-keywords -> pass; grep for "DRY RUN" -> pass
+#     (always matches in dry-run); else exit-non-zero -> pass.
+# So every dry-run outcome inflated PASS count and the actual read-only
+# behavior of init.sh was never exercised.
+#
+# Honest reframe: dry-run cannot exercise mkdir, so it cannot prove the
+# read-only-handling contract. Split into:
+#   - E8a: --dry-run honestly verifies preview completes and is non-
+#     destructive even when target parent is unwritable.
+#   - E8b: --non-interactive real-run probe of the BL-041 write-permission
+#     preflight. Was SKIPped pre-BL-041 because init.sh's framework-repo
+#     guard fired first and masked the permission failure path. After
+#     PR for BL-041 the preflight runs BEFORE the framework-repo guard,
+#     so this case is now exercisable from the test harness even when
+#     cwd is the framework repo.
 # ================================================================
 section "E8: Read-Only Directory"
 
@@ -393,35 +616,60 @@ mkdir -p "$E8_DIR"
 chmod 444 "$E8_DIR"
 
 echo ""
-echo "  Testing init.sh with read-only target directory: $E8_DIR/project"
+echo "  E8a: Testing init.sh --dry-run with read-only target parent"
 
-e8_input=$(build_init_input "e8-readonly" "Read-only test" 3 1 1 8 "$E8_DIR/project" "Y")
-e8_exit=0
-e8_output=$(printf '%s\n' "$e8_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || e8_exit=$?
+e8_input=$(build_init_input "e8-readonly" "Read-only test" 4 1 1 6 "$E8_DIR/project" "Y")
+e8a_exit=0
+e8a_output=$(printf '%s\n' "$e8_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || e8a_exit=$?
 
-# The script should fail because it can't create files in a read-only directory
-if [ $e8_exit -ne 0 ]; then
-  pass "E8: init.sh exited with non-zero status on read-only directory"
+# E8a: dry-run must produce its DRY RUN banner even when the would-be
+# target parent is unwritable. (Permission probe is not part of dry-run,
+# so a read-only parent should not abort the preview.)
+if echo "$e8a_output" | grep -qi "DRY RUN"; then
+  pass "E8a: dry-run produced DRY RUN banner with read-only target parent"
 else
-  # Even if exit code is 0, check if it actually created anything
-  if [ -d "$E8_DIR/project" ]; then
-    fail "E8: init.sh succeeded in a read-only directory (unexpected)"
-  else
-    pass "E8: init.sh did not create project in read-only directory"
-  fi
+  fail "E8a: dry-run did not produce DRY RUN banner (exit=$e8a_exit)"
 fi
 
-# In dry-run mode, init.sh doesn't attempt to create directories,
-# so no permission error is expected. Verify the dry-run completed cleanly.
-if echo "$e8_output" | grep -qi "permission\|denied\|cannot\|read.only\|mkdir\|error\|No such file"; then
-  pass "E8: error message mentions permission/access issue"
-elif echo "$e8_output" | grep -qi "DRY RUN"; then
-  pass "E8: dry-run completed (doesn't attempt directory creation)"
+# E8a: dry-run must not create anything regardless of permissions.
+if [ ! -d "$E8_DIR/project" ]; then
+  pass "E8a: dry-run did not create project dir under read-only parent"
 else
-  if [ $e8_exit -ne 0 ]; then
-    pass "E8: init.sh exited non-zero (exit=$e8_exit)"
+  fail "E8a: dry-run created $E8_DIR/project — non-destructive invariant violated"
+fi
+
+# E8b: real-run read-only assertion — verifies the BL-041 write-perm
+# preflight. POSIX 0444 does not deny root; skip when running as root
+# so we don't false-pass.
+if [ "$(id -u)" = "0" ]; then
+  skip "E8b: skipped under root (POSIX 0444 doesn't deny root; preflight cannot be exercised)"
+else
+  echo ""
+  echo "  E8b: Testing init.sh --non-interactive with read-only --project-dir parent"
+  e8b_exit=0
+  e8b_output=$( bash "$REPO_DIR/init.sh" --non-interactive \
+                  --project e8b-readonly \
+                  --platform web \
+                  --deployment personal \
+                  --language typescript \
+                  --git-host github \
+                  --visibility private \
+                  --project-dir "$E8_DIR/project" \
+                  --no-remote-creation 2>&1 ) || e8b_exit=$?
+  if [ "$e8b_exit" -eq 0 ]; then
+    fail "E8b: expected non-zero exit (write-perm preflight); got rc=0"
+  elif ! echo "$e8b_output" | grep -qE "write permission denied|Cannot create project directory"; then
+    fail "E8b: did not emit write-permission marker (rc=$e8b_exit). Tail: $(echo "$e8b_output" | tail -5)"
+  # BL-199 (2026-07-29): widened from the old guard's exact banner to the
+  # shared "Refusing to operate" opener. init.sh now guards the TARGET
+  # (guard_target_not_in_framework), whose refusal deliberately uses different
+  # guidance text — the old exact-string grep would have gone blind to a
+  # layering regression by the new guard. E8b's contract is unchanged: this
+  # target's parent is read-only, so the preflight must still win.
+  elif echo "$e8b_output" | grep -q "Refusing to operate"; then
+    fail "E8b: framework-repo guard fired first (BL-041 layering regressed). Tail: $(echo "$e8b_output" | tail -5)"
   else
-    fail "E8: no clear error message for read-only directory"
+    pass "E8b: write-perm preflight fires before framework-repo guard (BL-041 layering active)"
   fi
 fi
 
@@ -445,20 +693,35 @@ echo "  HOME=$E9_FAKE_HOME (does not exist)"
 # - Default project dir suggestion: $HOME/projects/$PROJECT_NAME
 # - Development Guardrails clone: $HOME/.claude-dev-framework
 
-e9_input=$(build_init_input "e9-badhome" "Bad home test" 3 1 1 8 "$E9_DIR" "Y")
+e9_input=$(build_init_input "e9-badhome" "Bad home test" 4 1 1 6 "$E9_DIR" "Y")
 e9_exit=0
 e9_output=$(printf '%s\n' "$e9_input" | HOME="$E9_FAKE_HOME" bash "$REPO_DIR/init.sh" --dry-run 2>&1) || e9_exit=$?
 
-# The script should either fail gracefully or continue with warnings
-# about missing settings.json etc.
-if echo "$e9_output" | grep -qi "Solo Orchestrator\|prerequisites\|checking"; then
-  pass "E9: init.sh started with non-existent HOME"
+# The original assertion grepped for generic banner text ("Solo Orchestrator",
+# "prerequisites", "checking") that init.sh emits on virtually any invocation,
+# so the PASS was essentially unconditional once init.sh started. The nested
+# else passed on any non-zero exit, even one unrelated to HOME handling.
+# Tighten to a HOME-specific signal so a regression in HOME handling actually
+# fails the test.
+# (Closes audit finding tests-edge-cases-5.)
+
+# A HOME-aware signal that fires ONLY when HOME affects behavior:
+#   - "no Claude settings" — emitted by check_prerequisites() at init.sh:292
+#     when $HOME/.claude/settings.json is missing (settings.json check at
+#     init.sh:282 fails, fallthrough emits the cannot-check diagnostic).
+#   - "will be installed during project creation" — emitted at init.sh:282
+#     when $HOME/.claude-dev-framework/.git is missing (else branch of the
+#     framework-present check at init.sh:279).
+# We require AT LEAST ONE of these two HOME-conditioned diagnostics, so
+# the assertion only passes when init.sh's HOME handling actually fires.
+# (Generic banner text and "Files to create: .claude/..." in the dry-run
+# summary are emitted regardless of HOME state, so they don't count.)
+e9_home_signal_re='(no Claude settings|will be installed during project creation)'
+
+if echo "$e9_output" | grep -Eq "$e9_home_signal_re"; then
+  pass "E9: init.sh emitted HOME-conditioned diagnostic with non-existent HOME"
 else
-  if [ $e9_exit -ne 0 ]; then
-    pass "E9: init.sh exited gracefully with non-existent HOME (exit=$e9_exit)"
-  else
-    fail "E9: init.sh produced no recognizable output with non-existent HOME"
-  fi
+  fail "E9: no HOME-conditioned diagnostic in output (exit=$e9_exit) — generic banner/exit no longer counts"
 fi
 
 # Key check: it should not crash with an unhandled error
@@ -493,7 +756,7 @@ find "$TEST_DIR/e10-watch" -type f -o -type d 2>/dev/null | sort > "$e10_snapsho
 # Also snapshot the proposed target directory (should not exist)
 ls -la "$E10_TARGET" >> "$e10_snapshot_before" 2>&1 || true
 
-e10_input=$(build_dryrun_input "e10-dryrun" "Dry run no changes" 3 2 1 8 "$E10_TARGET" "Y")
+e10_input=$(build_dryrun_input "e10-dryrun" "Dry run no changes" 4 2 1 6 "$E10_TARGET" "Y")
 e10_output=$(printf '%s\n' "$e10_input" | bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
 
 # Snapshot AFTER dry-run
@@ -538,15 +801,21 @@ E10_FAKE_HOME="$TEST_DIR/e10-fake-home"
 mkdir -p "$E10_FAKE_HOME"
 find "$E10_FAKE_HOME" -type f 2>/dev/null | sort > "$e10_home_before"
 
-e10_input2=$(build_dryrun_input "e10-dryrun2" "Dry run HOME test" 3 2 1 8 "$TEST_DIR/e10-target2" "Y")
+e10_input2=$(build_dryrun_input "e10-dryrun2" "Dry run HOME test" 4 2 1 6 "$TEST_DIR/e10-target2" "Y")
 e10_output2=$(HOME="$E10_FAKE_HOME" printf '%s\n' "$e10_input2" | HOME="$E10_FAKE_HOME" bash "$REPO_DIR/init.sh" --dry-run 2>&1) || true
 
 find "$E10_FAKE_HOME" -type f 2>/dev/null | sort > "$e10_home_after"
 
-# Note: tools like semgrep and snyk create cache files in HOME when invoked
-# for version checking during check_prerequisites(). This is tool behavior,
-# not init.sh writing to HOME. Filter out known cache paths.
-e10_home_new=$(diff "$e10_home_before" "$e10_home_after" 2>/dev/null | grep "^>" | grep -v "semgrep\|snyk\|cache\|Cache\|\.log\|settings\.yml" || true)
+# Note: tools probed by check_prerequisites() may write cache/config files
+# under HOME during version-check invocations. This is tool behavior, not
+# init.sh writing to HOME. Filter out known cache paths:
+#   semgrep, snyk: version-check cache files
+#   colima: Docker daemon state on darwin (writes ~/.colima/* when probed)
+#   rustup: ~/.rustup/settings.toml created on first invocation
+#   .log / settings.yml / cache / Cache: generic catch-all suffixes
+# (Bonus catch — adding colima/rustup to the pre-existing filter to keep
+# the assertion honest on macOS Apple Silicon dev environments.)
+e10_home_new=$(diff "$e10_home_before" "$e10_home_after" 2>/dev/null | grep "^>" | grep -v "semgrep\|snyk\|cache\|Cache\|\.log\|settings\.yml\|colima\|rustup" || true)
 if [ -z "$e10_home_new" ]; then
   pass "E10: HOME directory unchanged by --dry-run (tool caches excluded)"
 else

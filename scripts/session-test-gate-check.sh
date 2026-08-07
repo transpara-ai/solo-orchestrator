@@ -7,6 +7,32 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── Parse SessionStart envelope ──────────────────────────────────
+# Claude Code passes a SessionStart envelope on stdin with a `source`
+# field whose value is one of:
+#   "startup" — first session of the project (or a new conversation)
+#   "resume"  — `claude --resume`, picking up a prior session
+#   "compact" — `/compact` invocation mid-session
+#   "clear"   — `/clear` invocation mid-session
+#
+# Pre-fix, this hook destructively overwrote .claude/tool-usage.json on
+# every invocation, zeroing the calls array and the
+# commits_since_last_context7 counter — re-arming the MCP gate and
+# erasing in-flight Context7 / Qdrant history mid-Build-Loop on every
+# /compact. Now we only do the destructive init on startup (or when the
+# envelope is missing — legacy compatibility for non-Claude-Code
+# invocations); the other three sources merge into the existing file.
+SESSION_SOURCE="startup"
+if [ ! -t 0 ]; then
+  ENVELOPE=$(cat 2>/dev/null || echo "")
+  if [ -n "$ENVELOPE" ] && command -v jq >/dev/null 2>&1; then
+    parsed=$(echo "$ENVELOPE" | jq -r '.source // ""' 2>/dev/null || echo "")
+    case "$parsed" in
+      startup|resume|compact|clear) SESSION_SOURCE="$parsed" ;;
+    esac
+  fi
+fi
+
 # ── MCP Server Discovery ─────────────────────────────────────────
 # Detect which MCP servers are configured and set up enforcement requirements.
 # Known servers (set up by init.sh): context7, qdrant
@@ -49,15 +75,36 @@ if command -v jq &>/dev/null; then
   done <<< "$ALL_MCP_SERVERS"
 fi
 
-# ── Initialize Tool Usage Tracking ────────────────────────────────
+# ── Initialize / merge Tool Usage Tracking ───────────────────────
 TOOL_USAGE=".claude/tool-usage.json"
 if command -v jq &>/dev/null; then
   SESSION_ID=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   mkdir -p .claude
 
-  # Build additional_required array from unknown servers (empty for now —
-  # the agent will ask the user about these, and the user can add them)
-  cat > "$TOOL_USAGE" << TUEOF
+  if [ "$SESSION_SOURCE" != "startup" ] && [ -f "$TOOL_USAGE" ]; then
+    # Merge path: preserve in-flight ledger state (calls, counters,
+    # flags, operator-added additional_required), refresh session_id
+    # so the boundary is visible to a successor, and re-derive the
+    # MCP requirements in case the user added or removed servers
+    # between sessions.
+    tmp=$(mktemp "${TOOL_USAGE}.XXXXXX")
+    if jq \
+        --arg sid "$SESSION_ID" \
+        --argjson qreq "$QDRANT_CONFIGURED" \
+        --argjson creq "$CONTEXT7_CONFIGURED" \
+        '. as $orig |
+         $orig
+         | .session_id = $sid
+         | .mcp_requirements.qdrant_required = $qreq
+         | .mcp_requirements.context7_required = $creq
+         | .mcp_requirements.additional_required = ($orig.mcp_requirements.additional_required // [])' \
+        "$TOOL_USAGE" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$TOOL_USAGE"
+    else
+      # If jq fails (malformed prior file, etc.), fall through to a
+      # fresh write so the gate is not left wedged.
+      rm -f "$tmp"
+      cat > "$TOOL_USAGE" << TUEOF
 {
   "session_id": "$SESSION_ID",
   "calls": [],
@@ -73,6 +120,26 @@ if command -v jq &>/dev/null; then
   }
 }
 TUEOF
+    fi
+  else
+    # startup (or missing envelope, or file absent) — fresh init.
+    cat > "$TOOL_USAGE" << TUEOF
+{
+  "session_id": "$SESSION_ID",
+  "calls": [],
+  "commits_since_last_context7": 0,
+  "qdrant_find_called": false,
+  "qdrant_store_called": false,
+  "context7_called": false,
+  "mcp_gate_satisfied": false,
+  "mcp_requirements": {
+    "qdrant_required": $QDRANT_CONFIGURED,
+    "context7_required": $CONTEXT7_CONFIGURED,
+    "additional_required": []
+  }
+}
+TUEOF
+  fi
 fi
 
 # ── Report Unknown MCP Servers ────────────────────────────────────
@@ -129,9 +196,17 @@ fi
 
 # Read state
 FEATURES_COMPLETED=$(jq -r '.features_completed | length' "$BUILD_PROGRESS" 2>/dev/null || echo "0")
-SINCE_LAST=$(jq -r '.features_since_last_test' "$BUILD_PROGRESS" 2>/dev/null || echo "0")
-INTERVAL=$(jq -r '.test_interval' "$BUILD_PROGRESS" 2>/dev/null || echo "2")
-TESTING_REQUIRED=$(jq -r '.testing_required' "$BUILD_PROGRESS" 2>/dev/null || echo "false")
+case "$FEATURES_COMPLETED" in ''|*[!0-9]*) FEATURES_COMPLETED=0 ;; esac
+# BL-203: `jq -r` on a MISSING key prints the literal string `null` at rc 0,
+# so the `|| echo` fallbacks never fired and the -ge comparison below errored
+# with `integer expression expected` — taking the else branch, i.e. failing
+# OPEN. The `// default` inside jq plus the sanitizer line is the repo's
+# canonical shape (lint-counter-antipattern enforces the sanitizer).
+SINCE_LAST=$(jq -r '.features_since_last_test // 0' "$BUILD_PROGRESS" 2>/dev/null || echo "0")
+case "$SINCE_LAST" in ''|*[!0-9]*) SINCE_LAST=0 ;; esac
+INTERVAL=$(jq -r '.test_interval // 2' "$BUILD_PROGRESS" 2>/dev/null || echo "2")
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=2 ;; esac
+TESTING_REQUIRED=$(jq -r '.testing_required // false' "$BUILD_PROGRESS" 2>/dev/null || echo "false")
 
 # Check 1: Testing session is overdue
 if [ "$TESTING_REQUIRED" = "true" ] || [ "$SINCE_LAST" -ge "$INTERVAL" ]; then

@@ -12,13 +12,15 @@ set -euo pipefail
 #   scripts/test-gate.sh --help
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/helpers.sh"
+# BL-046: uses print_fail/info/ok/warn + prompt_yes_no only — core subset.
+source "$SCRIPT_DIR/lib/helpers-core.sh"
 
 BUILD_PROGRESS=".claude/build-progress.json"
 
 # --- Argument parsing ---
 ACTION=""
 FEATURE_NAME=""
+NEW_INTERVAL=""
 
 # Source-guard: the argument parser, "no action" check, and dispatch run only
 # when this script is executed directly. When sourced by tests (to call
@@ -30,6 +32,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       --check-batch)        ACTION="check-batch";        shift ;;
       --check-phase-gate)   ACTION="check-phase-gate";   shift ;;
       --reset-counter)      ACTION="reset-counter";       shift ;;
+      --set-interval)       ACTION="set-interval"; NEW_INTERVAL="${2:-}"; shift 2 ;;
       --reset-health-check) ACTION="reset-health-check"; shift ;;
       --record-feature)     ACTION="record-feature"; FEATURE_NAME="$2"; shift 2 ;;
       --unrecord-feature)   ACTION="unrecord-feature"; FEATURE_NAME="$2"; shift 2 ;;
@@ -40,6 +43,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         echo "  --check-batch         Check if testing session is due (exit 0=continue, 1=testing required)"
         echo "  --check-phase-gate    Check if Phase 2→3 transition is clear (exit 0=clear, 1=blocked, 2=warnings)"
         echo "  --reset-counter       Reset feature counter after testing session completes"
+        echo "  --set-interval N      Set the enforced testing interval (BL-203: the intake answer's single writer)"
         echo "  --record-feature N    Record a completed feature and increment counter"
         echo "  --unrecord-feature N  Un-record a feature recorded in error (interactive; inverse of --record-feature)"
         exit 0
@@ -73,7 +77,79 @@ ensure_progress_file() {
   "sessions_completed": 0
 }
 EOF
+    # BL-203: this heredoc is the SECOND writer of test_interval (init.sh is
+    # the first), so a recreated file must honor the interval the operator
+    # recorded at intake — otherwise the recorded answer silently reverts to 2
+    # whenever this file is lost (review R-203-1). The intake answer is the
+    # only recoverable source here; absent or non-numeric, the heredoc's 2
+    # stands. JSON ONLY — this runs from read-only queries (--check-batch,
+    # session hooks), which must never mutate CLAUDE.md (review R-BL203-6);
+    # the prose edit belongs to the explicit --set-interval action alone.
+    local recorded
+    recorded=$(jq -r '.answers.testing_interval // empty' .claude/intake-progress.json 2>/dev/null) || recorded=""
+    case "$recorded" in ''|*[!0-9]*|0*|??????*) recorded="" ;; esac
+    if [ -n "$recorded" ]; then
+      : # BL-203 guard: the marked line below is excisable without a syntax break
+      _bl203_write_json "$recorded" || true # BL-203-INTERVAL-PLUMB
+    fi
   fi
+}
+
+# _bl203_write_json <N> — the one write path for test_interval: sets the field
+# and re-evaluates testing_required against the new N. FAILS LOUDLY: a jq
+# failure (malformed or strange-shaped JSON) must never return 0 — a silent
+# success here recreates the exact doc-vs-gate divergence BL-203 documents
+# (review R-BL203-2). jq runs first and alone so its status is seen; mv only
+# on success.
+_bl203_write_json() {
+  local n="$1" tmp
+  tmp=$(mktemp)
+  if ! jq --argjson n "$n" '
+    .test_interval = $n |
+    .testing_required = ((.features_since_last_test // 0) >= $n)
+  ' "$BUILD_PROGRESS" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    print_fail "Could not update .claude/build-progress.json (malformed JSON?) — nothing changed."
+    return 1
+  fi
+  if ! mv "$tmp" "$BUILD_PROGRESS"; then
+    rm -f "$tmp"
+    print_fail "Could not replace .claude/build-progress.json — nothing changed."
+    return 1
+  fi
+}
+
+set_interval() {
+  local n="$1"
+  # Bound as well as shape: an all-digit value past ~5 digits breaks bash's
+  # integer tests downstream and would park the gate permanently open
+  # (review R-BL203-4). Leading zeros rejected with it; 1..99999 is ample.
+  case "$n" in ''|*[!0-9]*|0*|??????*)
+    print_fail "Usage: scripts/test-gate.sh --set-interval N (integer 1-99999; got '${n:-}')"
+    exit 1 ;;
+  esac
+  ensure_progress_file
+  soif_si_ok=0
+  # The marked line below is the write; excising it must leave valid syntax
+  # (the mutation case pins exactly that), so the failure test reads a flag.
+  _bl203_write_json "$n" && soif_si_ok=1 # BL-203-INTERVAL-PLUMB
+  if [ "$soif_si_ok" -ne 1 ]; then
+    exit 1
+  fi
+  # Prose second, and only after the enforced field moved — the doc must never
+  # advance past the gate (review R-BL203-2). Unique backup suffix so a user's
+  # own CLAUDE.md.bak is never clobbered (R-BL203-10); guard on the NUMERIC
+  # form so an unsubstituted __TEST_INTERVAL__ placeholder warns instead of
+  # silently staying wrong (R-BL203-11).
+  if [ -f "CLAUDE.md" ]; then
+    if grep -qE '\*\*Testing interval:\*\* Every [0-9][0-9]* features' CLAUDE.md; then
+      sed -i.soif-bl203-bak "s|\(\*\*Testing interval:\*\* Every \)[0-9][0-9]*\( features\)|\1${n}\2|" CLAUDE.md \
+        && rm -f CLAUDE.md.soif-bl203-bak
+    elif grep -q 'Testing interval:' CLAUDE.md; then
+      print_warn "CLAUDE.md's Testing interval line is not in the rendered numeric form (unsubstituted template?) — prose not updated."
+    fi
+  fi
+  print_ok "Enforced testing interval set: every $n feature(s) (.claude/build-progress.json)"
 }
 
 # --- Actions ---
@@ -85,7 +161,9 @@ check_batch() {
   # `[: null: integer expression expected` in the comparison below.
   local since_last interval
   since_last=$(jq -r '.features_since_last_test // 0' "$BUILD_PROGRESS")
+  case "$since_last" in ''|*[!0-9]*) since_last=0 ;; esac
   interval=$(jq -r '.test_interval // 2' "$BUILD_PROGRESS")
+  case "$interval" in ''|*[!0-9]*) interval=2 ;; esac
 
   if [ "$since_last" -ge "$interval" ]; then
     print_fail "Testing session required ($since_last features since last test, interval is $interval)"
@@ -94,6 +172,17 @@ check_batch() {
   else
     local remaining=$((interval - since_last))
     print_ok "Clear to continue ($remaining features until next testing session)"
+    # BL-203: name the interval and its source, and surface a recorded-answer
+    # mismatch with the exact remedy — the silent-config class this fixes is
+    # only dead if the divergence is self-revealing wherever it can exist.
+    print_info "Testing every $interval features (from .claude/build-progress.json)"
+    local intake_n
+    intake_n=$(jq -r '.answers.testing_interval // empty' .claude/intake-progress.json 2>/dev/null) || intake_n=""
+    case "$intake_n" in ''|*[!0-9]*) intake_n="" ;; esac
+    if [ -n "$intake_n" ] && [ "$intake_n" != "$interval" ]; then
+      print_warn "Your intake asked for testing every $intake_n features, but this project enforces every $interval."
+      print_info "To make them match: bash scripts/test-gate.sh --set-interval $intake_n"
+    fi
     exit 0
   fi
 }
@@ -119,7 +208,9 @@ record_feature() {
   # `[: null: integer expression expected` in the comparison below.
   local since_last interval
   since_last=$(jq -r '.features_since_last_test // 0' "$BUILD_PROGRESS")
+  case "$since_last" in ''|*[!0-9]*) since_last=0 ;; esac
   interval=$(jq -r '.test_interval // 2' "$BUILD_PROGRESS")
+  case "$interval" in ''|*[!0-9]*) interval=2 ;; esac
 
   print_ok "Feature '$name' recorded ($since_last/$interval until next test session)"
 
@@ -207,9 +298,12 @@ unrecord_feature() {
   # arithmetic and integer-comparison errors below.
   cur_array=$(jq -c '.features_completed // []' "$BUILD_PROGRESS")
   cur_fslt=$(jq -r '.features_since_last_test // 0' "$BUILD_PROGRESS")
+  case "$cur_fslt" in ''|*[!0-9]*) cur_fslt=0 ;; esac
   cur_fslhc=$(jq -r '.features_since_last_health_check // 0' "$BUILD_PROGRESS")
+  case "$cur_fslhc" in ''|*[!0-9]*) cur_fslhc=0 ;; esac
   cur_testing=$(jq -r '.testing_required // false' "$BUILD_PROGRESS")
   interval=$(jq -r '.test_interval // 2' "$BUILD_PROGRESS")
+  case "$interval" in ''|*[!0-9]*) interval=2 ;; esac
 
   new_fslt=$(( cur_fslt - 1 < 0 ? 0 : cur_fslt - 1 ))
   new_fslhc=$(( cur_fslhc - 1 < 0 ? 0 : cur_fslhc - 1 ))
@@ -236,9 +330,9 @@ unrecord_feature() {
   echo "  features_since_last_health_check: $new_fslhc"
   echo ""
 
-  local confirm
-  read -rp "Proceed? [y/N]: " confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  # Wave-3 raw-read sweep: prompt_yes_no centralizes the !-t 0 / CI /
+  # SOIF_NONINTERACTIVE non-interactive default-N policy.
+  if ! prompt_yes_no "Proceed? [y/N]" "N"; then
     print_info "Unrecord cancelled."
     exit 0
   fi
@@ -291,18 +385,26 @@ check_phase_gate() {
     # BUGS.md format: | # | SEV-N | Status | Feature | Description | ...
     # Status values: Open, Deferred, Fixed, Won't Fix, Post-MVP, Removed
     sev1_count=$(grep -c 'SEV-1.*Open' "BUGS.md" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$sev1_count" in ''|*[!0-9]*) sev1_count=0 ;; esac
     sev2_open=$(grep -c 'SEV-2.*Open' "BUGS.md" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$sev2_open" in ''|*[!0-9]*) sev2_open=0 ;; esac
     sev2_deferred=$(grep -c 'SEV-2.*Deferred' "BUGS.md" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$sev2_deferred" in ''|*[!0-9]*) sev2_deferred=0 ;; esac
     sev3_open=$(grep -c 'SEV-3.*Open' "BUGS.md" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$sev3_open" in ''|*[!0-9]*) sev3_open=0 ;; esac
   fi
 
   # Also check GitHub Issues if gh CLI available
   if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
     local gh_sev1 gh_sev2_open gh_sev2_deferred gh_sev3
     gh_sev1=$(gh issue list --label "SEV-1" --state open --json number 2>/dev/null | jq 'length' 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$gh_sev1" in ''|*[!0-9]*) gh_sev1=0 ;; esac
     gh_sev2_open=$(gh issue list --label "SEV-2" --label "fix-now" --state open --json number 2>/dev/null | jq 'length' 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$gh_sev2_open" in ''|*[!0-9]*) gh_sev2_open=0 ;; esac
     gh_sev2_deferred=$(gh issue list --label "SEV-2" --label "deferred" --state open --json number 2>/dev/null | jq 'length' 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$gh_sev2_deferred" in ''|*[!0-9]*) gh_sev2_deferred=0 ;; esac
     gh_sev3=$(gh issue list --label "SEV-3" --state open --json number 2>/dev/null | jq 'length' 2>/dev/null | tr -d '[:space:]' || echo "0")
+    case "$gh_sev3" in ''|*[!0-9]*) gh_sev3=0 ;; esac
 
     sev1_count=$((${sev1_count:-0} + ${gh_sev1:-0}))
     sev2_open=$((${sev2_open:-0} + ${gh_sev2_open:-0}))
@@ -371,13 +473,16 @@ check_phase_gate() {
     # Count feature entries (lines starting with ## or ### that look like feature headings)
     local feature_count
     feature_count=$(grep -cE '^#{2,3} ' FEATURES.md 2>/dev/null || echo "0")
+    case "$feature_count" in ''|*[!0-9]*) feature_count=0 ;; esac
     # Exclude template headings and non-feature sections
     feature_count=$(grep -cE '^#{2,3} [^#]' FEATURES.md 2>/dev/null | head -1 || echo "0")
+    case "$feature_count" in ''|*[!0-9]*) feature_count=0 ;; esac
 
     # Check build-progress.json for recorded features
     local recorded_features=0
     if [ -f ".claude/build-progress.json" ] && command -v jq &>/dev/null; then
       recorded_features=$(jq '.features_completed | length' .claude/build-progress.json 2>/dev/null || echo "0")
+      case "$recorded_features" in ''|*[!0-9]*) recorded_features=0 ;; esac
     fi
 
     if [ "$recorded_features" -gt 0 ]; then
@@ -392,7 +497,22 @@ check_phase_gate() {
     # Compare against MVP cutline if we can
     if [ -f "PRODUCT_MANIFESTO.md" ]; then
       local cutline_items
-      cutline_items=$(sed -n '/Must-Have/,/Should-Have\|Will-Not-Have\|---/p' PRODUCT_MANIFESTO.md 2>/dev/null | grep -cE '^\s*-\s*\*\*' || echo "0")
+      # BL-121-CUTLINE-COUNT — awk range, NOT sed: `\|` in a BASIC-regex sed
+      # program is GNU alternation but a BSD/macOS LITERAL, so the terminator
+      # never matched, the range ran to EOF, and every bold bullet in the
+      # whole manifesto was counted (68 vs the true 3 on the Dogfood-2 walk) —
+      # hard-blocking the production 3→4 gate via the exit-2 WARN arm. awk
+      # range patterns take real POSIX EREs on both platforms. `^---` is
+      # anchored on purpose: a Markdown rule is a whole line; unanchored `---`
+      # inside prose would close the range early. The OPENER is anchored to a
+      # Markdown heading (`^#+.*Must-Have`) — an unanchored opener re-opens
+      # the range on any Section-5 cutline bullet that mentions "Must-Have"
+      # (the template placeholder literally does), double-counting bold
+      # bullets there (BL-121 verifier NOTE-1; the GNU original had the same
+      # quirk). lint-counter-antipattern.sh flags basic-mode sed alternation
+      # so this class cannot recur.
+      cutline_items=$(awk '/^#+.*Must-Have/,/Should-Have|Will-Not-Have|^---/' PRODUCT_MANIFESTO.md 2>/dev/null | grep -cE '^\s*-\s*\*\*' || echo "0")
+      case "$cutline_items" in ''|*[!0-9]*) cutline_items=0 ;; esac
       if [ "$cutline_items" -gt 0 ] && [ "$recorded_features" -gt 0 ]; then
         if [ "$recorded_features" -lt "$cutline_items" ]; then
           print_warn "Feature count ($recorded_features) < MVP Cutline items ($cutline_items) — verify all MVP features are built"
@@ -414,6 +534,7 @@ check_phase_gate() {
   if [ -f ".claude/build-progress.json" ] && command -v jq &>/dev/null; then
     local untested
     untested=$(jq '.features_since_last_test // 0' .claude/build-progress.json 2>/dev/null || echo "0")
+    case "$untested" in ''|*[!0-9]*) untested=0 ;; esac
     if [ "$untested" -gt 0 ]; then
       print_warn "$untested feature(s) since last UAT session — complete testing before Phase 3"
       warnings=true
@@ -442,6 +563,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     check-batch)        check_batch ;;
     check-phase-gate)   check_phase_gate ;;
     reset-counter)      reset_counter ;;
+    set-interval)       set_interval "$NEW_INTERVAL" ;;
     record-feature)     record_feature "$FEATURE_NAME" ;;
     unrecord-feature)   unrecord_feature "$FEATURE_NAME" ;;
     reset-health-check)

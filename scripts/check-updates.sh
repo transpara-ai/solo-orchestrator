@@ -13,7 +13,8 @@ set -euo pipefail
 # If no path is provided, attempts to clone the latest version to a temp dir.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/helpers.sh"
+# BL-046: uses print_info/ok/warn only — source core subset.
+source "$SCRIPT_DIR/lib/helpers-core.sh"
 
 # Verify we're in a Solo Orchestrator project
 if [ ! -f "CLAUDE.md" ]; then
@@ -51,12 +52,42 @@ echo -e "${BOLD}║      Solo Orchestrator — Update Check                   �
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Show pinned Development Guardrails version if available (from CDF's manifest.json)
+# Show pinned Development Guardrails (CDF) version and check it against the
+# local CDF clone.
+#
+# IMPORTANT (BL-001): everything ELSE this script checks — framework
+# documents, utility scripts, CI templates — is compared against the
+# solo-orchestrator repo. CDF's hooks/rules/gates live in a SEPARATE
+# upstream (the CDF clone, default ~/.claude-dev-framework) and are
+# refreshed by scripts/upgrade-project.sh, NOT by copying files from
+# solo-orchestrator. This block is the ONLY CDF-aware part of the checker;
+# without it, a clean "all documents up to date" summary would give a false
+# sense that CDF is covered too.
 if [ -f ".claude/manifest.json" ] && command -v jq &>/dev/null; then
   cdf_commit=$(jq -r '.frameworkCommit // empty' .claude/manifest.json 2>/dev/null)
   cdf_version=$(jq -r '.frameworkVersion // empty' .claude/manifest.json 2>/dev/null)
   if [ -n "$cdf_commit" ] || [ -n "$cdf_version" ]; then
     print_info "Development Guardrails pinned at: ${cdf_version:-unknown}${cdf_commit:+ (${cdf_commit:0:12})}"
+  fi
+
+  # Compare the project's pin against the CDF clone's current FRAMEWORK_VERSION
+  # (default ~/.claude-dev-framework, overridable via CDF_HOME). A newer clone
+  # means the project's .claude/framework/ assets are stale — direct the user
+  # to the upgrade that refreshes them.
+  cdf_home="${CDF_HOME:-$HOME/.claude-dev-framework}"
+  if [ -f "$cdf_home/FRAMEWORK_VERSION" ]; then
+    clone_version=$(tr -d '[:space:]' < "$cdf_home/FRAMEWORK_VERSION" 2>/dev/null)
+    if [ -n "$clone_version" ] && [ "$clone_version" != "$cdf_version" ]; then
+      print_warn "CDF clone is at ${clone_version} — differs from this project's pin (${cdf_version:-none})."
+      echo "         Refresh CDF assets: bash scripts/upgrade-project.sh --backfill-only"
+      echo "         (Run 'cd $cdf_home && git pull --ff-only' first to compare against the latest upstream.)"
+    elif [ -n "$clone_version" ]; then
+      print_ok "CDF framework assets match the local clone (${clone_version})."
+    fi
+  else
+    print_info "CDF clone not found at $cdf_home — cannot check CDF (hooks/rules/gates) freshness."
+    echo "         This checker only covers solo-orchestrator docs/scripts, not CDF."
+    echo "         Clone: git clone https://github.com/kraulerson/claude-dev-framework.git $cdf_home"
   fi
 fi
 
@@ -87,8 +118,8 @@ check_file() {
     print_warn "$label: differs from upstream"
     # Show a brief summary of changes
     local added removed
-    added=$(diff "$project_path" "$upstream_path" | grep -c '^>' || true)
-    removed=$(diff "$project_path" "$upstream_path" | grep -c '^<' || true)
+    added=$(diff "$project_path" "$upstream_path" | grep -c '^>' || true) # lint-counter-antipattern: allow value is string-interpolated into a human-readable summary line only, never used in arithmetic or test comparisons; a multi-line "0\n0" value would still render correctly in the echo
+    removed=$(diff "$project_path" "$upstream_path" | grep -c '^<' || true) # lint-counter-antipattern: allow value is string-interpolated into a human-readable summary line only, never used in arithmetic or test comparisons; a multi-line "0\n0" value would still render correctly in the echo
     echo -e "         (+$added lines in upstream, -$removed lines removed from upstream)"
     changes=$((changes + 1))
   fi
@@ -166,6 +197,10 @@ else
   echo ""
   echo "  Review changes carefully before overwriting — your project may have"
   echo "  intentional customizations that should be preserved."
+  echo ""
+  echo "  Or, for a guided same-tier refresh of vendored scripts/hooks + doc-drift"
+  echo "  notices (BL-099), run from the framework clone (preview first):"
+  echo "    bash /path/to/solo-orchestrator/scripts/upgrade-project.sh --sync-framework --dry-run"
 fi
 echo -e "${BOLD}══════════════════════════════════════════════════════════${NC}"
 

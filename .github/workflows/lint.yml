@@ -1,0 +1,388 @@
+# .github/workflows/lint.yml — CI lint guards.
+#
+# Wave 2 follow-up to PRs #67-#71 (counter-sanitizer remediation
+# bundle). After wave 1 fixed every known unsanitized
+# `var=$(cmd | grep -c X || echo "0")` capture site, this workflow
+# is the merge-time backstop that prevents the antipattern from being
+# reintroduced. See scripts/lint-counter-antipattern.sh for the
+# defect-class write-up and the canonical fix pattern.
+#
+# This is the repository's FIRST GitHub Actions workflow — the
+# `.github/workflows/` directory did not exist before this PR.
+# Subsequent CI jobs (shellcheck, security review, full test suite
+# under CI, etc.) can be added as additional workflows or as
+# additional jobs in this file.
+#
+# ── BL-191: the inventory steps are `if: failure()`, NOT `if: always()` ──
+#
+# Every job here is a PAIR of steps: a GATING step that runs the lint and
+# fails the job, and an INVENTORY step that re-runs the SAME lint with
+# `--list` to print the per-file PASS/FAIL roster. There are THIRTEEN such
+# pairs — one per job; BL-197's diagnostic-destruction-lint was the tenth,
+# BL-196's bl-markers-lint the eleventh, the delta track's D1
+# delta-boundary-lint the twelfth, and brownfield WP0's
+# module-dependencies-lint the thirteenth —
+# and under `if: always()` the inventory step re-ran
+# the full scan on GREEN runs too, where nobody reads it. That doubled
+# every lint job. Measured on the counter-antipattern job (run 30297887996,
+# job 90083310253, main @ 9d71824): 207s gating + 204s inventory = 419s.
+# It is the single slowest PR-blocking job in the repo, so it alone sets
+# the lint floor for the whole PR.
+#
+# `failure()` and `always()` are IDENTICAL on the failure path — which is
+# the only path the inventory was ever for. Evidence, three real runs where
+# a gating step failed: run 29952639143 (backlog-references-lint), run
+# 29633780347 (counter-antipattern-lint), run 29136956152
+# (backlog-references-lint). In every one: gating step `failure`, inventory
+# step `success` (it RAN), job conclusion `failure`. Run 29633780347's
+# no-live-remote job is the clearest read — its middle step with no `if:`
+# shows `skipped` while the `always()` inventory step shows `success`,
+# which is exactly the semantics `failure()` also selects. So a red lint
+# still goes red and still prints its inventory; only the green-path
+# re-scan is gone.
+#
+# The `|| true` stays and is load-bearing: `--list` exits non-zero on a
+# dirty tree, and an inventory step must never be what fails a job. Run
+# 29633780347 proves it end to end — the tree was dirty enough to fail the
+# gate, and the inventory step still concluded `success`.
+#
+# WHY NOT `failure() || github.event_name == 'workflow_dispatch'`: this
+# workflow has no `workflow_dispatch` trigger (see `on:` below — only
+# `push: branches: [main]` and `pull_request`), so that arm is unreachable
+# dead code. A UI re-run is not an on-demand path either: it preserves the
+# ORIGINAL event name, so it would not satisfy it. The step names dropped
+# "or on demand" for the same reason — the real on-demand path is local:
+#     bash scripts/lint-<name>.sh --list
+# If anyone ever adds a `workflow_dispatch` trigger here, revisit this.
+
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Job name is the required-check label in branch protection. Keep it
+  # stable: changing the name forces every protected branch to be
+  # reconfigured. The lint script's behavior may evolve, but the job
+  # name should not.
+  counter-antipattern-lint:
+    name: counter-antipattern-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint counter-capture antipattern
+        run: bash scripts/lint-counter-antipattern.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-counter-antipattern.sh --list || true
+
+  # Cycle-7 Slot-5 sibling backstop: process discipline for backlog
+  # citations. See scripts/lint-backlog-references.sh header for the
+  # defect classes (unknown-ref + uncited-closure) and the allowlist
+  # mechanism. Same job-name-is-required-check convention as the
+  # counter-antipattern job above — keep the name stable.
+  backlog-references-lint:
+    name: backlog-references-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+        with:
+          fetch-depth: 0  # required for `git log BASE..HEAD` resolution
+
+      - name: Lint backlog references
+        # `github.base_ref` is user-controlled context data. To avoid
+        # the shell-injection class flagged by Semgrep rule
+        # yaml.github-actions.security.run-shell-injection (see
+        # https://sg.run/pkzk), route it through an `env:` var and
+        # reference the quoted env var inside the script rather than
+        # interpolating `${{ ... }}` directly into a `run:` shell line.
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: bash scripts/lint-backlog-references.sh --base "origin/${BASE_REF}"
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: bash scripts/lint-backlog-references.sh --base "origin/${BASE_REF}" --list || true
+
+  # Cycle-8 wave-3 Slot-5 sibling: ban `2>/dev/null` and `2>&-`
+  # inside any `fix_*()` function body. See
+  # scripts/lint-fix-functions-stderr.sh header for the defect class
+  # (silenced auto-fix stderr makes failures un-actionable for
+  # operators running under --auto-fix). The PR #92 scrub of
+  # fix_framework_clone / fix_framework_manifest / fix_superpowers
+  # established the precedent; this lint is the merge-time backstop.
+  fix-functions-stderr-lint:
+    name: fix-functions-stderr-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint fix_*() function stderr silencers
+        run: bash scripts/lint-fix-functions-stderr.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-fix-functions-stderr.sh --list || true
+
+  # Cycle-8 wave-3 Slot-5 sibling: ban raw `read -rp` / `read -p`
+  # outside scripts/lib/helpers.sh — the canonical home for the
+  # prompt_input / prompt_yes_no helpers that handle non-interactive
+  # / CI / no-TTY contexts safely. See
+  # scripts/lint-raw-read-prompt.sh header for the defect class
+  # (bare `read -p` hangs unattended invocations or auto-defaults
+  # without operator confirmation).
+  raw-read-prompt-lint:
+    name: raw-read-prompt-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint raw read -rp / read -p sites
+        run: bash scripts/lint-raw-read-prompt.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-raw-read-prompt.sh --list || true
+
+  # BL-038 (cycle-9): structural backstop for the BL-034 orphan-test
+  # defect class — refuses to merge a new tests/test-*.sh file unless
+  # an aggregator invokes it (or the file carries an EXEMPT marker
+  # with a non-empty reason). See scripts/lint-tests-registered.sh
+  # header for the contract + KNOWN_ORPHANS_PENDING_BL035 bridge,
+  # and tests/test-lint-tests-registered.sh for the behavior suite.
+  tests-registered-lint:
+    name: tests-registered-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint tests-registered (BL-038 structural backstop)
+        run: bash scripts/lint-tests-registered.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-tests-registered.sh --list || true
+
+  # BL-048: structural backstop for dead in-document anchors under
+  # docs/ — a `[text](#anchor)` link whose target heading no longer
+  # exists (renamed, reworded, or removed) silently 404s in the
+  # rendered page instead of failing anything locally. See
+  # scripts/lint-doc-anchors.sh header for the GitHub-slug derivation
+  # + fence-aware scanning contract, and
+  # tests/test-lint-doc-anchors.sh for the behavior suite.
+  doc-anchors-lint:
+    name: doc-anchors-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint in-document anchors under docs/ (BL-048)
+        run: bash scripts/lint-doc-anchors.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-doc-anchors.sh --list || true
+
+  # BL-073: schema backstop for the Phase 3→4 review manifest
+  # (docs/eval-results/review-manifest.json). check-phase-gate.sh's
+  # track-aware review gate reads .reviews[].reviewer / .status to decide
+  # whether the mandatory Security + Red Team reviews are complete — a
+  # malformed manifest silently defeats that gate. This lint pins the
+  # schema (reviewer / status / artifact required; date / signed_by
+  # validated when present). See scripts/lint-review-manifest.sh header
+  # and tests/test-bl073-review-manifest-gate.sh for the behavior suite.
+  review-manifest-lint:
+    name: review-manifest-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint review-manifest schema (BL-073)
+        run: bash scripts/lint-review-manifest.sh
+
+      - name: Show roster (on failure)
+        if: failure()
+        run: bash scripts/lint-review-manifest.sh --list || true
+
+  # BL-076: hermeticity backstop for the test suite. A test that runs the
+  # real init.sh with the default (github) host and WITHOUT
+  # --no-remote-creation / --git-host other / a mocked gh creates + pushes a
+  # REAL private repo on an authenticated host (the kraulerson/foo leak,
+  # 2026-07-06) — and blocks the suite from ever running in CI ([[bl077]]).
+  # This lint refuses to merge any test whose init.sh invocation can reach
+  # live remote creation. See scripts/lint-no-live-remote-in-tests.sh header
+  # and tests/test-lint-no-live-remote.sh for the behavior suite. Same
+  # job-name-is-required-check convention as the jobs above — keep it stable.
+  no-live-remote-in-tests-lint:
+    name: no-live-remote-in-tests-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint tests for live-remote-reachable init.sh runs (BL-076)
+        run: bash scripts/lint-no-live-remote-in-tests.sh
+
+      - name: Run the lint's own behavior suite
+        run: bash tests/test-lint-no-live-remote.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-no-live-remote-in-tests.sh --list || true
+
+  # BL-197: structural backstop for the DIAGNOSTIC-DESTRUCTION class — a
+  # failure report that discards the evidence needed to act on it. The
+  # gating predicate is the narrow one: a silenced command, a `||`, and a
+  # failure reporter in that arm, all on one line. Presence probes and the
+  # `2>&1 >/dev/null` capture idiom are carved out by measurement (see the
+  # linter header), and the truncated-evidence half is advisory-only under
+  # `--census`. See tests/test-lint-diagnostic-destruction.sh for the
+  # behavior suite.
+  #
+  # NOTE: not yet a required status check in branch protection — that is
+  # Karl's call. Adding it here makes it run on every PR; promoting it to
+  # required is a separate branch-protection change.
+  diagnostic-destruction-lint:
+    name: diagnostic-destruction-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint silenced-diagnostic failure reports (BL-197)
+        run: bash scripts/lint-diagnostic-destruction.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-diagnostic-destruction.sh --list || true
+
+  # BL-103: portability backstop for evaluation-prompts/. The Phase 3→4 review
+  # gate (BL-073) hands operators `evaluation-prompts/Projects/run-reviews.sh` as
+  # its remediation — and that script (plus compose.sh and the Framework runner)
+  # used `declare -A` + `[[ -v x ]]`, bash >= 4.2 constructs that macOS
+  # /bin/bash 3.2.57 cannot even PARSE. Every other portability rule in this repo
+  # is lint-enforced over scripts/ and init.sh; evaluation-prompts/ was uncovered,
+  # which is how three shipped scripts sat dead. See
+  # scripts/lint-evalprompts-portability.sh header and
+  # tests/test-bl103-eval-generator.sh for the behavior suite. Same
+  # job-name-is-required-check convention as the jobs above — keep it stable.
+  evalprompts-portability-lint:
+    name: evalprompts-portability-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint evaluation-prompts/ for bash-4 constructs (BL-103)
+        run: bash scripts/lint-evalprompts-portability.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-evalprompts-portability.sh --list || true
+
+  # BL-196: citation-integrity backstop for the repo's citation PRIMITIVE.
+  # CLAUDE.md § CITATION RULE makes the grep-able `# BL-NNN-…` marker
+  # comment the only sanctioned way to cite code (never a bare file:line,
+  # because line numbers mis-resolve within 24h) — and nothing validated
+  # it. This job resolves both directions: every marker in the code
+  # surface names a real `## BL-NNN:` entry, and every marker CITED in the
+  # live prose surface resolves to a marker that still exists. A vacuity
+  # floor makes a collapsed scan exit 2 rather than pass silently. See
+  # scripts/lint-bl-markers.sh header for the surface definitions and the
+  # allowlist mechanism, and tests/test-lint-bl-markers.sh for the
+  # behavior suite (incl. the fence-excision mutation).
+  #
+  # NOT a required status check yet — adding this job does not make it
+  # one. Branch protection is Karl's call; deliberately untouched here.
+  # Same job-name-is-required-check convention as the jobs above: if it
+  # IS promoted, keep the name stable.
+  bl-markers-lint:
+    name: bl-markers-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint BL marker citations (BL-196)
+        run: bash scripts/lint-bl-markers.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-bl-markers.sh --list || true
+
+  # Delta track (D1): the dependency-direction boundary lint. The delta track
+  # is a SEVERABLE module — delta may import core, core may never import delta
+  # — and settled decision D1 requires that boundary lint-enforced FROM THE
+  # FIRST COMMIT, because a severable module stops being severable one
+  # convenience call at a time and no test fails when it does. Two match tiers
+  # (literal module paths, then the bare `delta-` prefix that catches the
+  # variable-composition family), a seam allowlist whose cardinality is
+  # asserted at exactly one, and a vacuity floor that exits 2 rather than let a
+  # collapsed scan report a pass. See scripts/lint-delta-boundary.sh header and
+  # docs/designs/2026-08-02-delta-track-v1.md §3.3 for the spec, and
+  # tests/test-lint-delta-boundary.sh for the behavior suite (incl. the
+  # cardinality and empty-manifest mutations).
+  #
+  # NOT a required status check — adding this job does not make it one.
+  # Branch protection is Karl's call and is deliberately untouched here. Same
+  # job-name-is-required-check convention as the jobs above: if it IS promoted,
+  # keep the name stable.
+  delta-boundary-lint:
+    name: delta-boundary-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint the core -> delta dependency direction (D1)
+        run: bash scripts/lint-delta-boundary.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-delta-boundary.sh --list || true
+
+  # Brownfield adoption (WP0): the module-dependency lint for Scout and the
+  # adoption driver. Same severability argument as the job above and a
+  # deliberate SIBLING of it rather than a generalisation — a module stops
+  # being severable one convenience call at a time, and no test fails when it
+  # does. Two match tiers (literal manifest paths, then the path-shaped
+  # segment tokens `scout/`/`adopt/` that catch the variable-composition
+  # family), M5's scout-only zero-dependency arm, a core allowlist whose
+  # cardinality is asserted at exactly ZERO — the brownfield module declares no
+  # seam — and two vacuity floors that exit 2 rather than let a collapsed scan
+  # report a pass. See scripts/lint-module-dependencies.sh header,
+  # docs/module-contract.md, and
+  # docs/designs/2026-08-02-brownfield-adoption-v1.md §3.3 for the spec, and
+  # tests/test-lint-module-dependencies.sh for the behavior suite (incl. the
+  # cardinality, empty-manifest and arm-neutering mutations).
+  #
+  # NOT a required status check — adding this job does not make it one. Branch
+  # protection is Karl's call and is deliberately untouched here. Same
+  # job-name-is-required-check convention as the jobs above: if it IS promoted,
+  # keep the name stable.
+  module-dependencies-lint:
+    name: module-dependencies-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+
+      - name: Lint the core -> module dependency direction (M3) and M5
+        run: bash scripts/lint-module-dependencies.sh
+
+      - name: Show PASS/FAIL inventory (on failure)
+        if: failure()
+        run: bash scripts/lint-module-dependencies.sh --list || true

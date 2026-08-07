@@ -5,6 +5,15 @@ set -euo pipefail
 # Reads tool-matrix JSON files, filters by project context, checks
 # installed state, and outputs a categorized JSON plan to stdout.
 #
+# 2026-06-26: Tool check_commands / version_commands are evaluated
+# against the local environment to discover installed state. Some of
+# them connect to daemons (`colima version`, `docker version`, etc.)
+# and can hang indefinitely when the daemon is unreachable, taking
+# init.sh + verify-install.sh --auto-fix down with them (since the
+# resolver runs inside a $() subshell). Each eval is now bounded by a
+# portable wall-clock timeout; a timed-out check is treated as "tool
+# not found" and a timed-out version_command yields an empty version.
+#
 # Usage:
 #   scripts/resolve-tools.sh \
 #     --dev-os darwin \
@@ -17,6 +26,33 @@ set -euo pipefail
 #
 # Output: JSON with four buckets: auto_install, manual_install,
 #         already_installed, deferred
+
+# Portable wall-clock timeout for evaluated shell commands. Runs the
+# given command string via `bash -c` and kills it if it exceeds
+# RESOLVE_TOOLS_EVAL_TIMEOUT seconds. Exit code 124 signals timeout;
+# other non-zero codes propagate the command's own failure. Callers
+# already handle non-zero ("tool not installed") so the timeout case
+# is indistinguishable from a clean "missing tool" — which is what
+# we want for an unreachable daemon.
+RESOLVE_TOOLS_EVAL_TIMEOUT="${RESOLVE_TOOLS_EVAL_TIMEOUT:-10}"
+run_cmd_with_timeout() {
+  local _secs="$1" _cmd="$2"
+  bash -c "$_cmd" &
+  local _pid=$!
+  # Use wall-clock deadline (not a sleep-1 counter) so SIGCHLD from
+  # other killed children — which interrupts `sleep` short — doesn't
+  # inflate the iteration count and kill commands prematurely.
+  local _deadline=$(( $(date +%s) + _secs ))
+  while kill -0 "$_pid" 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$_deadline" ]; then
+      kill -9 "$_pid" 2>/dev/null || true
+      wait "$_pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+  done
+  wait "$_pid" 2>/dev/null
+}
 
 # --- Parse arguments ---
 DEV_OS=""
@@ -194,10 +230,10 @@ while IFS=$'\t' read -r TOOL_NAME TOOL_CATEGORY TOOL_PHASE TOOL_REQUIRED TOOL_CH
   INSTALLED=false
   VERSION=""
   set +u
-  if eval "$TOOL_CHECK" &>/dev/null 2>&1; then
+  if run_cmd_with_timeout "$RESOLVE_TOOLS_EVAL_TIMEOUT" "$TOOL_CHECK" &>/dev/null; then
     INSTALLED=true
     if [ -n "$TOOL_VERSION_CMD" ]; then
-      VERSION=$(eval "$TOOL_VERSION_CMD" 2>/dev/null || echo "")
+      VERSION=$(run_cmd_with_timeout "$RESOLVE_TOOLS_EVAL_TIMEOUT" "$TOOL_VERSION_CMD" 2>/dev/null || echo "")
     fi
   fi
   set -u
@@ -209,12 +245,68 @@ while IFS=$'\t' read -r TOOL_NAME TOOL_CATEGORY TOOL_PHASE TOOL_REQUIRED TOOL_CH
       --arg version "$VERSION" \
       '. + [{name: $name, category: $category, version: $version}]')
   else
-    # Find the best install command for this environment
+    # Find the best install command for this environment.
+    #
+    # BL-033: each `install.<key>` value can be one of two structured
+    # shapes:
+    #   1. Legacy — a single string (`"brew install jq"`).
+    #   2. Multi-stage — an array of strings (`["cmd1", "cmd2"]`), where
+    #      each element is executed as an independent stage (fail-fast on
+    #      the first non-zero exit). The array shape gives per-stage
+    #      failure diagnosis and makes rollback tractable.
+    #
+    # The resolver output emits BOTH `install_cmd` (joined with ` && `
+    # for back-compat with legacy consumers that read the singular field)
+    # AND `install_cmds` (JSON array of stages) so new consumers can
+    # iterate stages structurally.
     INSTALL_CMD=""
+    INSTALL_CMDS_JSON=""
     for key in $(echo "$INSTALL_KEYS" | jq -r '.[]'); do
-      cmd=$(echo "$TOOL_INSTALL_JSON" | jq -r --arg k "$key" '.[$k] // empty')
-      if [ -n "$cmd" ]; then
-        INSTALL_CMD="$cmd"
+      # Single jq call: normalize the per-key value into
+      # {install_cmd, install_cmds} regardless of shape. Emits `_error`
+      # for malformed shapes (T-mixed-invalid, unsupported types) so the
+      # reader fails fast rather than silently mis-interpreting the
+      # matrix.
+      extraction=$(echo "$TOOL_INSTALL_JSON" | jq -c --arg k "$key" '
+        if has($k) then
+          (.[$k]) as $v |
+          if ($v | type) == "string" then
+            if ($v | length) == 0 then null
+            else {install_cmd: $v, install_cmds: [$v]} end
+          elif ($v | type) == "array" then
+            if ($v | length) == 0 then
+              {_error: "install.\($k) is an empty array — supply at least one stage"}
+            elif ([$v[] | type] | unique) != ["string"] then
+              {_error: "install.\($k) array must contain only strings"}
+            else
+              {install_cmd: ($v | join(" && ")), install_cmds: $v}
+            end
+          elif ($v | type) == "object" then
+            if ($v | has("install_cmd")) and ($v | has("install_cmds")) then
+              {_error: "install.\($k) object contains BOTH install_cmd and install_cmds — mutually exclusive; pick one shape"}
+            else
+              {_error: "install.\($k) object shape not supported — use a string or array of strings"}
+            end
+          elif ($v | type) == "null" then null
+          else
+            {_error: "install.\($k) has unsupported type \($v | type) — use string or array of strings"}
+          end
+        else null end
+      ')
+
+      if [ -z "$extraction" ] || [ "$extraction" = "null" ]; then
+        continue
+      fi
+
+      err=$(echo "$extraction" | jq -r '._error // empty')
+      if [ -n "$err" ]; then
+        echo "ERROR: tool '$TOOL_NAME': $err" >&2
+        exit 1
+      fi
+
+      INSTALL_CMD=$(echo "$extraction" | jq -r '.install_cmd')
+      INSTALL_CMDS_JSON=$(echo "$extraction" | jq -c '.install_cmds')
+      if [ -n "$INSTALL_CMD" ]; then
         break
       fi
     done
@@ -222,6 +314,7 @@ while IFS=$'\t' read -r TOOL_NAME TOOL_CATEGORY TOOL_PHASE TOOL_REQUIRED TOOL_CH
     # If no auto-installable command found, fall back to manual
     if [ -z "$INSTALL_CMD" ]; then
       INSTALL_CMD=$(echo "$TOOL_INSTALL_JSON" | jq -r '.manual // "See documentation"')
+      INSTALL_CMDS_JSON=$(jq -n --arg s "$INSTALL_CMD" '[$s]')
       TOOL_AUTO="false"
     fi
 
@@ -230,9 +323,10 @@ while IFS=$'\t' read -r TOOL_NAME TOOL_CATEGORY TOOL_PHASE TOOL_REQUIRED TOOL_CH
         --arg name "$TOOL_NAME" \
         --arg category "$TOOL_CATEGORY" \
         --arg install_cmd "$INSTALL_CMD" \
+        --argjson install_cmds "$INSTALL_CMDS_JSON" \
         --argjson required "$([ "$TOOL_REQUIRED" = "true" ] && echo true || echo false)" \
         --arg description "$TOOL_DESCRIPTION" \
-        '. + [{name: $name, category: $category, install_cmd: $install_cmd, required: $required, description: $description}]')
+        '. + [{name: $name, category: $category, install_cmd: $install_cmd, install_cmds: $install_cmds, required: $required, description: $description}]')
     else
       MANUAL_INSTALL=$(echo "$MANUAL_INSTALL" | jq \
         --arg name "$TOOL_NAME" \
@@ -266,7 +360,7 @@ for i in $(seq 0 $((ADDITION_COUNT - 1))); do
   ADD_DESC=$(echo "$ADD_JSON" | jq -r '.description // ""')
 
   set +u
-  if [ -n "$ADD_CHECK" ] && eval "$ADD_CHECK" &>/dev/null 2>&1; then
+  if [ -n "$ADD_CHECK" ] && run_cmd_with_timeout "$RESOLVE_TOOLS_EVAL_TIMEOUT" "$ADD_CHECK" &>/dev/null; then
     set -u
     ALREADY_INSTALLED=$(echo "$ALREADY_INSTALLED" | jq \
       --arg name "$ADD_NAME" \

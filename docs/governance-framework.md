@@ -198,6 +198,22 @@ For personal projects, gate denial is a self-assessment finding. Record the find
 
 During Phase 2 (Construction, 2-4 weeks), the Orchestrator will make decisions that don't trigger formal escalation but are significant enough to record. Maintain a running decision log capturing: date, decision, rationale, alternatives considered. This log is reviewed at the Phase 3 gate by the Senior Technical Authority.
 
+### Mid-Phase 2 Governance Checkpoint (Organizational)
+
+For organizational deployments, the Orchestrator holds a biweekly (every two weeks) status review with the Senior Technical Authority for the duration of Phase 2. The checkpoint is mandatory for organizational projects; personal deployments may use it at their discretion.
+
+**Scope (30 minutes maximum):**
+
+- Features delivered vs. PROJECT_BIBLE.md scope — call out any drift early.
+- Architectural deviations from the Phase 1 design — note rationale and intent to merge back, refactor, or escalate.
+- Test pass rate trend (unit, integration, E2E) — flag regressions.
+- Unresolved security findings (Semgrep, dependency scanners) — confirm triage and owner.
+- Risk register delta (new risks, changed severity, mitigations in flight).
+
+**Outcomes are recorded as rows in the In-Phase Decision Log** (date, topic, decision, rationale, follow-up). The Senior Technical Authority does not approve or block at this cadence — the checkpoint is course-correction-oriented, not gate-style.
+
+**This checkpoint does not replace the Phase 3 gate.** The Phase 3 gate remains the formal go/no-go decision point for production readiness. The Mid-Phase 2 checkpoint exists so the Phase 3 gate is not the first time the Senior Technical Authority sees the project's state.
+
 ### Escalation Path
 
 The Orchestrator must escalate when:
@@ -219,6 +235,34 @@ Define the escalation chain before Phase 0 begins: Orchestrator → Senior Techn
 | AI vendor data incident | Organization (selected the vendor) | AI deployment path approval, commercial terms documentation |
 
 The existence of documented governance artifacts (approvals, security scans, compliance screening) demonstrates due diligence. The absence of these artifacts creates unmitigated liability.
+
+### POC Modes
+
+The Solo Orchestrator framework supports three governance modes, set at project creation and tracked in `.claude/phase-state.json::poc_mode`. They modulate which of the 6 blocking pre-conditions (Section XIV) must be cleared before Phase 0 versus deferred until the project upgrades to Production Build.
+
+| Mode | Deployment | Phase 0 entry requires | Deferred until upgrade | Phase 4 |
+|---|---|---|---|---|
+| **Production Build** | personal or organizational | All 6 pre-conditions (AI deployment path, sponsor, insurance, liability, ITSM, exit criteria, backup maintainer) | None | Allowed |
+| **Sponsored POC** | organizational only | AI deployment path approved + project sponsor assigned (2 of the 6 blocking pre-conditions in §XIV). Time-boxed exit criteria (§XIV item #8, tracked outside `APPROVAL_LOG.md`) must also be documented upfront. | Insurance clearance, liability entity, ITSM integration, backup maintainer (the remaining 4 of 6 blocking pre-conditions). `APPROVAL_LOG.md` retains all 6 rows; deferred rows are left blank until `--to-production`. | **Blocked** until `scripts/upgrade-project.sh --to-production` clears the deferred items |
+| **Private POC** | personal only | None — all governance is deferred for exploratory work | All 6 pre-conditions deferred | **Blocked** until upgrade to Sponsored POC (rare) or Production |
+
+**Constraints common to all POC modes:**
+
+- No production deployment, no real user data, no external users. Phase 4 (production release) is hard-blocked.
+- All technical work (Phases 0 through 3) runs identically to Production Build and carries forward unchanged on upgrade.
+- The framework does not distinguish "POC code quality" from "Production code quality." The distinction is purely governance.
+
+**Tier semantics (baseline §2.5):**
+
+- Private POC is **always** a personal deployment. The `organizational/private_poc` shape is not a valid tier; `init.sh` rejects it in non-interactive mode and `upgrade-project.sh --to-private-poc` always sets `TARGET_DEPLOYMENT=personal`.
+- Sponsored POC is **always** an organizational deployment. The `personal/sponsored_poc` shape is rejected by `init.sh`.
+- Production Build is the only mode valid for both deployments.
+
+**Upgrade path:**
+
+- `scripts/upgrade-project.sh --to-sponsored-poc` (Private POC → Sponsored POC, rare — usually only when an exploratory build wins org buy-in).
+- `scripts/upgrade-project.sh --to-production` (any POC → Production). For organizational POCs, verifies the deferred Pre-Phase-0 pre-conditions in `APPROVAL_LOG.md` are dated (rows 1-6 in the Pre-Phase 0 table); operators in `--non-interactive` mode can acknowledge missing rows via `--ack-preconditions=<N1,N2,...>` (writes a `user_terminal` row to `.claude/bypass-audit.json`). Personal POCs are exempt because the personal approval-log template pre-fills all 6 rows at init time. On success the script sets `poc_mode = null` in both `phase-state.json` and `intake-progress.json`.
+- All upgrades preserve the project's deployment tier (personal stays personal; organizational stays organizational). The pre-fix behavior of `--to-private-poc` forcing organizational, and `run_upgrade_to_production` forcing organizational, are both fixed (audit 2026-06).
 
 ---
 
@@ -253,6 +297,19 @@ When using Claude or any cloud-hosted LLM, project code and context are transmit
 | **Zero Data Retention (ZDR) or self-hosted LLM** | Projects handling PII, financial data, trade secrets, or data subject to regulatory constraints | IT Security written approval; may require additional architecture review |
 
 **Mandatory ZDR gate:** Projects with data classified as **Internal or higher** (Internal, Confidential, PII, Financial, Regulated) **must** use the ZDR or self-hosted deployment path. This is a hard gate at Phase 1 — the Orchestrator may not proceed to Phase 2 with a non-ZDR deployment path if the project handles data above Public classification. The Senior Technical Authority must verify the deployment path matches the data classification before approving the Phase 1 → Phase 2 transition.
+
+**Invariant #16 — Enforced (tier-crosscheck-6, closes the final S3 audit finding):** The Mandatory ZDR gate above is enforced as a Phase 1→2 invariant by `scripts/check-phase-gate.sh`. The gate refuses Phase 1→2 (exit 1, `[FAIL]`) unless `.claude/process-state.json::phase1_artifacts` records BOTH:
+
+1. `data_classification` — one of the 7-tier canonical taxonomy values (lowercase): `public`, `internal`, `confidential`, `pii`, `financial`, `health`, `regulated`. This mirrors `templates/project-intake.md` § 5.1 ("Sensitivity classifications: Public, Internal, Confidential, PII, Financial, Health/Medical, Regulated") and `docs/user-guide.md` Section 5.
+2. **Attestation evidence**, in one of two shapes:
+   * `zdr_attested: true` — boolean, indicates ZDR or self-hosted LLM is in place. Sufficient on its own.
+   * `zdr_attestation_reason: "<non-empty text>"` — free-text written exception (e.g. "customer SOW requires retention, risk accepted by CISO Email TKT-42"). Satisfies the gate when ZDR is not attested but the deviation is documented per organizational risk-acceptance policy.
+
+**Exemption:** `data_classification = public` projects are exempt from the attestation requirement — the classification itself is evidence that no sensitive data flows to the LLM provider. The gate emits `[OK]` and skips the attestation check for these projects.
+
+**Where the fields are captured:** Greenfield projects capture both values via `scripts/intake-wizard.sh` § 5.5 (interactive) or via the non-interactive flags `--data-classification VALUE --zdr-attested --zdr-attestation-reason "<text>"`. Retroactive correction uses `scripts/reconfigure-project.sh --field data_classification --new <value>` / `--field zdr_attested --new true|false [--reason "<text>"]`. Personal→Organizational deployment upgrade refuses up-front when `data_classification` is missing — operators must run reconfigure first.
+
+**Audit trail:** Every classification/attestation mutation appends a row to `APPROVAL_LOG.md` (Approval History section) with date, tool, actor, and the new value, preserving the append-only invariant (#8).
 
 **Policy verification cadence:** AI provider terms change. Verify the current data handling policy at the time of adoption and at each biannual review.
 
@@ -686,8 +743,9 @@ The entire value proposition of the Solo Orchestrator model is enabling faster a
 2. **Mandatory SSO integration** — applications authenticate through the enterprise identity provider, making them visible to identity governance.
 3. **Centralized logging** — application logs feed into the enterprise SIEM or logging platform, making operational issues visible to IT operations.
 4. **Quarterly portfolio review** — applications are evaluated against standards, not left to accumulate unmonitored.
+5. **Framework-level commit-time enforcement and audit ledger** — every Solo Orchestrator project ships with an `enforcement_level` (`strict` by default; forced to `strict` for organizational Sponsored POC and Production deployments). In strict mode, `.git/hooks/framework-gate.sh` blocks user-terminal commits that violate the Build Loop / Phase classifier, and the SessionStart out-of-band detector writes every bypassed or unaudited commit to `.claude/bypass-audit.json`. The audit is the durable record a successor or auditor needs to reconstruct the operator's enforcement decisions — the framework's guarantee is "you can route around the block, you cannot route around the audit." See `docs/user-guide.md` ("What Is Enforced vs. What Is Guided") for the level matrix and operator commands, and `docs/audit-log-lifecycle.md` for the audit-row taxonomy and the cold-pickup successor jq recipes.
 
-If any of these controls are not in place, the Solo Orchestrator model is creating shadow IT, regardless of the quality of the code or documentation.
+Shadow-IT mitigation in the Solo Orchestrator model requires both the governance controls above (1–4) AND the framework-level enforcement (5). The governance controls make the project visible to the organization; the framework-level controls keep the in-repo evidence honest. Without both, a project that reports compliance on the dashboard may still have bypassed enforcement that no one can reconstruct after the fact.
 
 ### Orchestrator Burnout
 
@@ -720,6 +778,7 @@ The Solo Orchestrator model concentrates all technical access in one individual.
    - All code changes are committed to version control with signed commits (recommended).
    - Production deployments flow through CI/CD — no manual production deployments.
    - Audit logging enabled on hosting platform and secrets manager.
+   - **In-repo bypass-audit ledger** (`.claude/bypass-audit.json`) — an append-only record of every framework-bypass event the Orchestrator triggered or witnessed: Claude-issued `--no-verify` proposals, user-terminal commits blocked by `framework-gate.sh`, user-terminal commits that landed via `--no-verify` (recorded by the SessionStart out-of-band detector), enforcement-level transitions, and escalations. The ledger lives in the repo and survives `git clone`, so a successor or auditor can reconstruct the Orchestrator's full enforcement history. See `docs/audit-log-lifecycle.md` for the row taxonomy and reader recipes.
 3. **Scope limitation.** Applications handling financial transactions, PII at scale, or regulated data (SOC 2, HIPAA, PCI) require compliance-specific modules that have not yet been developed. The governance framework already provides the structural requirements — role-based approval gate separation through independent phase gate approvers, append-only audit evidence, and anti-self-approval controls. The gap is compliance-specific content mapping and per-change code review enforcement. Do not deploy Solo Orchestrator applications in regulated environments until the applicable compliance module has been built, validated, and the per-change code review requirement is enforced via branch protection.
 
 ---

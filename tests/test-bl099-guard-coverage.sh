@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+# tests/test-bl099-guard-coverage.sh — SYSTEMATIC guard-coverage harness for the
+# BL-099 --sync-framework code paths (scripts/upgrade-project.sh).
+#
+# WHY THIS EXISTS (round 4). Four consecutive adversarial reviews each found a
+# DIFFERENT surviving mutation in this safety-critical code (it rewrites files inside
+# live user projects). Each round pinned the one guard the reviewer named; the next
+# reviewer found the next unpinned guard. That is whack-a-mole. This harness makes
+# guard coverage SYSTEMATIC and SELF-ENFORCING: it holds an explicit REGISTRY of
+# every load-bearing guard, and for each one it NEUTERS a throwaway copy of the real
+# script and proves the BL-099 regression suite goes RED — then restores and proves
+# it goes GREEN. A guard with no killing test cannot be added to the registry, and a
+# guard that is silently un-pinned makes THIS harness fail. Round 5 cannot find a
+# survivor that this registry does not already enumerate.
+#
+# HOW EACH ROW IS CHECKED (the anti-cheat rules, all enforced per row):
+#   1. copy the REAL scripts/upgrade-project.sh into a mutant framework tree;
+#   2. apply the neuter (a literal sed/awk transform — flip a dry-run test, gut a
+#      function body, delete/replace one line);
+#   3. assert the mutant DIFFERS from pristine (a neuter that changed nothing is a
+#      mis-targeted string — hard fail, never a vacuous pass);
+#   4. assert the named marker comment is STILL present (a neuter that removed the
+#      marker would let a marker-grep test pass vacuously — we attack BEHAVIOUR);
+#   5. assert `bash -n` still passes (a syntax-broken mutant proves nothing);
+#   6. run the BL-099 suite (JUST the named killing test, via BL099_ONLY) against the
+#      mutant tree (via BL099_REPO_OVERRIDE) and assert it EXITS NON-ZERO — RED;
+#   7. restore pristine and assert the same test EXITS ZERO — GREEN. This proves the
+#      RED was caused by the neuter, not by the environment.
+#
+# The suite it drives (tests/test-upgrade-sync-framework.sh) exposes two hooks used
+# ONLY here: BL099_REPO_OVERRIDE re-points its framework tree at the mutant, and
+# BL099_ONLY runs a single named test. A bare `bash tests/…` run ignores both.
+#
+# BL-112 EXTENSION. The registry now also covers the two COMMIT-TIME enforcement
+# generators — scripts/lib/hook-templates.sh (the emitted pre-commit hook) and
+# scripts/install-filesystem-gates.sh (the emitted strict framework gate) — whose
+# guards are killed by tests/test-bl112-commit-enforcement.sh (BL112_REPO_OVERRIDE
+# / BL112_ONLY, the same two hooks by another name). Those rows scaffold a REAL
+# project from the mutant tree and attempt a REAL `git commit`, so they are the
+# slowest rows here; they are also the only ones that can prove a commit gate
+# actually refuses a commit, which is precisely the proof BL-112 was missing.
+# Each row therefore declares its TARGET (which file in the mutant tree it
+# mutates) and the harness dispatches to the right killing suite.
+#
+# FAST-LANE: NOT in the tests.yml `unit` list ON PURPOSE. It neuters the script and
+# runs the suite ~2x per registry row (~25 rows), so it is minutes, not seconds —
+# an aggregator-only test (registered in tests/full-project-test-suite.sh). It does
+# NOT invoke init.sh. lint-tests-registered.sh is satisfied by the aggregator entry.
+#
+# CITATION: guards are neutered by a grep-able marker / function name / literal
+# construct, never a bare file:line (the repo's CITATION RULE). bash-3.2 safe;
+# hermetic (CDF_HOME pinned nowhere by the driven suite); no real remotes.
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SUITE="$REPO_ROOT/tests/test-upgrade-sync-framework.sh"
+SUITE_BL112="$REPO_ROOT/tests/test-bl112-commit-enforcement.sh"
+
+# Per-row TARGET: which file in the mutant tree gets neutered, and which suite kills
+# it. PRISTINE/MUT are the globals the neuter primitives operate on; `use_target`
+# (defined once MUTANT_TREE exists) rebinds them together with GUARD_RUNNER.
+PRISTINE=""
+MUT=""
+
+PASSED=0
+FAILED=0
+SKIPPED=0
+pass()  { echo "  [PASS] $1"; PASSED=$((PASSED + 1)); }
+fail_() { echo "  [FAIL] $1 — $2"; FAILED=$((FAILED + 1)); }
+skip_() { echo "  [SKIP] $1 — $2"; SKIPPED=$((SKIPPED + 1)); }
+
+echo "== tests/test-bl099-guard-coverage.sh =="
+
+# ── Build the MUTANT framework tree ONCE (scripts/, docs/, templates/, init.sh —
+# everything the sync reads from ORCHESTRATOR_ROOT). Only scripts/upgrade-project.sh
+# is ever mutated; every row resets it from PRISTINE.
+#
+# It IS a git checkout, deliberately: the real framework the suite drives is a git
+# repo, and _bl099_stamp_pin only writes soloFrameworkCommit when it can resolve the
+# framework HEAD. A non-git tree let the manifest-pin dry-run guard SURVIVE the matrix
+# (the pin silently no-ops, so flipping its guard mutates nothing) — this harness
+# caught exactly that. A single commit gives the pin a HEAD to stamp, so flipping the
+# pin dry-run guard writes the manifest and the matrix sees it. ────────────────────
+ROOT_TMP="$(mktemp -d)"
+MUTANT_TREE="$ROOT_TMP/framework"
+mkdir -p "$MUTANT_TREE"
+cp -R "$REPO_ROOT/scripts"    "$MUTANT_TREE/scripts"
+cp -R "$REPO_ROOT/docs"       "$MUTANT_TREE/docs"
+cp -R "$REPO_ROOT/templates"  "$MUTANT_TREE/templates"
+# BL-112 rows scaffold from this tree with the REAL init.sh, which also reads
+# evaluation-prompts/ — copy it so a mutant-tree init.sh is a faithful framework.
+[ -d "$REPO_ROOT/evaluation-prompts" ] && cp -R "$REPO_ROOT/evaluation-prompts" "$MUTANT_TREE/evaluation-prompts"
+cp    "$REPO_ROOT/init.sh"    "$MUTANT_TREE/init.sh"
+chmod +x "$MUTANT_TREE/init.sh"
+( cd "$MUTANT_TREE" && git init -q && git config user.email fw@t.local && git config user.name FW \
+    && unset GITHUB_BASE_REF && git add -A && git commit -q -m "mutant framework HEAD" ) >/dev/null 2>&1
+cleanup() { rm -rf "$ROOT_TMP" 2>/dev/null || true; }
+trap cleanup EXIT
+
+# ── THE PER-SECTION TARGET (BL-113, 2026-07-12) ────────────────────────────────
+# The registry originally pinned exactly one script (upgrade-project.sh) with one
+# killing suite. The BL-113 anti-laundering guards live in DIFFERENT scripts and
+# are killed by a DIFFERENT suite, so three knobs are now section-scoped:
+#   PRISTINE      the real script a row mutates (the neuter primitives all edit $MUT)
+#   MUT           its copy inside $MUTANT_TREE
+#   GUARD_RUNNER  the function that runs the named killing test against $MUTANT_TREE
+# Every existing row keeps the BL-099 defaults below — nothing about them changes.
+#
+# MERGE NOTE (BL-112 × BL-113): both branches independently needed exactly this and
+# each grew its own version — BL-113's `use_target <pristine> <mut> <runner>` and
+# BL-112's `_select_target <kind>` enum. ONE survives: `use_target`, which is
+# strictly the more general of the two (arbitrary script, arbitrary killing suite,
+# no central enum to edit). The BL-112 rows are expressed in terms of it below.
+GUARD_RUNNER=_run_killing
+
+# Reset the mutant script to pristine (cp preserves the +x mode).
+_reset_mutant() { cp "$PRISTINE" "$MUT"; chmod +x "$MUT"; }
+
+# Point the registry at a different script + killing suite for the rows that follow.
+# use_target <pristine-path> <mutant-path> <runner-fn>
+use_target() { PRISTINE="$1"; MUT="$2"; GUARD_RUNNER="$3"; }
+
+# The BL-099 default: every row up to section (K) mutates upgrade-project.sh and is
+# killed by the sync suite. (PRISTINE/MUT are declared empty above and bound here,
+# because MUTANT_TREE does not exist until the tree is built.)
+use_target "$REPO_ROOT/scripts/upgrade-project.sh" \
+           "$MUTANT_TREE/scripts/upgrade-project.sh" _run_killing
+
+# ── NEUTER PRIMITIVES ───────────────────────────────────────────────────────────
+# Each rewrites $MUT in place, chmods +x (mv from mktemp drops the exec bit — the
+# executed script would 126/Permission-denied and give a FALSE red), and returns
+# non-zero on a MIS-TARGET (anchor/string absent, or not exactly one occurrence) so
+# check_guard can hard-fail rather than silently produce a no-op mutant.
+
+# Flip the nearest `[ "$DRY_RUN" = true ]` test AT OR BEFORE <anchor>'s line to
+# `= false`, so that dry-run guard never fires and the write it suppressed escapes.
+# Literal index/substr matching (no regex) — the anchor and the test carry $ " [ ].
+_neu_flip() {
+  local anchor="$1" tmp; tmp="$(mktemp)"
+  awk -v anchor="$anchor" '
+    { line[NR]=$0 }
+    END {
+      aln=0; for(i=1;i<=NR;i++){ if(index(line[i],anchor)>0){aln=i;break} }
+      if(aln==0){ exit 3 }
+      tgt=0; for(i=1;i<=aln;i++){ if(index(line[i],"[ \"$DRY_RUN\" = true ]")>0) tgt=i }
+      if(tgt==0){ exit 3 }
+      for(i=1;i<=NR;i++){
+        if(i==tgt){ s=line[i]; p=index(s,"[ \"$DRY_RUN\" = true ]");
+          print substr(s,1,p-1) "[ \"$DRY_RUN\" = false ]" substr(s,p+length("[ \"$DRY_RUN\" = true ]")) }
+        else print line[i]
+      }
+    }' "$MUT" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$MUT"; chmod +x "$MUT"
+}
+
+# Gut <fn>'s body to <body>, keeping the signature and every marker comment in the
+# file. Matches `<fn>() {` at column 0 and the closing `}` at column 0 (bash-3.2 /
+# BSD-awk safe) — the same shape as the suite's own _neuter_fn.
+_neu_fnbody() {
+  local fn="$1" body="$2" tmp; tmp="$(mktemp)"
+  awk -v fn="$fn" -v body="$body" '
+    !done && index($0, fn "() {")==1 { print; print "  " body; skip=1; hit=1; next }
+    skip && $0=="}" { print; skip=0; done=1; next }
+    skip { next }
+    { print }
+    END { if(!hit) exit 3 }
+  ' "$MUT" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$MUT"; chmod +x "$MUT"
+}
+
+# Replace EXACTLY ONE occurrence of literal <old> with <new> (literal index/substr,
+# so glob/regex metachars in the strings are inert). Non-zero unless it hit once.
+_neu_subline() {
+  local old="$1" new="$2" tmp; tmp="$(mktemp)"
+  awk -v old="$old" -v new="$new" '
+    { p=index($0, old); if(p>0){ $0=substr($0,1,p-1) new substr($0,p+length(old)); c++ } print }
+    END { if(c!=1) exit 3 }
+  ' "$MUT" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$MUT"; chmod +x "$MUT"
+}
+
+# Delete EXACTLY ONE line containing literal <needle>. Non-zero unless it hit once.
+_neu_delline() {
+  local needle="$1" tmp; tmp="$(mktemp)"
+  awk -v needle="$needle" '
+    index($0, needle)>0 { c++; next } { print }
+    END { if(c!=1) exit 3 }
+  ' "$MUT" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$MUT"; chmod +x "$MUT"
+}
+
+# The mode-preservation guard is genuinely two lines (restore-known-mode / fallback).
+# Neuter BOTH restore chmods in _bl099_replace_region to no-ops, so a refreshed hook
+# keeps the mktemp 0600 (+ the caller's chmod +x → 0700, not 0755).
+_neu_modepreserve() {
+  local tmp; tmp="$(mktemp)"
+  awk '
+    { line=$0
+      p=index(line, "chmod \"$mode\" \"$file\" 2>/dev/null || true");
+      if(p>0){ line=substr(line,1,p-1) ": # neutered" substr(line,p+length("chmod \"$mode\" \"$file\" 2>/dev/null || true")); c1++ }
+      p=index(line, "chmod 755 \"$file\" 2>/dev/null || true");
+      if(p>0){ line=substr(line,1,p-1) ": # neutered" substr(line,p+length("chmod 755 \"$file\" 2>/dev/null || true")); c2++ }
+      print line }
+    END { if(c1!=1 || c2!=1) exit 3 }
+  ' "$MUT" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$MUT"; chmod +x "$MUT"
+}
+
+# Neuter EVERY CODE line carrying literal <marker> to `: # <marker> (NEUTERED)` —
+# the marker survives (rule 4) and the decision body is gone. Comment-only lines
+# are left intact. Non-zero unless it hit at least once. This is the primitive for
+# guards whose decision is spread over more than one marked statement (BL-113).
+_neu_markerline() {
+  local marker="$1" tmp; tmp="$(mktemp)"
+  awk -v marker="$marker" '
+    {
+      line=$0
+      # leading-whitespace-only-then-# => a comment line; never neuter it.
+      s=line; sub(/^[ \t]+/, "", s)
+      if (substr(s,1,1)=="#") { print line; next }
+      if (index(line, marker)>0) {
+        n=match(line, /^[ \t]*/); ind=substr(line, 1, RLENGTH)
+        print ind ": # " marker " (NEUTERED)"
+        c++
+        next
+      }
+      print line
+    }
+    END { if(c<1) exit 3 }
+  ' "$MUT" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$MUT"; chmod +x "$MUT"
+}
+
+_apply_neuter() {
+  local kind="$1" a1="$2" a2="$3"
+  case "$kind" in
+    flip)         _neu_flip "$a1" ;;
+    fnbody)       _neu_fnbody "$a1" "$a2" ;;
+    subline)      _neu_subline "$a1" "$a2" ;;
+    delline)      _neu_delline "$a1" ;;
+    markerline)   _neu_markerline "$a1" ;;
+    modepreserve) _neu_modepreserve ;;
+    *) return 2 ;;
+  esac
+}
+
+# Run ONE (or more, space-separated) killing test(s) against the mutant tree.
+# Prints the suite output; returns the suite's exit code (non-zero = a named test
+# FAILED, because the *_ONLY hook runs only those tests). This is the BL-099
+# default runner: upgrade-project.sh guards are killed by the sync suite.
+_run_killing() {
+  BL099_REPO_OVERRIDE="$MUTANT_TREE" BL099_ONLY="$1" bash "$SUITE" 2>&1
+}
+
+# BL-112 runner: the commit-gate GENERATORS (hook-templates.sh,
+# install-filesystem-gates.sh) are killed by tests/test-bl112-commit-enforcement.sh,
+# which scaffolds a REAL project from the mutant tree with the REAL init.sh and then
+# attempts a REAL `git commit` — the only shape that can prove a commit gate refuses
+# a commit. (Whole-tree override, not a scripts/ swap: the hook bodies are BAKED IN
+# at scaffold time by init.sh, so the mutation has to be present before it runs.)
+_run_killing_bl112() {
+  BL112_REPO_OVERRIDE="$MUTANT_TREE" BL112_ONLY="$1" bash "$SUITE_BL112" 2>&1
+}
+
+# BL-125 runner: the commit-time TEST-EXECUTION arm is killed by
+# tests/test-bl125-commit-test-exec.sh, which emits the hook DIRECTLY from the
+# mutant tree's hook-templates.sh (the single source both installers consume)
+# and attempts a REAL `git commit` — no init.sh, so these rows are seconds.
+_run_killing_bl125() {
+  BL125_REPO_OVERRIDE="$MUTANT_TREE" BL125_ONLY="$1" \
+    bash "$REPO_ROOT/tests/test-bl125-commit-test-exec.sh" 2>&1
+}
+
+# BL-113 runner: drive tests/test-bl113-sast-honesty.sh against the mutant tree's
+# scripts/. The suite scaffolds a real project with the REAL init.sh and then swaps
+# in the (possibly neutered) scripts via BL113_SCRIPTS_OVERRIDE; BL113_ONLY narrows
+# it to the anti-laundering arms so each row costs two scaffolds, not six.
+_run_killing_bl113() {
+  BL113_SCRIPTS_OVERRIDE="$MUTANT_TREE/scripts" BL113_ONLY="$1" \
+    bash "$REPO_ROOT/tests/test-bl113-sast-honesty.sh" 2>&1
+}
+
+# ── THE REGISTRY PIPELINE ────────────────────────────────────────────────────────
+# check_guard <name> <marker|-> <killing_test_fn> <kind> [arg1] [arg2]
+GUARD_ROWS=""   # accumulated "STATUS<TAB>name<TAB>killing-test" for the summary table
+check_guard() {
+  local name="$1" marker="$2" tests="$3" kind="$4" a1="$5" a2="$6"
+  _reset_mutant
+  if ! _apply_neuter "$kind" "$a1" "$a2"; then
+    fail_ "$name" "neuter MIS-TARGETED (kind=$kind) — the anchor/string was absent or not unique in the current script; update the registry row"
+    GUARD_ROWS="${GUARD_ROWS}MISTARGET\t${name}\t${tests}\n"; _reset_mutant; return
+  fi
+  if cmp -s "$PRISTINE" "$MUT"; then
+    fail_ "$name" "neuter produced an IDENTICAL file — nothing was mutated (kind=$kind)"
+    GUARD_ROWS="${GUARD_ROWS}NOOP\t${name}\t${tests}\n"; _reset_mutant; return
+  fi
+  if [ "$marker" != "-" ] && ! grep -qF "$marker" "$MUT"; then
+    fail_ "$name" "the neuter removed the marker '$marker' — a marker-grep test could pass vacuously; the neuter must attack behaviour, not the marker text"
+    GUARD_ROWS="${GUARD_ROWS}MARKERGONE\t${name}\t${tests}\n"; _reset_mutant; return
+  fi
+  if ! bash -n "$MUT" 2>/dev/null; then
+    fail_ "$name" "the mutant has a bash syntax error — a syntax-broken mutant proves nothing (kind=$kind)"
+    GUARD_ROWS="${GUARD_ROWS}SYNTAX\t${name}\t${tests}\n"; _reset_mutant; return
+  fi
+  local mout mrc=0; mout=$("$GUARD_RUNNER" "$tests") || mrc=$?
+  if echo "$mout" | grep -qF "running as root"; then
+    _reset_mutant
+    skip_ "$name" "killing test [$tests] short-circuits under root (mode bits do not restrict root) — cannot pin here on this host"
+    GUARD_ROWS="${GUARD_ROWS}SKIP-root\t${name}\t${tests}\n"; return
+  fi
+  # A killing test that SKIPPED exits 0 — which would read as SURVIVED. It is not.
+  # The BL-112 SAST cases skip when semgrep is absent; say so instead of lying in
+  # either direction.
+  if echo "$mout" | grep -qF "[SKIP] $tests"; then
+    _reset_mutant
+    skip_ "$name" "killing test [$tests] SKIPPED on this host (semgrep absent) — the guard is UNPINNED here, not proven"
+    GUARD_ROWS="${GUARD_ROWS}SKIP-nosemgrep\t${name}\t${tests}\n"; return
+  fi
+  if [ "$mrc" = "0" ]; then
+    _reset_mutant
+    fail_ "$name" "SURVIVED — killing test [$tests] stayed GREEN against the neutered guard. The guard is NOT pinned by that test.\nmutant PASS/FAIL lines:\n$(echo "$mout" | grep -E '\[PASS\]|\[FAIL\]' | head -4)"
+    GUARD_ROWS="${GUARD_ROWS}SURVIVED\t${name}\t${tests}\n"; return
+  fi
+  # RED confirmed. Restore and prove GREEN so the RED is attributable to the neuter.
+  _reset_mutant
+  local gout grc=0; gout=$("$GUARD_RUNNER" "$tests") || grc=$?
+  if [ "$grc" != "0" ]; then
+    fail_ "$name" "killing test [$tests] FAILS even against the RESTORED pristine script — the RED was not caused by the neuter (environment/flake?).\nrestored PASS/FAIL lines:\n$(echo "$gout" | grep -E '\[PASS\]|\[FAIL\]' | head -4)"
+    GUARD_ROWS="${GUARD_ROWS}FLAKY\t${name}\t${tests}\n"; return
+  fi
+  pass "$name → RED under neuter ($kind), GREEN restored | killing: $tests"
+  GUARD_ROWS="${GUARD_ROWS}PINNED\t${name}\t${tests}\n"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# THE GUARD REGISTRY — one row per load-bearing guard in the BL-099 code paths.
+# Column meaning: NAME | MARKER (grep-able, or - if the killing test is behavioural)
+#                 | KILLING TEST (in tests/test-upgrade-sync-framework.sh) | NEUTER.
+# Every dry-run guard is neutered by FLIPPING its own `[ "$DRY_RUN" = true ]` test to
+# false (the write it suppressed then escapes) and is killed by the full-surface
+# dry-run matrix. Behaviour guards are gutted / line-edited and killed by the
+# behavioural test that asserts the property.
+# ══════════════════════════════════════════════════════════════════════════════════
+
+# ── (A) DRY-RUN PURITY — every write suppressed under --dry-run (BLOCK-1) ─────────
+check_guard "dryrun/backfill+CDF"            "-" t_dry_run_pure_under_all_flags flip '[dry-run] would run idempotent'
+check_guard "dryrun/script-sync"             "-" t_dry_run_pure_under_all_flags flip '[would sync]'
+check_guard "dryrun/commit-msg-hook-refresh" "-" t_dry_run_pure_under_all_flags flip '[would refresh] commit-msg TDD gate'
+check_guard "dryrun/commit-msg-hook-install" "-" t_dry_run_pure_under_all_flags flip '[would install] commit-msg TDD gate'
+check_guard "dryrun/pre-commit-hook-install" "-" t_dry_run_pure_under_all_flags flip '[would install] pre-commit fallback hook'
+check_guard "dryrun/pre-commit-hook-refresh" "-" t_dry_run_pure_under_all_flags flip '[would refresh] pre-commit fallback managed region'
+check_guard "dryrun/pre-commit-hook-legacy"  "-" t_dry_run_pure_under_all_flags flip '[would write sidecar] legacy'
+check_guard "dryrun/doc-apply"               "-" t_dry_run_pure_under_all_flags flip '[dry-run] notice only'
+check_guard "dryrun/manifest-pin"            "-" t_dry_run_pure_under_all_flags flip '[dry-run] would stamp'
+
+# ── (B) REFUSE-TO-RUN GUARDS — freeze the surface before any mutation ─────────────
+check_guard "sentinel/pending-approval" "-" t_sentinel_freezes_sync  subline 'if [ "$BACKFILL_ONLY" != true ]; then _bl015_sentinel_guard; fi' 'if [ "$BACKFILL_ONLY" != true ]; then :; fi'
+check_guard "source-check/self-copy"    "-" t_sync_self_copy_refused subline 'if [ "$SCRIPT_DIR" -ef "$PROJECT_ROOT/scripts" ]; then' 'if false; then'
+
+# ── (C) THE RENDERED-DOC FENCE (# BL-099-DOC-GUARD) ──────────────────────────────
+check_guard "doc-guard/rendered-fence" "# BL-099-DOC-GUARD" t_rendered_doc_never_applied fnbody _bl099_doc_is_rendered 'return 1'
+
+# ── (D) DESTRUCTIVE-OVERWRITE CONSENT (# BL-099-CONFIRM) + its non-interactive
+#        fallback (a flag never auto-yeses a destructive overwrite) ───────────────
+check_guard "confirm/overwrite-consent"    "# BL-099-CONFIRM" t_doc_overwrite_confirm_declined fnbody _bl099_overwrite_consent 'return 0'
+check_guard "confirm/noninteractive-fallback" "-"             t_doc_overwrite_confirm_declined subline '  [ "$CONFIRM_DOC_OVERWRITE" = true ]' '  true'
+
+# ── (E) THE WRITE-STATUS CHECK — BOTH halves of _bl099_write_ok (# BL-099-APPLY-STATUS)
+check_guard "write-ok/status-half"   "# BL-099-APPLY-STATUS" t_doc_cp_reports_failure_is_caught            fnbody _bl099_write_ok 'cmp -s "$2" "$3"'
+check_guard "write-ok/byteread-half" "# BL-099-APPLY-STATUS" t_doc_overwrite_write_silently_fails_is_caught fnbody _bl099_write_ok '[ "$1" -eq 0 ]'
+
+# ── (F) THE OVERWRITE BACKUP + REPAIR CHAIN ──────────────────────────────────────
+check_guard "overwrite/backup-before-write" "# BL-099-APPLY-STATUS" t_doc_overwrite_backup_refusal            subline 'if ! _bl099_write_ok "$rc" "$pfile" "$bak"; then' 'if false; then'
+check_guard "overwrite/auto-restore"        "-"                     t_doc_overwrite_write_failure_restores_original delline 'cp "$bak" "$pfile" 2>/dev/null || true'
+check_guard "overwrite/restore-message"     "-"                     t_doc_overwrite_write_failure_restores_original subline 'if cmp -s "$bak" "$pfile"; then' 'if ! cmp -s "$bak" "$pfile"; then'
+
+# ── (G) SCRIPT SYNC — dispatch (# BL-099-SYNC) + its new cp status check (MINOR-5) ─
+check_guard "script-sync/dispatch"  "# BL-099-SYNC"         t_sync_refreshes_stale_script subline '  _bl099_sync_scripts        # BL-099-SYNC' '  :        # BL-099-SYNC'
+check_guard "script-sync/cp-status" "# BL-099-APPLY-STATUS" t_scriptsync_cp_failure_is_loud subline 'if ! _bl099_write_ok "$rc" "$src" "$dst"; then    # BL-099-APPLY-STATUS' 'if false; then    # BL-099-APPLY-STATUS'
+
+# ── (H) CONSENT-CONTEXT GUARDS — forcing predicate + hook consent fallback ────────
+check_guard "consent/noninteractive-forcing" "-" t_non_interactive_flag_honored           fnbody  _bl099_forced_noninteractive 'return 1'
+check_guard "consent/hook-install-fallback"  "-" t_hook_refused_noninteractive_without_flag subline '  [ "$INSTALL_HOOKS" = true ]' '  true'
+
+# ── (I) HOOK MODE PRESERVATION (a refresh keeps the destination 0755) ────────────
+check_guard "mode/hook-refresh-preservation" "-" t_hook_mode_preserved modepreserve
+
+# ── (J) THE INTERACTIVE APPLY-PROMPT FALLBACK (# BL-099-PROMPT-FALLBACK, BLOCK-2) ──
+check_guard "prompt/apply-fallback-is-skip" "# BL-099-PROMPT-FALLBACK" t_doc_prompt_default_is_skip subline '|| action="skip"  # BL-099-PROMPT-FALLBACK' '|| action="overwrite"  # BL-099-PROMPT-FALLBACK'
+
+# ── (K) BL-112 — THE COMMIT-TIME ENFORCEMENT GENERATORS ──────────────────────────
+# Three guards, all three of which were BROKEN in production and all three of which
+# a static/fixture test would have missed. Killed by tests/test-bl112-commit-
+# enforcement.sh, which scaffolds a REAL project from the mutant tree and attempts
+# a REAL `git commit`: the ONLY test shape that can prove a commit gate refuses a
+# commit. These rows are the slow ones (a real init.sh per RED and per GREEN).
+
+# K1. The semgrep `--error` flag in the emitted pre-commit hook. Neuter = drop the
+#     flag (the exact pre-BL-112 invocation) => semgrep still DETECTS and PRINTS the
+#     planted eval(req.query.code) RCE, exits 0, and the commit lands.
+use_target "$REPO_ROOT/scripts/lib/hook-templates.sh" \
+           "$MUTANT_TREE/scripts/lib/hook-templates.sh" _run_killing_bl112
+check_guard "bl112/sast-error-flag" "# BL-112-SAST-ERROR" T-sast-blocks-real-commit \
+  subline '--severity=ERROR --error ${soif_idx_files[@]+"${soif_idx_files[@]}"}' '--severity=ERROR ${soif_idx_files[@]+"${soif_idx_files[@]}"}'
+
+# K2. The CONDITIONAL terminal exit in the emitted pre-commit hook. Neuter = make it
+#     unconditional (`if true; then exit "$FAILED"`) — byte-for-byte the pre-BL-112
+#     `exit $FAILED` semantics — which puts the appended `# >>> SOIF framework gate`
+#     block back BELOW a terminal exit, i.e. back into dead code.
+check_guard "bl112/strict-gate-reachable" "# BL-112-STRICT-GATE" T-strict-gate-blocks-unverified \
+  subline 'if [ "$FAILED" -ne 0 ]; then' 'if true; then'
+
+# K3. The framework gate's VERDICT PROPAGATION. Neuter = put the checker back behind
+#     a `!`, which is exactly the original `if ! cmd; then EXIT=$?` semantics: inside
+#     that branch `$?` is the status of the NEGATION, i.e. 0 whenever cmd FAILED — so
+#     EXIT was always 0 and the gate printed its [FAIL] and then `exit 0`. A gate
+#     whose verdict is discarded is not a gate; reachability alone does not save it.
+use_target "$REPO_ROOT/scripts/install-filesystem-gates.sh" \
+           "$MUTANT_TREE/scripts/install-filesystem-gates.sh" _run_killing_bl112
+check_guard "bl112/gate-verdict-propagates" "# BL-112-GATE-EXIT" T-strict-gate-blocks-unverified \
+  subline '"$SCRIPTS/process-checklist.sh" --check-commit-ready 2>&1' '! "$SCRIPTS/process-checklist.sh" --check-commit-ready 2>&1'
+
+# K4. The BL-125 test-execution arm actually RUNS the project's test command. Neuter
+#     = replace the real invocation with `true` (the arm still prints its banner and
+#     receipts, but the verdict is hardwired green) => a RED suite lands. Killed by
+#     the bl125 suite's T1 via the dedicated runner — the emitted-hook path, not
+#     init.sh, so this row is cheap.
+use_target "$REPO_ROOT/scripts/lib/hook-templates.sh" \
+           "$MUTANT_TREE/scripts/lib/hook-templates.sh" _run_killing_bl125
+check_guard "bl125/test-exec-runs-real-cmd" "# BL-125-COMMIT-TESTS" T1 \
+  subline 'sh -c "$soif_test_cmd" </dev/null' 'sh -c "true" </dev/null'
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# ── (K) BL-109 S3 — PLAN STAGING GUARDS ───────────────────────────────────────────
+# The staging engine (scripts/lib/plan-staging.sh) + the --plan dispatch
+# (scripts/upgrade-project.sh) carry their OWN load-bearing guards. They are driven
+# by a DIFFERENT suite — tests/test-plan-staging.sh, which honours PLAN_ONLY (run one
+# named test) + PLAN_REPO_OVERRIDE (source the libs + run upgrade-project.sh from the
+# MUTANT tree) exactly as the sync suite honours BL099_ONLY/BL099_REPO_OVERRIDE. So
+# these rows neuter plan-staging.sh (lib guards) or upgrade-project.sh (the dispatch),
+# then assert the named plan-suite test goes RED. Same anti-cheat rules per row.
+# ══════════════════════════════════════════════════════════════════════════════════
+PLAN_PRISTINE_LIB="$REPO_ROOT/scripts/lib/plan-staging.sh"
+PLAN_MUT_LIB="$MUTANT_TREE/scripts/lib/plan-staging.sh"
+# The S2 DETECTOR is a third neuter target (`fresh`). The plan reuses freshness-detect's
+# comparison facts wholesale, so a guard can live in the detector and be killed by a plan
+# test — # BL-109-MISSING is exactly that: the detector decides whether a locally-deleted
+# tracked file is NAMED or silently mis-reported as framework-drift, and the plan is where
+# the mis-report detonates (an empty payload → a whole-plan abort).
+FRESH_PRISTINE_LIB="$REPO_ROOT/scripts/lib/freshness-detect.sh"
+FRESH_MUT_LIB="$MUTANT_TREE/scripts/lib/freshness-detect.sh"
+PLAN_SUITE="$REPO_ROOT/tests/test-plan-staging.sh"
+_reset_plan_lib()  { cp "$PLAN_PRISTINE_LIB"  "$PLAN_MUT_LIB"; }
+_reset_fresh_lib() { cp "$FRESH_PRISTINE_LIB" "$FRESH_MUT_LIB"; }
+# Drive ONE plan-suite test against the mutant tree (PLAN_REPO_OVERRIDE re-points the
+# sourced libs + upgrade-project.sh; PLAN_ONLY selects the single killing test).
+_run_killing_plan() { PLAN_REPO_OVERRIDE="$MUTANT_TREE" PLAN_ONLY="$1" bash "$PLAN_SUITE" 2>&1; }
+
+# ⚠ use_target IS STATEFUL — it rebinds the GLOBAL PRISTINE/MUT, and every row below
+# inherits the last binding until someone rebinds again. check_guard_plan's `disp`
+# target falls through to those globals (see its `*)` arm), so the plan rows below
+# MUST run with the globals pointing back at upgrade-project.sh. The BL-112 section
+# above rebinds them to hook-templates.sh / install-filesystem-gates.sh; without this
+# line the plan/dispatch row silently neuters the WRONG FILE and MIS-TARGETs.
+# (Caught by the merge of BL-112 into the S3 branch: 49/49 on each side, 51/52 merged.)
+use_target "$REPO_ROOT/scripts/upgrade-project.sh" \
+           "$MUTANT_TREE/scripts/upgrade-project.sh" _run_killing
+
+# check_guard_plan <name> <marker|-> <killing_test> <target:lib|fresh|disp> <kind> [a1] [a2]
+#   lib   → neuter $MUTANT_TREE/scripts/lib/plan-staging.sh
+#   fresh → neuter $MUTANT_TREE/scripts/lib/freshness-detect.sh (the S2 detector the plan reuses)
+#   disp  → neuter $MUT (the mutant upgrade-project.sh, the # BL-109-PLAN dispatch)
+check_guard_plan() {
+  local name="$1" marker="$2" tests="$3" target="$4" kind="$5" a1="$6" a2="$7"
+  local pristine mut saved="$MUT"
+  _reset_mutant; _reset_plan_lib; _reset_fresh_lib
+  case "$target" in
+    lib)   pristine="$PLAN_PRISTINE_LIB";  mut="$PLAN_MUT_LIB" ;;
+    fresh) pristine="$FRESH_PRISTINE_LIB"; mut="$FRESH_MUT_LIB" ;;
+    *)     pristine="$PRISTINE";           mut="$MUT" ;;
+  esac
+  MUT="$mut"
+  if ! _apply_neuter "$kind" "$a1" "$a2"; then
+    MUT="$saved"; fail_ "$name" "neuter MIS-TARGETED (kind=$kind) — anchor/string absent or not unique; update the row"
+    GUARD_ROWS="${GUARD_ROWS}MISTARGET\t${name}\t${tests}\n"; _reset_mutant; _reset_plan_lib; _reset_fresh_lib; return
+  fi
+  if cmp -s "$pristine" "$mut"; then
+    MUT="$saved"; fail_ "$name" "neuter produced an IDENTICAL file (kind=$kind)"
+    GUARD_ROWS="${GUARD_ROWS}NOOP\t${name}\t${tests}\n"; _reset_mutant; _reset_plan_lib; _reset_fresh_lib; return
+  fi
+  if [ "$marker" != "-" ] && ! grep -qF "$marker" "$mut"; then
+    MUT="$saved"; fail_ "$name" "the neuter removed the marker '$marker' — attack behaviour, not the marker"
+    GUARD_ROWS="${GUARD_ROWS}MARKERGONE\t${name}\t${tests}\n"; _reset_mutant; _reset_plan_lib; _reset_fresh_lib; return
+  fi
+  if ! bash -n "$mut" 2>/dev/null; then
+    MUT="$saved"; fail_ "$name" "the mutant has a bash syntax error (kind=$kind)"
+    GUARD_ROWS="${GUARD_ROWS}SYNTAX\t${name}\t${tests}\n"; _reset_mutant; _reset_plan_lib; _reset_fresh_lib; return
+  fi
+  MUT="$saved"
+  local mout mrc=0; mout=$(_run_killing_plan "$tests") || mrc=$?
+  if [ "$mrc" = "0" ]; then
+    _reset_mutant; _reset_plan_lib; _reset_fresh_lib
+    fail_ "$name" "SURVIVED — killing test [$tests] stayed GREEN against the neutered guard.\nmutant PASS/FAIL lines:\n$(echo "$mout" | grep -E '\[PASS\]|\[FAIL\]' | head -4)"
+    GUARD_ROWS="${GUARD_ROWS}SURVIVED\t${name}\t${tests}\n"; return
+  fi
+  _reset_mutant; _reset_plan_lib; _reset_fresh_lib
+  local gout grc=0; gout=$(_run_killing_plan "$tests") || grc=$?
+  if [ "$grc" != "0" ]; then
+    fail_ "$name" "killing test [$tests] FAILS against the RESTORED pristine (flake).\nrestored PASS/FAIL lines:\n$(echo "$gout" | grep -E '\[PASS\]|\[FAIL\]' | head -4)"
+    GUARD_ROWS="${GUARD_ROWS}FLAKY\t${name}\t${tests}\n"; return
+  fi
+  pass "$name → RED under neuter ($kind), GREEN restored | killing: $tests"
+  GUARD_ROWS="${GUARD_ROWS}PINNED\t${name}\t${tests}\n"
+}
+
+check_guard_plan "plan/dispatch"        "# BL-109-PLAN"               t_plan_dispatch_creates_run_folder disp subline '_run_plan     # BL-109-PLAN' ':     # BL-109-PLAN'
+check_guard_plan "plan/exclusive-mkdir" "# BL-109-PLAN-MKDIR"         t_exclusive_mkdir                  lib  subline 'if ! mkdir "$RUN_DIR" 2>/dev/null; then' 'if ! mkdir -p "$RUN_DIR" 2>/dev/null; then'
+check_guard_plan "plan/write-fence-I1"  "# BL-109-PLAN-FENCE"         t_i1_write_fence                   lib  subline '"$RUN_DIR/UPDATE-PLAN.md"' '"$proj/UPDATE-PLAN.md"'
+check_guard_plan "plan/a2-fence"        "# BL-109-PLAN-A2FENCE"       t_a2_structural_only               lib  subline '_soif_plan_build_a2_structural "$RUN_DIR"' '_soif_plan_build_a1_candidate "$RUN_DIR"'
+check_guard_plan "plan/a1-placeholder"  "# BL-109-PLAN-A1PLACEHOLDER" t_a1_placeholder_withheld          lib  fnbody  _soif_plan_has_placeholder 'return 1'
+check_guard_plan "plan/base-sha"        "# BL-109-PLAN-BASESHA"       t_base_sha_recorded                lib  fnbody  _soif_plan_base_sha ':'
+# NB: the neuter target is escape-FREE (`>> "$items_tmp" … ;; # marker`) — the awk
+# `-v` in _neu_subline interprets \t/\n in the passed string, so a target containing
+# the printf format's \t/\n would mis-match. Routing the emitted retire row to
+# /dev/null drops it (no orphan item → no retire/rename → t_retire_emitted RED).
+check_guard_plan "plan/retire-verb"     "# BL-109-PLAN-RETIRE"        t_retire_emitted                   lib  subline '>> "$items_tmp"  ;; # BL-109-PLAN-RETIRE' '>> /dev/null  ;; # BL-109-PLAN-RETIRE'
+
+# ── (K2) S3 REVIEW ROUND 1 — the two guards the review round added ────────────────
+# I11 CONSENT SCOPE. _soif_plan_is_i11_item is the ONE place that decides which items
+# can never be batch-consented: hooks (class) ∪ gate scripts (path). Neuter the
+# GATE-SCRIPT half only — `_soif_plan_is_enforcement_path "$path"` → `false` — so the
+# predicate still fires for hooks but matches no gate script. That is exactly the
+# half-delivered fence the review caught: a gate script would fall back to
+# batch-consent + diffstat-only, with no full diff to read before ticking the box that
+# rewrites the code deciding whether the operator's gates block. The killing test
+# drifts a gate script, a hook and an ordinary M script SIMULTANEOUSLY, so it also
+# proves the neuter is surgical (the hook half stays GREEN under it).
+check_guard_plan "plan/i11-consent-scope" "# BL-109-I11-CONSENT"      t_i11_consent_scope_simultaneous_drift lib subline '_soif_plan_is_enforcement_path "$path"' 'false'
+
+# A1 THREE-WAY LEG ORDER. `git merge-file -p <ours> <base> <theirs>` with base=render-
+# THEN and theirs=render-NOW. Swap base and theirs and the NEW render becomes the
+# common ancestor: the merge then treats the upstream delta as something to REVERT and
+# SILENTLY DROPS IT — a clean-looking candidate that is missing the very update it was
+# built to stage. No conflict, no error, no warning. The killing test makes all three
+# legs distinguishable and asserts the upstream delta reaches the candidate.
+check_guard_plan "plan/a1-merge-leg-order" "# BL-109-A1-MERGE-LEGS"   t_a1_merge_leg_order lib subline 'git merge-file -p "$run/incoming/${safe}.ours" "$then_out" "$now_out"' 'git merge-file -p "$run/incoming/${safe}.ours" "$now_out" "$then_out"'
+
+# ── (K3) S3 REVIEW ROUND 2 — THE I11 PAYLOAD GUARD + the two unpinned fence halves ─
+# THE PATTERN THIS ROUND ENDS. The I11 consent fence was caught HOLLOW three times on
+# one change, each time in a different arm — gate items rendered diffstat-only (r1); hook
+# items emitted an EMPTY ```diff block under a heading promising a full diff, because hook
+# rows carry path "-" (r1 fix round); a RENAMED gate script emitted an empty block because
+# `rename` had no arm in _soif_plan_unified_diff (r2). Three instances, ONE root cause:
+# nothing asserted that an I11 item's promised diff actually HAD a payload. The r1 hook
+# "fix" even shipped with a passing test, because the test grepped the HEADING.
+#
+# So the invariant is now STRUCTURAL, not per-verb: _soif_plan_diff_has_payload runs at
+# the single emission site on EVERY I11 item, and an empty/hunkless diff is a hard abort
+# that discards the run folder. The rows below pin the guard, both halves of the I11
+# predicate, and the tier derivation.
+
+# THE PAYLOAD GUARD ITSELF. Gut _soif_plan_diff_has_payload → it always says "yes, there
+# is a payload" → the hollow plan gets OFFERED instead of aborting. The killing test
+# drives it two ways (an empty upstream gate script end-to-end; a synthetic FUTURE verb
+# with no diff arm), both of which must hard-error, so this row also proves the guard is
+# what makes "every verb needs a diff arm" a machine fact rather than a review habit.
+check_guard_plan "plan/i11-payload"     "# BL-109-I11-PAYLOAD"        t_i11_empty_payload_hard_error lib fnbody _soif_plan_diff_has_payload 'return 0'
+
+# THE VERB ARMS, via the (class × verb) CROSS-PRODUCT. Delete the `rename)` arm — the
+# exact round-2 bug — and the rename falls through to `*)`, which diffs two paths of which
+# one never exists on a rename, yielding nothing. The payload guard converts that silent
+# hollow block into a named abort, so t_i11_payload_cross_product goes RED. The same holds
+# for add/retire/update/hook: the cross-product covers every arm, so a future verb added
+# without a diff arm trips this row automatically.
+check_guard_plan "plan/i11-verb-arms"   "# BL-109-I11-PAYLOAD"        t_i11_payload_cross_product lib subline '    rename)' '    rename-NOARM)'
+
+# THE HOOK HALF OF THE I11 PREDICATE. plan/i11-consent-scope (above) neuters only the GATE
+# half (_soif_plan_is_enforcement_path). A two-clause fence needs a kill per clause, so
+# this row neuters the HOOK clause: `[ "$class" = "hook" ]` never matches → hooks fall out
+# of the I11 scope entirely (batch consent, no full-diff section).
+check_guard_plan "plan/i11-hook-half"   "# BL-109-I11-CONSENT"        t_hook_item_consent_full_diff lib subline '  [ "$class" = "hook" ] && return 0' '  [ "$class" = "hook-NEVER" ] && return 0'
+
+# THE I11 NORMALIZATION IN soif_plan_run — now genuinely load-bearing. It USED to be a
+# second opinion (every derivation arm decided I11 consent for itself and this line
+# re-decided it), so neutering it changed nothing and the suite stayed 19/19 green while
+# the PR body called it "the single load-bearing point". The derivation arms now emit the
+# ordinary `batch` default and THIS is the only place that upgrades the I11 scope to
+# `item` — so flipping it to `if false` drops gate scripts AND hooks into the batch
+# bucket, and the killing test goes RED. The claim in the code is now true.
+check_guard_plan "plan/i11-normalize"   "# BL-109-I11-CONSENT"        t_i11_consent_scope_simultaneous_drift lib subline '    if _soif_plan_is_i11_item "$class" "$path"; then consent=item; fi' '    if false; then consent=item; fi'
+
+# TIER DERIVED FROM THE PATH. The retire arm hard-coded `tier=enforcement` for every
+# orphan, so retiring an ordinary script rendered as a ⚠ ENFORCEMENT item — a lie that
+# devalues the ⚠ on the items that ARE enforcement machinery. Pin the derivation by
+# collapsing the helper back to the constant it used to be.
+check_guard_plan "plan/retire-tier"     "# BL-109-PLAN-TIER"          t_retire_tier_derived_from_path lib fnbody _soif_plan_tier_for_path 'printf enforcement'
+
+# ── (K4) S3 REVIEW ROUND 3 — PIN THE GUARD'S STRICTNESS, NOT JUST ITS EXISTENCE ────
+# The round-2 verifier confirmed the payload guard WORKS (its own class × verb × tier
+# cross-product found zero hollow payloads) — and then weakened _soif_plan_diff_has_payload
+# to "any non-empty output" and watched all 22 plan tests and all 39 registry rows stay
+# GREEN. The guard was real; NOTHING PINNED HOW STRICT IT WAS. `plan/i11-payload` (above)
+# only kills the total gutting (`return 0`); every intermediate softening survived. That is
+# the WEAK-TEST class reappearing on the very guard built to kill the weak-test class.
+#
+# So the PREDICATE is now pinned directly, by t_payload_predicate_strictness, which drives
+# _soif_plan_diff_has_payload with crafted inputs in BOTH directions. The registry delivers
+# the strictness row as a FAMILY — one row per SPECIFIC weakening, because the harness
+# applies exactly one neuter per row and "kills the specific weakenings, not merely the
+# deletion of the function" is the whole point. Each body keeps the marker, stays
+# syntactically valid, and is a plausible careless edit rather than a straw man:
+#
+#   any-nonempty          the verifier's own weakening: any output at all counts.
+#   no-hunk-required      drop the hunk-header clause → loose +/- lines pass as a "diff".
+#   no-content-required   drop the content clause → a hunk header alone passes.
+#   file-headers-count    the classic: `^[-+]` file-wide, so the ---/+++ FILE HEADERS are
+#                         mistaken for content and a header-only block passes.
+#   over-strict           the OPPOSITE failure, and a real one — this IS the pre-round-3
+#                         predicate. It keyed on a line's SPELLING (`^\+` not followed by
+#                         another `+`), so a real diff whose payload TEXT begins with
+#                         `+++`/`---` was REJECTED and the plan fail-closed on a legitimate
+#                         update. An over-strict guard is a denial-of-service on the
+#                         operator's own updates, so the ACCEPT direction is pinned exactly
+#                         as hard as the REJECT direction.
+check_guard_plan "plan/i11-payload-strictness/any-nonempty"        "# BL-109-I11-PAYLOAD" t_payload_predicate_strictness lib fnbody _soif_plan_diff_has_payload '[ -s "$1" ]'
+check_guard_plan "plan/i11-payload-strictness/no-hunk-required"    "# BL-109-I11-PAYLOAD" t_payload_predicate_strictness lib fnbody _soif_plan_diff_has_payload 'grep -qE "^[-+]" "$1"'
+check_guard_plan "plan/i11-payload-strictness/no-content-required" "# BL-109-I11-PAYLOAD" t_payload_predicate_strictness lib fnbody _soif_plan_diff_has_payload 'grep -q "^@@" "$1"'
+check_guard_plan "plan/i11-payload-strictness/file-headers-count"  "# BL-109-I11-PAYLOAD" t_payload_predicate_strictness lib fnbody _soif_plan_diff_has_payload 'grep -q "^@@" "$1" && grep -qE "^[-+]" "$1"'
+check_guard_plan "plan/i11-payload-strictness/over-strict"         "# BL-109-I11-PAYLOAD" t_payload_predicate_strictness lib fnbody _soif_plan_diff_has_payload 'grep -q "^@@" "$1" && grep -qE "^[+]([^+]|$)|^[-]([^-]|$)" "$1"'
+
+# THE MISSING TRACKED FILE (# BL-109-MISSING) — two guards, one on each side of the seam.
+#
+# DETECTION (the S2 detector — the `fresh` target). The drift arm compared the MANIFEST sha
+# to the UPSTREAM sha and never checked that the project file still EXISTS. Neuter the
+# existence check and a locally-deleted tracked gate script falls straight back into the
+# drift comparison as verb `update` — a diff with no base, an EMPTY payload — and the
+# fail-closed I11 guard then aborts the WHOLE plan, naming the payload and the verb instead
+# of the missing file, taking every unrelated item down with it. This row reproduces that
+# bug exactly; the killing test asserts the true cause is named AND the blast radius is nil.
+check_guard_plan "plan/missing-detect"  "# BL-109-MISSING"            t_missing_tracked_file_restored fresh subline 'if [ ! -f "$proj/$rel" ]; then' 'if false; then'
+
+# THE OFFER (the plan side). Detecting it and then dropping it on the floor would leave the
+# operator with a gate script that is gone and a plan that never mentions it. Neuter the
+# `missing)` arm and the item vanishes from the plan entirely → RED.
+check_guard_plan "plan/missing-offer"   "# BL-109-MISSING"            t_missing_tracked_file_restored lib subline '      missing)' '      missing-NEVER)'
+
+# ABORT HYGIENE (# BL-109-PLAN-NOTRACE). A fail-closed --plan discarded its run folder but
+# left the docs/updates/ parent it had just created, so a plan that REFUSED to write a plan
+# still mutated an otherwise-untouched tree. Gut the container cleanup → the empty
+# containers survive the abort → the whole-tree fingerprint (files AND dirs) differs → RED.
+check_guard_plan "plan/abort-no-trace"  "# BL-109-PLAN-NOTRACE"       t_abort_leaves_no_trace lib fnbody _soif_plan_discard_container 'return 0'
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# (L) BL-113 — THE ANTI-LAUNDERING GUARDS (a different pair of scripts, a different
+#     killing suite; same anti-cheat contract). Walk findings F14 + F15: the 3→4
+#     gate's dirty-tree autorun ran the validation driver with `--offline`, which
+#     rewrote a REAL semgrep FAIL into an attestable SKIP. Two defences, both
+#     marked `# BL-113-NO-LAUNDER`, both pinned here:
+#       driver — a SKIP never overwrites a prior REAL FAIL (carry-forward)
+#       gate   — an offline-autorun SKIP for an INSTALLED tool is refused outright
+#     The killing test is tests/test-bl113-sast-honesty.sh::T-no-launder-dirty-tree
+#     (driven with BL113_ONLY=no-launder). Neutering EITHER marked decision must
+#     turn it RED; restoring must turn it GREEN.
+# ══════════════════════════════════════════════════════════════════════════════════
+use_target "$REPO_ROOT/scripts/run-phase3-validation.sh" \
+           "$MUTANT_TREE/scripts/run-phase3-validation.sh" _run_killing_bl113
+check_guard "bl113/driver-carry-forward" "# BL-113-NO-LAUNDER" no-launder markerline '# BL-113-NO-LAUNDER'
+
+use_target "$REPO_ROOT/scripts/check-phase-gate.sh" \
+           "$MUTANT_TREE/scripts/check-phase-gate.sh" _run_killing_bl113
+check_guard "bl113/gate-refuses-offline-skip" "# BL-113-NO-LAUNDER" no-launder markerline '# BL-113-NO-LAUNDER'
+
+# Restore the BL-099 target for anything appended after this point.
+use_target "$REPO_ROOT/scripts/upgrade-project.sh" \
+           "$MUTANT_TREE/scripts/upgrade-project.sh" _run_killing
+
+echo ""
+echo "── Guard-coverage registry (STATUS  guard  killing-test) ──"
+printf '%b' "$GUARD_ROWS" | sed 's/^/  /'
+echo ""
+echo "== Total: $((PASSED + FAILED + SKIPPED)) | Pinned: $PASSED | Failed: $FAILED | Skipped: $SKIPPED =="
+[ "$FAILED" -eq 0 ] && exit 0 || exit 1

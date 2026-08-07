@@ -11,7 +11,8 @@ set -euo pipefail
 #    or: bash /path/to/solo-orchestrator/scripts/validate.sh (from any project)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/helpers.sh"
+# BL-046: uses print_fail/info/ok/warn only — source core subset.
+source "$SCRIPT_DIR/lib/helpers-core.sh"
 
 print_section() { echo ""; echo -e "${BOLD}── $1 ──${NC}"; }
 
@@ -62,6 +63,11 @@ case "$PLATFORM" in
   web)     [ -f "docs/platform-modules/web.md" ]     && print_ok "Platform Module: Web" || fail "Platform Module: Web missing" ;;
   desktop) [ -f "docs/platform-modules/desktop.md" ] && print_ok "Platform Module: Desktop" || fail "Platform Module: Desktop missing" ;;
   mobile)  [ -f "docs/platform-modules/mobile.md" ]  && print_ok "Platform Module: Mobile" || fail "Platform Module: Mobile missing" ;;
+  # Legacy 'cli' platform fallback (BL-047): 'cli' predates the cli->mcp_server rename
+  # and is still reachable when a project's CLAUDE.md carries `Platform: cli` (hand-edited
+  # or created before the migration). $PLATFORM here is read from the user-editable CLAUDE.md,
+  # not init.sh's validated enum, so this arm is intentional graceful degradation — NOT dead
+  # code. Do not delete without removing `cli` support end-to-end (option list + docs + here).
   cli)     print_info "No platform module for CLI (Builder's Guide works standalone)" ;;
   *)       print_info "Platform: $PLATFORM — no module expected" ;;
 esac
@@ -95,7 +101,7 @@ print_section "CI/CD Pipelines"
 if [ -f ".github/workflows/release.yml" ]; then
   # Check if release pipeline still has uncommented TODO placeholders
   todo_count=$(grep -cE "# TODO|echo.*TODO" .github/workflows/release.yml 2>/dev/null || true)
-  todo_count=${todo_count:-0}
+  case "$todo_count" in ''|*[!0-9]*) todo_count=0 ;; esac
   if [ "$todo_count" -gt 0 ]; then
     print_ok "Release pipeline (${todo_count} TODOs remaining — configure before first release)"
   else
@@ -256,6 +262,7 @@ fi
 
 if [ -f ".claude/process-audit.log" ]; then
   reset_count=$(grep -c "\[RESET\]" .claude/process-audit.log 2>/dev/null || echo "0")
+  case "$reset_count" in ''|*[!0-9]*) reset_count=0 ;; esac
   if [ "$reset_count" -gt 0 ]; then
     warn "process-audit.log contains $reset_count reset event(s) — review for compliance"
   else
@@ -263,46 +270,145 @@ if [ -f ".claude/process-audit.log" ]; then
   fi
 fi
 
+# ── THE ERA ASSERTION — REPORT-ONLY BY CONSTRUCTION ──────────────────────────
+# SPEC: docs/designs/2026-08-02-delta-track-v1.md §10.1 (the invariant
+# `active_delta != null => current_phase == 4` and its SECOND enforcement point),
+# §11-WP3.
+#
+# The load-bearing enforcement of that invariant is a REFUSAL at open, in the
+# post-1.0 track's own front door, and it is not here. This is the other half:
+# §10.1 observes that this script "already reads phase-state.json::current_phase
+# and already warns on a phase/artifact mismatch", and that an open piece of
+# post-release work at phase < 4 "is that same class of inconsistency and belongs
+# in that same report."
+#
+# ── THE `[WARN]` TRAP, AND WHY THIS ARM CALLS `warn` AND NOT `fail` ──────────
+# CLAUDE.md's trap is that in check-phase-gate.sh the `[WARN]`/`[FAIL]` TEXT is
+# cosmetic — the exit predicate is a counter, so a "WARN" arm that increments it
+# BLOCKS, and two arms printing the same word can have opposite outcomes. This
+# script has the same shape: it ends `exit $errors`, `fail` increments `errors`,
+# and `warn` increments `warnings`, which nothing reads. So the choice of helper
+# IS the choice of exit behaviour, and this arm is deliberately REPORT-ONLY:
+#   • validate.sh is a drift report an operator runs voluntarily. Turning a
+#     recoverable state inconsistency into a non-zero exit here would fail
+#     pipelines that run it advisorily, for a condition the operator may be
+#     halfway through resolving.
+#   • The refusal that actually protects the invariant is unconditional and
+#     lives at open. This one only has to be SEEN.
+# tests/test-delta-wp3-era-classify.sh pins it in BOTH directions on the EXIT
+# CODE, never the label: the report fires, and the exit code is identical to the
+# same tree without the inconsistency. Its m5 mutation swaps this one `warn` for
+# `fail` and requires the exit-code-unchanged assertion to go RED.
+#
+# ── WHY THE READ IS A SEAM CALL AND NOT A `jq` ──────────────────────────────
+# This script is CORE. The post-1.0 track is a SEVERABLE MODULE (D1) and
+# scripts/lint-delta-boundary.sh forbids every core file from naming a module
+# path on an executed line (§3.3 clause 2, tier T1 — NOT inline-waivable), with a
+# file-level seam allowlist whose cardinality is asserted at exactly ONE. So the
+# obvious implementation — `jq -r '.active_delta.id' .claude/…` — is unavailable:
+# that JSON file is a T1 path, and naming it in a core file is precisely the
+# fusion the lint exists to stop. The read therefore routes core -> core through
+# the ONE seam, exactly as scripts/upgrade-project.sh's policy notice does; this
+# is the SECOND instance of that waived routing, which is expected and recorded.
+# The residue is the one waived line below: reaching the seam means naming a seam
+# ACTION FLAG, and every seam action carries the `delta-` prefix by design, which
+# is exactly what tier T2 scans for. T2 exists WITH a reason-required inline
+# waiver for this case. Do not rename the action to hide the prefix — that evades
+# the scan below the prefix boundary (§13-R15) and buys nothing.
+#
+# FAIL-SOFT: a framework without the module installed, an older vendored seam
+# that does not know the action, or a project with no record at all are all a
+# silent no-op. A validation report must never fail because an advisory read
+# could not be made.
+_postmvp_era_assertion() {
+  local seam="$SCRIPT_DIR/process-checklist.sh" doc="" open_id=""
+  [ -f "$seam" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  [ "$phase" -lt 4 ] || return 0
+  doc=$( bash "$seam" --delta-state-read </dev/null 2>/dev/null ) || return 0   # lint-delta-boundary: allow core->core delegation to the ONE declared seam — this names the seam's action FLAG, never a module path (T1 is clean) and the seam allowlist stays at cardinality 1 (§3.1/§3.3)
+  [ -n "$doc" ] || return 0
+  open_id=$(printf '%s\n' "$doc" | jq -r '.active_delta.id // ""' 2>/dev/null || echo "")
+  [ -n "$open_id" ] || return 0
+  warn "Post-release work $open_id is recorded as open, but this project is at phase $phase — that work only exists after launch (phase 4). One of the two records is wrong."   # DELTA-ERA-REPORT-ONLY
+  return 0
+}
+_postmvp_era_assertion
+
 # ================================================================
 # 6. Approval Log Completeness
 # ================================================================
 print_section "Approval Log"
 
+# BL-059: `.claude/phase-state.json::gates.<gate>` is the live source of
+# truth for gate-passage timestamps — the approval log is a
+# human-readable mirror. Prior versions only greped APPROVAL_LOG.md,
+# emitting a false-negative WARN when the JSON gate was populated but
+# the log had not been mirrored. Fix: read JSON first, fall back to
+# APPROVAL_LOG.md only if the JSON path is absent or malformed
+# (back-compat), and only warn when NEITHER source has a valid date.
+#
+# get_gate_date_from_phase_state <gate_key>
+# - Prints the YYYY-MM-DD gate date from phase-state.json::gates.<key>.
+# - Prints "" if phase-state.json is missing, the key is absent, the
+#   value is null, or the value is not a valid YYYY-MM-DD date.
+# - Uses the same grep+sed extraction shape as check-phase-gate.sh so
+#   the two validators agree on what counts as a recorded gate.
+get_gate_date_from_phase_state() {
+  local gate_key="$1"
+  local state_file=".claude/phase-state.json"
+  [ -f "$state_file" ] || { echo ""; return; }
+  local value
+  value=$(grep -o "\"$gate_key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$state_file" 2>/dev/null \
+            | sed 's/.*: *"//' | sed 's/"//' || echo "")
+  if [ -n "$value" ] && ! echo "$value" | grep -qE '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'; then
+    echo ""
+    return
+  fi
+  echo "$value"
+}
+
+# check_gate <phase-min> <json-key> <approval-log-header> <label>
+# Precedence: phase-state.json::gates.<json-key> WINS. Falls back to
+# APPROVAL_LOG.md scan for back-compat with older projects that
+# predated the JSON gates block. Warns iff neither source has a valid
+# date AND the project is at or past <phase-min>.
+check_gate() {
+  local phase_min="$1"
+  local json_key="$2"
+  local header="$3"
+  local label="$4"
+
+  [ "$phase" -ge "$phase_min" ] || return 0
+
+  local json_date
+  json_date=$(get_gate_date_from_phase_state "$json_key")
+  if [ -n "$json_date" ]; then
+    print_ok "$label gate: dated entry found ($json_date from phase-state.json)"
+    return 0
+  fi
+
+  if [ -f "APPROVAL_LOG.md" ] && grep -q "$header" APPROVAL_LOG.md; then
+    local log_date
+    log_date=$(grep -A 10 "$header" APPROVAL_LOG.md | grep -i "date" | head -1 || true)
+    if echo "$log_date" | grep -qE "[0-9]{4}-[0-9]{2}-[0-9]{2}"; then
+      print_ok "$label gate: dated entry found (APPROVAL_LOG.md)"
+      return 0
+    fi
+  fi
+
+  warn "$label gate: no date recorded — project appears to be past Phase $((phase_min - 1))"
+}
+
 if [ -f "APPROVAL_LOG.md" ]; then
-  # Check if phase gates have been filled in based on detected phase
-  if [ $phase -ge 1 ]; then
-    if grep -q "Phase 0 → Phase 1" APPROVAL_LOG.md; then
-      # Check if the gate has actual content (not just template)
-      gate_01_date=$(grep -A 10 "Phase 0 → Phase 1" APPROVAL_LOG.md | grep -i "date" | head -1 || true)
-      if echo "$gate_01_date" | grep -qE "[0-9]{4}-[0-9]{2}-[0-9]{2}"; then
-        print_ok "Phase 0→1 gate: dated entry found"
-      else
-        warn "Phase 0→1 gate: no date recorded — project appears to be past Phase 0"
-      fi
-    fi
-  fi
-
-  if [ $phase -ge 2 ]; then
-    if grep -q "Phase 1 → Phase 2" APPROVAL_LOG.md; then
-      gate_12_date=$(grep -A 10 "Phase 1 → Phase 2" APPROVAL_LOG.md | grep -i "date" | head -1 || true)
-      if echo "$gate_12_date" | grep -qE "[0-9]{4}-[0-9]{2}-[0-9]{2}"; then
-        print_ok "Phase 1→2 gate: dated entry found"
-      else
-        warn "Phase 1→2 gate: no date recorded — project appears to be past Phase 1"
-      fi
-    fi
-  fi
-
-  if [ $phase -ge 4 ]; then
-    if grep -q "Phase 3 → Phase 4" APPROVAL_LOG.md; then
-      gate_34_date=$(grep -A 10 "Phase 3 → Phase 4" APPROVAL_LOG.md | grep -i "date" | head -1 || true)
-      if echo "$gate_34_date" | grep -qE "[0-9]{4}-[0-9]{2}-[0-9]{2}"; then
-        print_ok "Phase 3→4 gate: dated entry found"
-      else
-        warn "Phase 3→4 gate: no date recorded — project appears to be past Phase 3"
-      fi
-    fi
-  fi
+  check_gate 1 "phase_0_to_1" "Phase 0 → Phase 1" "Phase 0→1"
+  check_gate 2 "phase_1_to_2" "Phase 1 → Phase 2" "Phase 1→2"
+  # code-test-gate-track-resume-validate-1: the Approval Log section had
+  # Phase 0→1, 1→2, and 3→4 gate checks but was silently missing the
+  # symmetric 2→3 check. A project past Phase 3 without a dated
+  # `Phase 2 → Phase 3` entry slipped past validation. Mirrors the 1→2
+  # block structure for consistency.
+  check_gate 3 "phase_2_to_3" "Phase 2 → Phase 3" "Phase 2→3"
+  check_gate 4 "phase_3_to_4" "Phase 3 → Phase 4" "Phase 3→4"
 else
   fail "APPROVAL_LOG.md missing"
 fi
@@ -341,13 +447,12 @@ print_section "Intake Completeness"
 
 if [ -f "PROJECT_INTAKE.md" ]; then
   # Count blank table cells (likely unfilled fields)
-  blank_cells=$(grep -cE '\| *\|$|\| *$' PROJECT_INTAKE.md 2>/dev/null || true)
-  blank_cells=$(echo "$blank_cells" | tr -d '[:space:]')
-  blank_cells=${blank_cells:-0}
+  # BL-202-INTAKE-PREDICATE (SYNC SIBLINGS: scripts/validate.sh, scripts/session-intake-check.sh, scripts/resume.sh) — count only truly-blank cells: '\| *\|$'. The old '|\| *$' alternative matched EVERY table row (constant 258 on real intakes — review R-BL202-1).
+  blank_cells=$(grep -cE '\| *\|$' PROJECT_INTAKE.md 2>/dev/null || true)
+  case "$blank_cells" in ''|*[!0-9]*) blank_cells=0 ;; esac
   # Count N/A entries (explicitly marked as not applicable — this is fine)
   na_cells=$(grep -ciE '\| *N/?A' PROJECT_INTAKE.md 2>/dev/null || true)
-  na_cells=$(echo "$na_cells" | tr -d '[:space:]')
-  na_cells=${na_cells:-0}
+  case "$na_cells" in ''|*[!0-9]*) na_cells=0 ;; esac
 
   if [ "$blank_cells" -gt 20 ]; then
     warn "PROJECT_INTAKE.md has ~${blank_cells} blank fields — fill these out before starting Phase 0"
@@ -427,7 +532,7 @@ if [ -f "PROJECT_INTAKE.md" ] && [ -f ".github/workflows/ci.yml" ] && [ $phase -
   if [ $matrix_issues -eq 0 ]; then
     # Check if any rows were actually filled in
     has_no=$(grep -i "| *No *|" PROJECT_INTAKE.md | grep -ciE "Security|Accessibility|Performance|Database" || true)
-    has_no=${has_no:-0}
+    case "$has_no" in ''|*[!0-9]*) has_no=0 ;; esac
     if [ "$has_no" -eq 0 ]; then
       print_info "No domains marked 'No' in Competency Matrix (or matrix not yet filled out)"
     fi

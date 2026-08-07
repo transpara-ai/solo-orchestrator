@@ -2,6 +2,12 @@
 
 Reference for generating usable UAT test scenarios in solo-orchestrator projects. Complements the embedded comments in `templates/uat/test-session-template.html` — read both together when filling out a UAT session.
 
+## 0. Before you fill anything in: the placeholder manifest
+
+The template's **first HTML comment** is an `AGENT: PLACEHOLDER MANIFEST` block listing **all seven** `__TOKEN__` placeholders and where each one lives. Work that list — it is the only complete enumeration.
+
+Six of the seven are announced by a block comment sitting next to the markup they fill. The seventh, `__FEATURE_OPTIONS__`, is **mid-file inside the `addBug()` JavaScript function** (it supplies the `<option>` list for the bug form's Feature select), and it is the one authors miss (walk 2026-08-02 ISSUE-008). `scripts/lint-uat-scenarios.sh` does catch a survivor — but it reports a line number in **your populated output file**, and the edit belongs at a different place in the **template**, so the linter's line number does not lead you to the fix. Use the manifest to prevent the miss; use the linter to confirm you did.
+
 ## 1. Why UAT quality matters
 
 UAT scenarios that are schema-valid but operationally broken waste real human time. On the lancache project's first UAT session (2026-04-22), an AI agent generated scenarios that passed the template schema but failed as tester instructions: no system context, implicit working directory, cross-scenario dependencies, vague pass/fail criteria, non-deterministic expected output, informal cleanup, unmarked optional dependencies. The Orchestrator's feedback: *"The tests are not stating what system this is done on, it doesn't walk through the tests step by step and makes assumption the tester knows where everything is."* The rewrite recovered usability but cost substantial Orchestrator time. This guide codifies the rewrite recipe so every future project inherits the floor.
@@ -32,7 +38,7 @@ Common pre-flight content for web:
 - **Optional tools:** devtools for scenarios that use Network/Console.
 - **One-time setup:** open URL → sign in → confirm no console errors.
 
-Reference file: `templates/uat/references/web-pre-flight.html`.
+Reference file (framework source): `templates/uat/references/web-pre-flight.html`; in a generated project: `tests/uat/examples/pre-flight-reference.html` (copied by init.sh:1187-1207 when the project's platform is `web`).
 
 ### 3.2 desktop
 
@@ -45,7 +51,7 @@ Common pre-flight content for desktop:
 - **Required tools:** `git`, `jq`, `python`/`node`/`cargo`/`go` per stack.
 - **One-time setup:** three lines max — `cd`, activate, version check.
 
-Reference file: `templates/uat/references/desktop-pre-flight.html`.
+Reference file (framework source): `templates/uat/references/desktop-pre-flight.html`; in a generated project: `tests/uat/examples/pre-flight-reference.html` (copied by init.sh:1187-1207 when the project's platform is `desktop`).
 
 ### 3.3 mobile
 
@@ -58,7 +64,7 @@ Common pre-flight content for mobile:
 - **Optional tools:** screen recording for scenarios that benefit from tap-sequence capture.
 - **One-time setup:** install, launch, onboard, sign in, confirm home.
 
-Reference file: `templates/uat/references/mobile-pre-flight.html`.
+Reference file (framework source): `templates/uat/references/mobile-pre-flight.html`; in a generated project: `tests/uat/examples/pre-flight-reference.html` (copied by init.sh:1187-1207 when the project's platform is `mobile`).
 
 ### 3.4 mcp_server
 
@@ -71,7 +77,7 @@ Common pre-flight content for mcp_server:
 - **Auth:** env var exports (e.g., `MCP_API_KEY`).
 - **One-time setup:** export env → start Inspector against server → confirm connection.
 
-Reference file: `templates/uat/references/mcp_server-pre-flight.html`.
+Reference file (framework source): `templates/uat/references/mcp_server-pre-flight.html`; in a generated project: `tests/uat/examples/pre-flight-reference.html` (copied by init.sh:1187-1207 when the project's platform is `mcp_server`).
 
 ## 4. Per-platform scenario patterns
 
@@ -84,7 +90,7 @@ Example anchor styles:
 - "The /items list shows the new record at the top with category 'general'."
 - "After deletion, GET /api/items/<id> would return 404."
 
-Reference file: `templates/uat/references/web-scenario.json`.
+Reference file (framework source): `templates/uat/references/web-scenario.json`; in a generated project: `tests/uat/examples/scenario-reference.json` (copied by init.sh:1187-1207 when the project's platform is `web`).
 
 ### 4.2 desktop
 
@@ -95,7 +101,7 @@ Example anchor styles:
 - "`git diff --exit-code` returns 0 and prints 'RESTORED'."
 - "Output contains `total=42` on a single line."
 
-Reference file: `templates/uat/references/desktop-scenario.json`.
+Reference file (framework source): `templates/uat/references/desktop-scenario.json`; in a generated project: `tests/uat/examples/scenario-reference.json` (copied by init.sh:1187-1207 when the project's platform is `desktop`).
 
 ### 4.3 mobile
 
@@ -106,7 +112,7 @@ Example anchor styles:
 - "Sync indicator appears for ≥1 second, then disappears; post appears in the list."
 - "No crash dialog. App does not return to the home screen."
 
-Reference file: `templates/uat/references/mobile-scenario.json`.
+Reference file (framework source): `templates/uat/references/mobile-scenario.json`; in a generated project: `tests/uat/examples/scenario-reference.json` (copied by init.sh:1187-1207 when the project's platform is `mobile`).
 
 ### 4.4 mcp_server
 
@@ -117,7 +123,7 @@ Example anchor styles:
 - "`response.result.total` is the integer 25."
 - "Response does not contain an `error` field at the top level."
 
-Reference file: `templates/uat/references/mcp_server-scenario.json`.
+Reference file (framework source): `templates/uat/references/mcp_server-scenario.json`; in a generated project: `tests/uat/examples/scenario-reference.json` (copied by init.sh:1187-1207 when the project's platform is `mcp_server`).
 
 ## 5. Co-build protocol for 'other' platform
 

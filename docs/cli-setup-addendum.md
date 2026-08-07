@@ -47,25 +47,28 @@ If you want to configure all optional enhancements at once, run these commands f
 claude mcp add context7 --scope user -- npx -y @upstash/context7-mcp
 ```
 
-**2. Superpowers plugin (one command, no prerequisites):**
-```bash
-claude plugins add superpowers
+**2. Superpowers plugin (one command, no prerequisites — this is a slash command run inside Claude Code, not a shell command):**
+```
+/plugin install superpowers@claude-plugins-official
 ```
 
 **3. Qdrant MCP (requires Docker):**
 ```bash
 # Start Qdrant (runs in background)
 docker run -d --name qdrant -p 6333:6333 -p 6334:6334 \
-  -v qdrant_storage:/qdrant/storage qdrant/qdrant
+  -v qdrant_storage:/qdrant/storage \
+  --restart unless-stopped \
+  qdrant/qdrant:latest
 
 # Add the MCP server
-claude mcp add qdrant --scope user -- npx -y @qdrant/mcp-server-qdrant \
-  --qdrant-url http://localhost:6333 \
-  --collection-name solo-orchestrator
+claude mcp add -s user \
+  -e QDRANT_URL=http://localhost:6333 \
+  -e COLLECTION_NAME=claude-memory \
+  qdrant -- uvx --python 3.13 mcp-server-qdrant
 ```
 
 **4. Replace CLAUDE.md with the enhanced template:**
-After configuring any of the above, replace your project's `CLAUDE.md` with the enhanced template from [Section 6](#6-claudemd) below and fill in the project-specific sections.
+After configuring any of the above, replace your project's `CLAUDE.md` with the enhanced template from [Section 6](#6-claudemd-project-level-agent-instructions) below and fill in the project-specific sections.
 
 For detailed explanations of each tool and how it integrates with the Builder's Guide, see the individual sections below.
 
@@ -208,9 +211,20 @@ Place this in `.claude/settings.json` (project-level, shared with team) or `.cla
 The Development Guardrails for Claude Code (github.com/kraulerson/claude-dev-framework) is a hook-based system that provides automated workflow guardrails for coding standards, security scanning, and documentation requirements through Git hooks. It uses a layered defense model within its hook system — multiple hook-based checks (pre-commit, pre-push, post-merge) cover different failure modes, so no single check needs to catch everything. The combination of checks across Git hook stages provides broader coverage than any individual hook.
 
 The framework uses:
-- **Profiles** — Configuration sets that define rules for different project types (`mobile-app.yml`, `web-api.yml`, `cli-tool.yml`), inheriting from a `_base.yml` with shared standards.
+- **Profiles** — Configuration sets that define rules for different project types (`_base.yml`, `desktop-app.yml`, `mobile-app.yml`, `web-api.yml`, `web-app.yml`), inheriting from `_base.yml` with shared standards.
 - **Hooks** — Git-triggered actions (pre-commit, pre-push, post-merge) that run automated checks before code reaches the repository.
 - **Rules** — Specific enforcement policies (e.g., "no direct schema modifications without migration files," "no dependencies without license check," "no commit without test coverage").
+
+### How CDF and Solo Orchestrator Layer
+
+CDF and Solo Orchestrator are deliberately split across two layers; both are installed by `init.sh`, but they enforce different things and a Solo project's working set of guardrails is the sum of both:
+
+| Layer | What it owns | Where it runs | Where the rules live |
+| - | - | - | - |
+| **CDF** | Coding-standards enforcement: secret detection (gitleaks), SAST quick scan (Semgrep), license check, lockfile pinning, test-co-location heuristic, schema-migration check. | `.git/hooks/` (pre-commit, pre-push, post-merge) and `.claude/settings.json` (PreToolUse hooks the agent triggers). Profile-driven (`desktop-app.yml`, `mobile-app.yml`, `web-api.yml`, `web-app.yml`). | `~/.claude-dev-framework/` (global, shared install). |
+| **Solo Orchestrator** | Process enforcement: Build Loop step ordering, Phase 2/3/4 checklists, phase-gate consistency. Plus the enforcement-level layer added in BL-030: a project-wide `enforcement_level` (`strict` / `light` / `no`) that gates **user-terminal** commits via `.git/hooks/framework-gate.sh` and writes every framework-bypass event to `.claude/bypass-audit.json`. | `scripts/pre-commit-gate.sh` (PreToolUse on Claude-issued `git commit` / `gh pr create`), `scripts/framework-gate.sh` (the strict-mode user-terminal gate), `scripts/detect-out-of-band-commits.sh` (SessionStart — catches `--no-verify` post-hoc), `scripts/hooks/bypass-detector.sh` (PostToolUse + Stop). | In-project (`scripts/`, `.claude/`). |
+
+CDF answers "does this code meet the project's standards?" Solo answers "did this commit follow the process, and if it bypassed enforcement, is that recorded?" The two compose: a Solo-strict project on the `web-api` CDF profile gets gitleaks + Semgrep + license-check from CDF plus the Build Loop / Phase gate + bypass-audit from Solo, both at commit time. See `docs/user-guide.md` ("What Is Enforced vs. What Is Guided") for the canonical operator-facing level matrix and `docs/builders-guide.md` ("Enforcement Model") for how Claude-issued vs user-terminal commits are gated.
 
 ### How It Applies to the Builder's Guide
 
@@ -219,7 +233,7 @@ The Builder's Guide defines quality controls at each phase. The Development Guar
 | Builder's Guide Requirement | Development Guardrails Enforcement |
 |---|---|
 | TDD — tests before implementation (Phase 2, Step 2.2) | Pre-commit hook validates test file exists for changed source files |
-| Secret detection (Phase 2, Step 2.4) | Pre-commit hook runs gitleaks on staged files; CI pipeline runs gitleaks-action as backstop |
+| Secret detection (Phase 2, Step 2.4) | Pre-commit hook runs gitleaks on staged files; CI pipeline runs the gitleaks CLI as backstop |
 | SAST quick scan (Phase 2, Step 2.4) | Pre-commit hook runs Semgrep on staged files; CI pipeline runs full Semgrep scan |
 | License compliance (Phase 2, CI/CD) | Pre-push hook runs license-checker |
 | Documentation updates (Phase 2, Step 2.5) | Hook validates CHANGELOG.md updated when source files change |
@@ -230,36 +244,31 @@ The framework catches violations the agent might introduce — particularly duri
 
 ### Setup
 
-**1. Clone the framework template into your project:**
+**`init.sh` installs CDF automatically.** Running `bash init.sh` from a new project directory clones CDF to `~/.claude-dev-framework` (a global, shared install — not per-project) and then runs CDF's own initializer from your project root. Per-project profile selection happens inside that CDF init flow.
+
+**Solo enforcement level is selected at the same time.** `init.sh` accepts `--enforcement-level <no|light|strict>` (default `strict`; `--confirm-pitfalls` is required to go below strict). The chosen level determines whether `.git/hooks/framework-gate.sh` is installed: strict installs it (a user-terminal commit the gate BLOCKS lands a `terminal_commit_blocked` row in `.claude/bypass-audit.json`, while a clean pass writes **no** ledger row — only a non-tracked `.claude/last-gate-pass.txt` receipt, so the tracked ledger records real events only (BL-161); `terminal_commit_passed` remains a recognized legacy type historical ledgers may still contain); light and no skip the install. The SessionStart out-of-band detector runs on strict AND light (any `--no-verify` commit is captured post-hoc); on `no`, it is a no-op. To change the level on an existing project, use `scripts/reconfigure-project.sh --enforcement-level <new-level> [--confirm-pitfalls]`. For pre-BL-030 projects, `scripts/upgrade-project.sh --backfill-only` migrates the manifest in place (defaults to strict, forced strict for organizational Sponsored POC / Production).
+
+**Manual fallback** (only needed if you skipped Solo's `init.sh` and want CDF in isolation):
+
 ```bash
-# From your project root
-mkdir -p .claude/framework
-git clone https://github.com/kraulerson/claude-dev-framework.git /tmp/cdf
-cp -r /tmp/cdf/templates/* .claude/framework/
-rm -rf /tmp/cdf
+# Clone CDF globally (matches the layout init.sh expects)
+git clone https://github.com/kraulerson/claude-dev-framework.git ~/.claude-dev-framework
+
+# Run CDF init from your project root
+cd /path/to/your/project
+bash ~/.claude-dev-framework/scripts/init.sh
 ```
 
-**2. Select and configure the appropriate profile:**
-```bash
-# Copy the base profile and the project-type profile
-cp .claude/framework/profiles/_base.yml .claude/framework/active-profile.yml
-# Append the project-type specific rules:
-# For web applications: cat .claude/framework/profiles/web-api.yml >> .claude/framework/active-profile.yml
-# For mobile apps: cat .claude/framework/profiles/mobile-app.yml >> .claude/framework/active-profile.yml
-# For CLI tools: cat .claude/framework/profiles/cli-tool.yml >> .claude/framework/active-profile.yml
-```
+CDF's init prompts for the project profile (web-api, web-app, mobile-app, desktop-app) and wires the appropriate hooks into your project's `.claude/settings.json` and `.git/hooks/`. It does NOT clone its templates into `.claude/framework/` — that earlier per-project clone pattern is obsolete.
 
-**3. Install the Git hooks:**
-Follow the framework's installation instructions in its README. The hooks integrate with the husky (Node.js) or pre-commit (Python) hook managers that the Builder's Guide already requires in Phase 2 Project Initialization.
-
-**4. Verify:**
+**Verify the integration:**
 ```bash
 # Stage a test file and commit — the hooks should fire
 git add .
 git commit -m "test: verify framework hooks"
 ```
 
-**Note:** If the project type doesn't match an existing profile (e.g., a full-stack web application with significant frontend), the framework may need a `web-app.yml` profile. See the framework's documentation for profile creation guidance.
+**Note:** If the project type doesn't match an existing profile, the framework may need a new profile only for genuinely outside types (libraries, CLI tools — CDF retired its earlier `cli-tool.yml` profile). See the framework's documentation for profile creation guidance.
 
 ---
 
@@ -322,16 +331,18 @@ This solves a specific Solo Orchestrator problem: the Builder's Guide acknowledg
 ```bash
 docker run -d \
   --name qdrant \
-  -p 6333:6333 \
-  -v qdrant_data:/qdrant/storage \
+  -p 6333:6333 -p 6334:6334 \
+  -v qdrant_storage:/qdrant/storage \
+  --restart unless-stopped \
   qdrant/qdrant:latest
 ```
 
 **2. Add the Qdrant MCP server to Claude Code (user-scoped):**
 ```bash
-claude mcp add qdrant --scope user -- uvx mcp-server-qdrant \
-  --qdrant-url http://localhost:6333 \
-  --collection-name solo-orchestrator
+claude mcp add -s user \
+  -e QDRANT_URL=http://localhost:6333 \
+  -e COLLECTION_NAME=claude-memory \
+  qdrant -- uvx --python 3.13 mcp-server-qdrant
 ```
 
 If `uvx` is not installed:
@@ -504,7 +515,10 @@ bypass hooks. If a hook blocks a commit:
 1. Read the hook's error message
 2. Fix the violation
 3. Re-attempt the commit
-Never use --no-verify to skip hooks.
+Never use --no-verify to skip hooks. On strict-mode projects
+the SessionStart out-of-band detector records every --no-verify
+commit to .claude/bypass-audit.json regardless of the hook
+being bypassed — the block is bypassable, the audit is not.
 
 ## Architecture Constraints
 [PHASE 1+ — Add after architecture selection]
@@ -529,7 +543,10 @@ Never use --no-verify to skip hooks.
 - Do not add features not in the MVP Cutline
 - Do not modify the database schema directly — use migration tool
 - Do not add dependencies without justification
-- Do not use `--no-verify` to bypass Git hooks
+- Do not use `--no-verify` to bypass Git hooks. On strict-mode projects
+  the SessionStart out-of-band detector records every such commit to
+  `.claude/bypass-audit.json` — the audit lands even when the hook is
+  skipped. See `docs/audit-log-lifecycle.md`.
 - Do not delete tests to make them pass
 - Do not include production data, real PII, or credentials in
   prompts, comments, or test fixtures
@@ -578,8 +595,8 @@ Run this once per development machine:
 - [ ] Superpowers plugin installed (`/plugin install superpowers@claude-plugins-official`)
 - [ ] Auto Mode configured (or granular permissions in settings.json if Auto Mode unavailable)
 - [ ] Context7 MCP added (`claude mcp add context7 --scope user -- npx -y @upstash/context7-mcp`)
-- [ ] Qdrant running in Docker (`docker run -d --name qdrant -p 6333:6333 -v qdrant_data:/qdrant/storage qdrant/qdrant:latest`)
-- [ ] Qdrant MCP added (`claude mcp add qdrant --scope user -- uvx mcp-server-qdrant --qdrant-url http://localhost:6333 --collection-name solo-orchestrator`)
+- [ ] Qdrant running in Docker (`docker run -d --name qdrant -p 6333:6333 -p 6334:6334 -v qdrant_storage:/qdrant/storage --restart unless-stopped qdrant/qdrant:latest`)
+- [ ] Qdrant MCP added (`claude mcp add -s user -e QDRANT_URL=http://localhost:6333 -e COLLECTION_NAME=claude-memory qdrant -- uvx --python 3.13 mcp-server-qdrant`)
 - [ ] Development Guardrails for Claude Code cloned and available for project setup
 - [ ] Verify all MCP servers connected (`claude /mcp`)
 - [ ] Verify Superpowers active (start a session, ask to plan a feature — brainstorming skill should trigger)
@@ -593,14 +610,6 @@ Run this once per project (during Phase 2 Project Initialization):
 - [ ] Add `@` includes to CLAUDE.md for project documents as they're created
 - [ ] Verify hooks fire on test commit
 - [ ] Verify Superpowers skills trigger during first feature build
-
----
-
-## Document Revision History
-
-| Version | Date | Changes |
-|---|---|---|
-| 1.0 | 2026-04-02 | Initial release. |
 
 ---
 
@@ -643,21 +652,52 @@ glab auth login
 glab auth login --hostname gitlab.your-company.com
 ```
 
-### Bitbucket (curl + App Password)
+### Bitbucket (curl + API Token)
 
-No first-party CLI. Uses `curl` plus a Bitbucket App Password.
+No first-party CLI. Uses `curl` plus an Atlassian API Token.
+
+> **Why API Token, not App Password?** Atlassian is sunsetting Bitbucket
+> Cloud App Passwords in 2026 (see
+> <https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/>).
+> API tokens are the forward-compatible replacement. Both are sent as
+> HTTP Basic authentication — for API tokens, the username is your
+> Atlassian account **email** (NOT your Bitbucket username), and the
+> password is the token itself. Bearer auth does NOT work; it is
+> reserved for OAuth 2.0 access tokens (PR #90 verifier fix).
+
+1. Create an API token at <https://id.atlassian.com/manage-profile/security/api-tokens>
+   - Scope it to Bitbucket; pick an expiry up to 1 year.
+2. Export credentials (all three are required — audit code-host-bitbucket-1):
+   ```bash
+   export BITBUCKET_API_TOKEN_EMAIL="you@example.com"    # Atlassian account email
+   export BITBUCKET_API_TOKEN="your-api-token"
+   export BITBUCKET_WORKSPACE="your-workspace-slug"
+   ```
+   `BITBUCKET_WORKSPACE` is the slug in your `bitbucket.org/<workspace>/` URL;
+   for org accounts it is the team slug, which differs from any single user.
+3. Add to your shell rc (`.bashrc` / `.zshrc`) for persistence. Ensure mode 600 if any secrets live in it.
+
+**Legacy — App Password (sunset 2026):** still works today, will break
+on Atlassian's enforcement date. Prefer the API token path above.
 
 1. Generate an App Password at <https://bitbucket.org/account/settings/app-passwords/>
    - Required scopes: `repository:admin`, `project:admin`, `pullrequest:write`
-2. Export credentials:
+2. Export the three legacy vars:
    ```bash
    export BITBUCKET_USER="your-bitbucket-username"
    export BITBUCKET_APP_PASSWORD="your-app-password"
-   # For org workspaces, also:
-   export BITBUCKET_WORKSPACE="org-name"
+   export BITBUCKET_WORKSPACE="your-workspace-slug"
    ```
-3. Add to your shell rc (`.bashrc` / `.zshrc`) for persistence. Ensure mode 600 if any secrets live in it.
+   On personal accounts `BITBUCKET_USER` often (but not always) equals the workspace slug.
 
 ### Other hosts (Gitea, Codeberg, self-hosted)
 
 No CLI required. During intake, choose `other`; provide the HTTPS clone URL when prompted by `init.sh` and attest that branch protection is configured per the required bar. No CI template is laid down for `other` — supply your own.
+
+---
+
+## Document Revision History
+
+| Version | Date | Changes |
+|---|---|---|
+| 1.0 | 2026-04-02 | Initial release. |

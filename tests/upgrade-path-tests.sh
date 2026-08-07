@@ -418,14 +418,20 @@ else
 fi
 
 # 4b: Verify organizational approval log has governance fields that personal lacks
-# We simulate what init.sh generates by checking the template content
+# The approval-log bodies were refactored out of init.sh heredocs into
+# templates/generated/approval-log-{org,personal}.tmpl —
+# generate_approval_log() (init.sh:2622) now renders those templates.
+# Grep the template files, not init.sh (was stale fixture drift: the
+# markers moved when the templates were extracted).
 ORG_APPROVAL_MARKERS=("IT Security" "Legal" "Executive Sponsor" "ITSM" "Backup maintainer")
 PERSONAL_SKIP_MARKER="N/A — personal project"
+ORG_APPROVAL_TMPL="$SCRIPT_DIR/templates/generated/approval-log-org.tmpl"
+PERSONAL_APPROVAL_TMPL="$SCRIPT_DIR/templates/generated/approval-log-personal.tmpl"
 
 org_markers_found=0
 for marker in "${ORG_APPROVAL_MARKERS[@]}"; do
-  if grep -q "$marker" "$INIT_FILE" 2>/dev/null; then
-    ((org_markers_found++))
+  if grep -q "$marker" "$ORG_APPROVAL_TMPL" 2>/dev/null; then
+    org_markers_found=$((org_markers_found + 1))
   fi
 done
 
@@ -435,7 +441,7 @@ else
   fail "Organizational approval log missing governance roles ($org_markers_found/5 found)"
 fi
 
-if grep -q "$PERSONAL_SKIP_MARKER" "$INIT_FILE" 2>/dev/null; then
+if grep -q "$PERSONAL_SKIP_MARKER" "$PERSONAL_APPROVAL_TMPL" 2>/dev/null; then
   pass "Personal approval log marks pre-conditions as N/A"
 else
   fail "Personal approval log missing N/A markers for pre-conditions"
@@ -450,8 +456,10 @@ else
 fi
 
 # 4d: Verify organizational deployment requires more governance sections
-# Count governance-related sections in init.sh organizational vs personal templates
-org_gate_count=$(grep -c "Phase Gate\|Approver\|Role.*|.*IT Security\|Evidence required" "$INIT_FILE" 2>/dev/null || echo "0")
+# Count governance-related markers in the extracted org approval template
+# (was init.sh before the approval-log heredocs were templated — see 4b note).
+org_gate_count=$(grep -c "Phase Gate\|Approver\|Role.*|.*IT Security\|Evidence required" "$ORG_APPROVAL_TMPL" 2>/dev/null || echo "0")
+case "$org_gate_count" in ''|*[!0-9]*) org_gate_count=0 ;; esac
 if [ "$org_gate_count" -gt 5 ]; then
   pass "Organizational template has extensive governance ($org_gate_count gate-related markers)"
 else
@@ -536,7 +544,17 @@ for entry in "${TRACK_UPGRADES[@]}"; do
   fi
 done
 
-# Test track downgrades (should be blocked)
+# Test track downgrades — resolver superset property check.
+#
+# tests-upgrade-paths-6: this block asserts the RESOLVER's behavior
+# (lower track tools are a subset of higher track tools so a downgrade
+# would lose tools). It does NOT assert scripts/upgrade-project.sh
+# actually refuses the downgrade — that direct refusal assertion lives
+# in the "Direct upgrade-project.sh downgrade-refusal" block below.
+# Keeping both gives us defense in depth: the resolver property test
+# catches matrix-data regressions, the script test catches upgrade-
+# script logic regressions (e.g., the track_rank check on
+# scripts/upgrade-project.sh:739-744 silently going away).
 declare -a TRACK_DOWNGRADES=(
   "full:standard:BLOCKED"
   "standard:light:BLOCKED"
@@ -565,12 +583,89 @@ for entry in "${TRACK_DOWNGRADES[@]}"; do
     done <<< "$from_names"
 
     if [ -n "$lost_tools" ]; then
-      pass "Track downgrade $from_track -> $to_track: correctly $expected (would lose: ${lost_tools%, })"
+      pass "Resolver superset: track downgrade $from_track -> $to_track would lose tools (${lost_tools%, })"
     else
       # Even if no tool loss, the downgrade should still be blocked conceptually
-      warn "Track downgrade $from_track -> $to_track: no tool loss detected but should still be blocked"
+      warn "Resolver superset: track downgrade $from_track -> $to_track: no tool loss detected but should still be blocked"
     fi
   fi
+done
+
+# ── Direct upgrade-project.sh downgrade-refusal ─────────────────────
+#
+# tests-upgrade-paths-6: the resolver-superset loop above only proves
+# the matrix data SHOULD make the downgrade lose tools. It does not
+# exercise scripts/upgrade-project.sh's track_rank refusal at
+# scripts/upgrade-project.sh:739-744 ("Cannot downgrade track from
+# $CURRENT_TRACK to $TARGET_TRACK"). A regression that loosens that
+# branch (e.g., flipping `<` to `<=`, removing the early `exit 1`)
+# would silently allow `--track light` on a `full` project. We stage
+# a tiny fixture for each downgrade pair and assert (1) non-zero exit
+# and (2) the canonical "Cannot downgrade track" message in stderr.
+echo ""
+echo -e "${CYAN}--- Direct upgrade-project.sh downgrade-refusal ---${NC}"
+
+UPGRADE_SCRIPT="$SCRIPT_DIR/scripts/upgrade-project.sh"
+
+# Pairs to exercise: (current_track, target_track). The current track
+# is written into both phase-state.json and tool-preferences.json so
+# the script picks it up via its preferred source (tool-preferences
+# first, phase-state fallback — see scripts/upgrade-project.sh:528-570).
+declare -a DIRECT_DOWNGRADES=(
+  "full:standard"
+  "standard:light"
+  "full:light"
+)
+
+# Loop vars are prefixed `_dr_` to avoid silent inheritance from any
+# earlier TEST 1-5 block that uses unscoped `pre_head`, `out`, `rc`, or
+# `fixture` — defensive isolation since this file runs in
+# `set -euo pipefail` shared with the rest of upgrade-path-tests.sh.
+for _dr_pair in "${DIRECT_DOWNGRADES[@]}"; do
+  IFS=':' read -r _dr_current_track _dr_target_track <<< "$_dr_pair"
+  _dr_fixture=$(mktemp -d)
+  (
+    cd "$_dr_fixture"
+    git init -q
+    git config user.email t@t.local
+    git config user.name "Test User"
+    git remote add origin https://example.com/fake.git
+    mkdir -p .claude
+    # Personal/light-style manifest; the script does not require
+    # organizational for a pure --track downgrade refusal — it short-
+    # circuits at the track_rank check before any deployment logic.
+    cat > .claude/manifest.json <<JSON
+{"frameworkVersion":"test","mode":"personal","host":"github","deployment":"personal","poc_mode":null,"enforcement_level":"strict"}
+JSON
+    cat > .claude/phase-state.json <<JSON
+{"track":"$_dr_current_track","deployment":"personal","poc_mode":null,"current_phase":1,"phases":{}}
+JSON
+    cat > .claude/tool-preferences.json <<JSON
+{"context":{"track":"$_dr_current_track","platform":"web","os":"darwin"},"preferences":{}}
+JSON
+    cat > .claude/intake-progress.json <<JSON
+{"track":"$_dr_current_track","deployment":"personal"}
+JSON
+    git add -A && git commit -q -m "init"
+  ) >/dev/null 2>&1
+
+  _dr_pre_head=$(cd "$_dr_fixture" && git rev-parse HEAD)
+  _dr_out=""
+  _dr_rc=0
+  _dr_out=$(cd "$_dr_fixture" && bash "$UPGRADE_SCRIPT" --track "$_dr_target_track" --non-interactive </dev/null 2>&1) || _dr_rc=$?
+  _dr_post_head=$(cd "$_dr_fixture" && git rev-parse HEAD)
+
+  if [ "$_dr_rc" = "0" ]; then
+    fail "Direct refusal: --track $_dr_target_track on $_dr_current_track project did NOT exit non-zero (rc=$_dr_rc)"
+  elif ! echo "$_dr_out" | grep -qF "Cannot downgrade track"; then
+    fail "Direct refusal: $_dr_current_track -> $_dr_target_track refused but stderr lacks 'Cannot downgrade track' (out tail: $(echo "$_dr_out" | tail -3 | tr '\n' ' '))"
+  elif [ "$_dr_pre_head" != "$_dr_post_head" ]; then
+    fail "Direct refusal: $_dr_current_track -> $_dr_target_track refused but git HEAD advanced ($_dr_pre_head -> $_dr_post_head)"
+  else
+    pass "Direct refusal: scripts/upgrade-project.sh --track $_dr_target_track refuses ${_dr_current_track} project (rc!=0, message + git HEAD intact)"
+  fi
+
+  rm -rf "$_dr_fixture"
 done
 
 # Test deployment type transitions
@@ -593,8 +688,9 @@ else
   fail "Deployment ordering wrong: personal should be lower than organizational"
 fi
 
-# Verify structural difference: organizational has governance artifacts personal lacks
-if grep -q "Pre-Condition.*Approver.*Role.*Date.*Method" "$INIT_FILE" 2>/dev/null; then
+# Verify structural difference: organizational has governance artifacts personal lacks.
+# Table header lives in the extracted org template (see 4b note above), not init.sh.
+if grep -q "Pre-Condition.*Approver.*Role.*Date.*Method" "$ORG_APPROVAL_TMPL" 2>/dev/null; then
   pass "Organizational template has structured approval table (would be lost on downgrade)"
 else
   warn "Could not verify organizational approval table structure"
@@ -625,9 +721,9 @@ names_light=$(get_all_tool_names "$output_light_all")
 names_standard=$(get_all_tool_names "$output_standard_all")
 names_full=$(get_all_tool_names "$output_full_all")
 
-count_light=$(echo "$names_light" | grep -c . || true)
-count_standard=$(echo "$names_standard" | grep -c . || true)
-count_full=$(echo "$names_full" | grep -c . || true)
+count_light=$(echo "$names_light" | grep -c . || true) # lint-counter-antipattern: allow value is echoed for human inspection in the upgrade-path diagnostic output only, never used in arithmetic or test gating
+count_standard=$(echo "$names_standard" | grep -c . || true) # lint-counter-antipattern: allow value is echoed for human inspection in the upgrade-path diagnostic output only, never used in arithmetic or test gating
+count_full=$(echo "$names_full" | grep -c . || true) # lint-counter-antipattern: allow value is echoed for human inspection in the upgrade-path diagnostic output only, never used in arithmetic or test gating
 
 echo "  web/typescript tool counts: light=$count_light, standard=$count_standard, full=$count_full"
 echo ""
@@ -690,7 +786,7 @@ new_in_standard=0
 while IFS= read -r tool; do
   [ -z "$tool" ] && continue
   if ! echo "$names_light" | grep -qxF "$tool"; then
-    ((new_in_standard++))
+    new_in_standard=$((new_in_standard + 1))   # not ((x++)): returns 1 when x=0, tripping set -e on bash 5
   fi
 done <<< "$names_standard"
 
@@ -705,7 +801,7 @@ new_in_full=0
 while IFS= read -r tool; do
   [ -z "$tool" ] && continue
   if ! echo "$names_standard" | grep -qxF "$tool"; then
-    ((new_in_full++))
+    new_in_full=$((new_in_full + 1))   # not ((x++)): returns 1 when x=0, tripping set -e on bash 5
   fi
 done <<< "$names_full"
 

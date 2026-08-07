@@ -37,18 +37,240 @@ ARG_GIT_HOST=""
 ARG_VISIBILITY=""
 ARG_REMOTE_URL=""
 ARG_BRANCH_PROTECTION_ATTESTED=false
+# BL-032: proactive attestation for gitlab.com Free org-mode approvals
+# API (Premium-only). When set, init.sh exports SOLO_APPROVALS_ATTESTED=1
+# to host_configure_protection, which skips the approvals PUT and emits
+# a WARN with the operator-actionable manual-setup hint. Post-success
+# init.sh records the corresponding attestation in process-state.json
+# with reason `gitlab_free_tier_approvals` (honored by check-gate.sh +
+# check-phase-gate.sh, mirroring the `github_free_tier` reactive path).
+ARG_APPROVALS_ATTESTED=false
 ARG_ALLOW_EXISTING_DIR=false
 ARG_NO_REMOTE_CREATION=false
+# BL-084: tier-aware escape hatches for a FAILED initial push on the
+# bring-your-own-host (--git-host other) path. These are honored ONLY for
+# track=light (Personal / POC-Personal). For track=standard|full
+# (POC-Sponsored / Production) a failed push is a NON-bypassable hard
+# failure and these flags have no effect. Absent a flag, a light-tier push
+# failure is still a real failure (default = no silent success).
+#   --accept-local-only-risk : operator accepts keeping the project LOCAL
+#                              (no remote) and the attendant data-loss risk.
+#   --defer-remote-push      : operator will push manually later; the
+#                              Phase 1→2 gate WILL block until the push is
+#                              verified against the remote.
+ARG_ACCEPT_LOCAL_ONLY_RISK=false
+ARG_DEFER_REMOTE_PUSH=false
+# BL-030: enforcement-level flags (non-interactive). Default empty so
+# resolution defers to the choosability check after deployment+poc_mode.
+ARG_ENFORCEMENT_LEVEL=""
+ARG_CONFIRM_PITFALLS=false
 # Resolved variables produced by either input path (consumed by downstream functions)
 GOV_MODE=""
 GIT_HOST=""
 VISIBILITY=""
 REMOTE_URL=""
 BRANCH_PROTECTION_ATTESTED=false
+APPROVALS_ATTESTED=false
 ALLOW_EXISTING_DIR=false
 NO_REMOTE_CREATION=false
+# BL-084: resolved forms of the tier-aware push-failure escape hatches.
+ACCEPT_LOCAL_ONLY_RISK=false
+DEFER_REMOTE_PUSH=false
+ENFORCEMENT_LEVEL=""
+CONFIRM_PITFALLS=0
 
 source "$SCRIPT_DIR/scripts/lib/helpers.sh"
+# BL-099: shared git-hook body generators (fallback pre-commit + commit-msg TDD
+# gate + language→test-pattern table). Sourced here so install_precommit_hook /
+# install_tdd_commit_msg_hook and scripts/upgrade-project.sh --sync-framework
+# emit byte-identical hooks from ONE source of truth.
+source "$SCRIPT_DIR/scripts/lib/hook-templates.sh"
+# BL-109-CURRENCY: currency-inventory (Layer 0) writer/reader helpers. Sourced
+# here so the render sites (generate_claude_md / PROJECT_INTAKE / the A2 template
+# copies) can stash render bases into $SOIF_CURRENCY_RENDERBASE_FILE, and
+# prepare_initial_state_for_commit can stamp the whole `currency` block into
+# .claude/manifest.json at birth. The lib transitively sources
+# scaffold-shipped-set.sh (mechanical shipped-set parsers) if not already loaded.
+source "$SCRIPT_DIR/scripts/lib/currency-manifest.sh"
+# BL-109 S3 / BL-101: the parameterized A1 generator (CLAUDE.md + PROJECT_INTAKE
+# renderers), factored out of init.sh's former inline renders so the Currency
+# System's plan-time three-way merge re-renders the SAME way init.sh does at
+# birth. init.sh calls it here for byte-identity; the sync/plan path sources it
+# framework-side. (tests/test-currency-birth-stamp.sh + tests/test-plan-staging.sh
+# pin the byte-identity.)
+source "$SCRIPT_DIR/scripts/lib/render-project-docs.sh"
+
+# BL-199 (2026-07-29): the anchor a bare/relative --project-dir resolves
+# against. It is the PARENT OF THE DIRECTORY CONTAINING init.sh — NOT the cwd.
+#
+#   /x/solo-orchestrator/init.sh --project-dir testproject   ->  /x/testproject/
+#
+# Karl's worked example invokes init.sh by full path, so the cwd is whatever
+# the operator happened to be standing in; anchoring there would scatter
+# projects unpredictably. Anchoring on SCRIPT_DIR/.. makes `--project-dir
+# <name>` mean "beside the clone" no matter where it is invoked from, which is
+# also what the interactive directory prompt has always defaulted to.
+# Mutation-pinned by tests/test-bl199-quickstart-from-clone.sh::M1 — that test
+# rewrites the _anchor_base line below and requires T2 to go red.
+soif_sibling_anchor() {
+  # BL-199-SIBLING-ANCHOR
+  local _anchor_base="$SCRIPT_DIR/.."
+  local _anchor
+  _anchor="$(cd "$_anchor_base" 2>/dev/null && pwd -P)"
+  [ -n "$_anchor" ] || _anchor="$SCRIPT_DIR"
+  printf '%s' "$_anchor"
+}
+
+# ────────────────────────────────────────────────────────────────────
+# BL-064: init-failure tracking (silent-success defect class)
+# ────────────────────────────────────────────────────────────────────
+# Adversarial certainty re-walk (re-walker-2, scenario
+# `fresh-org-sponsored-poc-standard-web-ts`) surfaced that init.sh used
+# to exit 0 with the "Setup Complete" banner even after emitting a
+# [FAIL] line for branch protection (or push, or any other
+# create_and_protect_remote step that returns non-zero). Operators who
+# only check the exit code (or scan for the banner) miss the gap —
+# same defect class as PR #105's intake-wizard.sh:2028 silent success.
+#
+# Contract (closes BL-064):
+#   • create_and_protect_remote's failure paths (every print_fail
+#     inside that function feeds `return 1`, which the outer caller
+#     records via `record_init_failure`).
+#   • print_init_failures_summary prints a "Setup INCOMPLETE" banner
+#     with a re-listing of every tracked failure when INIT_FAILURES is
+#     non-empty.
+#   • main() ends with: if [ ${#INIT_FAILURES[@]} -gt 0 ]; then
+#     print_init_failures_summary; return 2; fi.  The non-zero return
+#     propagates as init.sh's exit status.
+#
+# Structural backstop: scripts/lint-fail-emit-exit-status.sh enforces
+# that every print_fail in init.sh either terminates (exit/return 1
+# inline or within 2 lines) or carries a `# lint-fail-emit-exit-status:
+# allow <reason>` annotation justifying continuation. See its header
+# for the regex + allowlist contract.
+INIT_FAILURES=()
+record_init_failure() {
+  INIT_FAILURES+=("$1")
+}
+
+# BL-084: best-effort "who acknowledged this" identity for the recorded
+# push-failure escape hatches. Prefers `git config user.name`/`user.email`,
+# falls back to whoami@hostname. Mirrors check-phase-gate.sh::_cpg_gate_actor
+# so the two audit surfaces read the same way.
+_init_actor() {
+  local name email host
+  name=$(git config user.name 2>/dev/null || echo "")
+  email=$(git config user.email 2>/dev/null || echo "")
+  if [ -n "$name" ] && [ -n "$email" ]; then
+    printf '%s <%s>' "$name" "$email"
+  elif [ -n "$name" ]; then
+    printf '%s' "$name"
+  else
+    host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "localhost")
+    printf '%s@%s' "$(whoami 2>/dev/null || echo unknown)" "$host"
+  fi
+}
+
+# BL-084: record an EXPLICIT, operator-acknowledged escape from a FAILED
+# initial push on the bring-your-own-host ('other') path. Only ever called
+# for track=light (Personal / POC-Personal). Writes a structured record to
+# .claude/process-state.json::phase2_init.remote.<key> so the choice is on
+# the record — never a silent pass — and the Phase 1→2 gate can read it.
+#   <key> ∈ { local_only_acknowledged, push_deferred_acknowledged }
+# Atomic tmp-file + mv rename (same idiom as the branch-protection
+# attestation write below; BL-071 atomic-finalize lineage). bash-3.2-safe.
+_record_remote_ack() {
+  local key="$1" reason="$2"
+  local by today
+  by="$(_init_actor)"
+  today="$(date -u +%FT%TZ)"
+  mkdir -p .claude
+  if [ ! -f .claude/process-state.json ]; then
+    echo '{"phase2_init":{"steps_completed":[],"attestations":{}}}' > .claude/process-state.json
+  fi
+  jq --arg k "$key" --arg reason "$reason" --arg date "$today" --arg by "$by" \
+     '.phase2_init.remote = ((.phase2_init.remote // {}) + {($k): {risk_accepted: true, reason: $reason, date: $date, by: $by}})' \
+     .claude/process-state.json > .claude/process-state.json.tmp \
+     && mv .claude/process-state.json.tmp .claude/process-state.json
+}
+
+# BL-084 (verifier follow-up): custom-host push-failure escape-hatch
+# eligibility keys on the ACTUAL project TIER — NOT on `track`. `track=light`
+# can be set (non-interactively) on a POC-Sponsored or Production project
+# (the interactive force-upgrade at init.sh:561-573 does NOT run in
+# --non-interactive mode), so trusting `track` alone would let a
+# sponsored/production project bypass a failed push with NO code uploaded —
+# a silent-success hole exactly like the one BL-084 exists to prevent.
+#
+# Tier is derived from `deployment` + `poc_mode` as init.sh / intake-wizard
+# write them. Valid combos: deployment=personal → poc_mode ∈ {"", private_poc};
+# deployment=organizational → poc_mode ∈ {"", sponsored_poc} (sponsored_poc
+# NEVER pairs with personal). So:
+#   BYPASSABLE     (Personal / POC-Personal): deployment=personal
+#                  AND poc_mode≠sponsored_poc.
+#   NON-bypassable (POC-Sponsored / Production): deployment=organizational
+#                  OR  poc_mode=sponsored_poc.
+# scripts/check-phase-gate.sh's Phase 1→2 push gate computes the IDENTICAL
+# predicate from phase-state.json::{deployment,poc_mode} so the two enforcement
+# points cannot disagree (a gate can't be fooled by track=light either).
+# Returns 0 (success) iff BYPASSABLE. Mutation-proof surface: `# BL-084-TIER-KEY`.
+_bl084_tier_bypassable() {  # BL-084-TIER-KEY
+  if [ "${DEPLOYMENT:-}" = "organizational" ] || [ "${POC_MODE:-}" = "sponsored_poc" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Audit specs-plans-init-intake-noninteractive-2 (2026-06): the dynamic
+# platform discovery used by the interactive flow at collect_inputs() and
+# the case-statement used by the non-interactive validator had drifted
+# apart. The interactive flow scanned docs/platform-modules + release
+# pipelines and appended 'other'; the non-interactive flow hardcoded
+# {desktop|mobile|web|mcp_server} and rejected 'other'. The helper below
+# is the single source of truth — used by both flows and exported for
+# any caller that wants to enumerate or validate platforms.
+get_available_platforms() {
+  # BL-051: process-local memoization. This helper globs
+  # docs/platform-modules/*.md + templates/pipelines/release/github/*.yml
+  # on every call; a single non-interactive validate invocation calls it
+  # more than once (--platform validation at collect_inputs_non_interactive
+  # + the required-arg error message). The platform set is fixed for the
+  # lifetime of the process (on-disk layout doesn't change mid-run), so the
+  # first call caches the result in a guard var + a plain string and later
+  # calls return it verbatim — preserving exact output and ordering.
+  # bash-3.2-safe: NO associative arrays (macOS ships bash 3.2 as /bin/bash),
+  # mirroring the guard-var + delimited-string pattern in
+  # scripts/lint-tests-registered.sh.
+  if [ "${_GET_AVAILABLE_PLATFORMS_CACHED:-0}" = "1" ]; then
+    echo "$_GET_AVAILABLE_PLATFORMS_CACHE"
+    return 0
+  fi
+  local seen=""
+  for f in "$SCRIPT_DIR/docs/platform-modules/"*.md; do
+    [ -f "$f" ] || continue
+    local pname
+    pname=$(basename "$f" .md)
+    if [[ ! " $seen " == *" $pname "* ]]; then
+      seen="$seen $pname"
+    fi
+  done
+  for f in "$SCRIPT_DIR/templates/pipelines/release/github/"*.yml; do
+    [ -f "$f" ] || continue
+    local pname
+    pname=$(basename "$f" .yml)
+    if [[ ! " $seen " == *" $pname "* ]]; then
+      seen="$seen $pname"
+    fi
+  done
+  # 'other' is always available as a fallback for platforms not in the
+  # canonical set (matches the interactive flow).
+  if [[ ! " $seen " == *" other "* ]]; then
+    seen="$seen other"
+  fi
+  _GET_AVAILABLE_PLATFORMS_CACHE="$seen"
+  _GET_AVAILABLE_PLATFORMS_CACHED=1
+  echo "$seen"
+}
 
 # ================================================================
 # PHASE 1: Prerequisites Check
@@ -69,7 +291,7 @@ check_prerequisites() {
   if command -v git &>/dev/null; then
     print_ok "Git $(git --version | awk '{print $3}')"
   else
-    print_fail "Git not found"
+    print_fail "Git not found"  # lint-fail-emit-exit-status: allow check_prerequisites accumulator pattern — missing tools are collected into missing_required[] and a single `exit 1` at the function tail (see line near print_fail "Missing required prerequisites" below) fires only when at least one required tool is absent; interactive install path may install the tool before that check, in which case the [FAIL] line is a status diagnostic only.
     local git_installed=false
     if [ "$interactive" = true ]; then
       if [ "$os_type" = "Darwin" ]; then
@@ -353,61 +575,76 @@ collect_project_info() {
     print_warn "For personal projects, Standard track provides external-user readiness without"
     print_warn "enterprise overhead (pen testing, legal review). You can upgrade later."
     local confirm_full
-    read -rp "$(echo -e "  ${BOLD}Continue with Full track? [y/N]${NC}: ")" confirm_full
+    read -rp "$(echo -e "  ${BOLD}Continue with Full track? [y/N]${NC}: ")" confirm_full # lint-raw-read-prompt: allow init.sh interactive-only wizard (NON_INTERACTIVE=true path bypasses collect_inputs_interactive entirely; see init.sh:3532)
     if [[ ! "$confirm_full" =~ ^[Yy] ]]; then
       TRACK=$(prompt_choice "Project track:" "light" "standard" "full")
       TRACK="${TRACK#"${TRACK%%[![:space:]]*}"}"
     fi
   fi
 
-  # For organizational deployments, ask about governance mode (POC vs production)
+  # Audit code-init-sh-4 + tier-crosscheck-2 (2026-06): move the POC
+  # prompt out from under the organizational guard. Per baseline §2.5,
+  # Private POC is always personal and Sponsored POC is always
+  # organizational, so each deployment offers a different two-option
+  # dialog; both still produce a POC_MODE value (or "") for downstream
+  # consumers.
   POC_MODE=""
+  echo ""
+  echo -e "  ${BOLD}Governance Mode:${NC}"
+  echo "    Production Build — All governance approvals required before starting."
   if [ "$DEPLOYMENT" = "organizational" ]; then
-    echo ""
-    echo -e "  ${BOLD}Governance Mode:${NC}"
-    echo "    Production Build — All governance approvals required before starting."
     echo "    Sponsored POC    — Organization-approved pilot. Technical approvals now,"
     echo "                       non-technical (insurance, ITSM, etc.) deferred."
+  else
     echo "    Private POC      — Personal exploration. All governance deferred."
-    echo ""
-    echo -e "  ${BOLD}POC constraints:${NC} No production deployment, no real user data, no external"
-    echo "  users. All technical work is production-grade and carries forward unchanged."
-    echo "  Phases 0-3 run identically. Phase 4 (production release) is blocked until upgrade."
-    echo ""
-    local gov_mode
+  fi
+  echo ""
+  echo -e "  ${BOLD}POC constraints:${NC} No production deployment, no real user data, no external"
+  echo "  users. All technical work is production-grade and carries forward unchanged."
+  echo "  Phases 0-3 run identically. Phase 4 (production release) is blocked until upgrade."
+  echo ""
+  local gov_mode
+  if [ "$DEPLOYMENT" = "organizational" ]; then
     gov_mode=$(prompt_choice "Governance mode:" \
-      "Private POC" \
       "Sponsored POC" \
       "Production Build")
     case "$gov_mode" in
       "Production"*) POC_MODE="" ;;
       "Sponsored"*)  POC_MODE="sponsored_poc" ;;
+    esac
+  else
+    gov_mode=$(prompt_choice "Governance mode:" \
+      "Private POC" \
+      "Production Build")
+    case "$gov_mode" in
+      "Production"*) POC_MODE="" ;;
       "Private"*)    POC_MODE="private_poc" ;;
     esac
+  fi
 
-    # Validate track against governance mode
-    # Sponsored POC and Production Build require Standard or Full track
-    if [ "$TRACK" = "light" ] && [ "$POC_MODE" != "private_poc" ]; then
-      echo ""
-      if [ -z "$POC_MODE" ]; then
-        print_warn "Production builds require Standard or Full track."
-        print_warn "Light track skips market validation, user testing, and security hardening."
-      else
-        print_warn "Sponsored POC requires Standard or Full track."
-        print_warn "A sponsor expects due diligence — Light track skips too many safeguards."
-      fi
-      echo ""
-      TRACK=$(prompt_choice "Select a track:" "standard" "full")
-      TRACK="${TRACK#"${TRACK%%[![:space:]]*}"}"
-      print_ok "Track upgraded to $TRACK"
+  # Validate track against governance mode
+  # Private POC tolerates light track (it's exploratory by design).
+  # Sponsored POC and Production Build require Standard or Full track.
+  if [ "$TRACK" = "light" ] && [ "$POC_MODE" != "private_poc" ]; then
+    echo ""
+    if [ -z "$POC_MODE" ]; then
+      print_warn "Production builds require Standard or Full track."
+      print_warn "Light track skips market validation, user testing, and security hardening."
+    else
+      print_warn "Sponsored POC requires Standard or Full track."
+      print_warn "A sponsor expects due diligence — Light track skips too many safeguards."
     fi
+    echo ""
+    TRACK=$(prompt_choice "Select a track:" "standard" "full")
+    TRACK="${TRACK#"${TRACK%%[![:space:]]*}"}"
+    print_ok "Track upgraded to $TRACK"
+  fi
 
-    if [ -n "$POC_MODE" ]; then
-      echo ""
-      print_warn "POC MODE: ${POC_MODE//_/ }"
-      print_warn "Phase 4 (production release) is blocked until you upgrade."
-      print_warn "Upgrade later: bash scripts/upgrade-project.sh --to-production"
-    fi
+  if [ -n "$POC_MODE" ]; then
+    echo ""
+    print_warn "POC MODE: ${POC_MODE//_/ }"
+    print_warn "Phase 4 (production release) is blocked until you upgrade."
+    print_warn "Upgrade later: bash scripts/upgrade-project.sh --to-production"
   fi
 
   # Auto-discover available languages from CI pipeline templates.
@@ -461,7 +698,7 @@ collect_project_info() {
     esac
     if [ -n "$os_block_reason" ]; then
       echo ""
-      print_fail "Incompatible OS/language combination: $LANGUAGE on $OS_TYPE"
+      print_fail "Incompatible OS/language combination: $LANGUAGE on $OS_TYPE"  # lint-fail-emit-exit-status: allow interactive prompt_choice recovery — the while-true loop below re-prompts for a compatible language and re-validates; init proceeds normally once the operator picks a valid combination, so the [FAIL] line is a status diagnostic that does NOT survive past the recovery loop.
       print_warn "$os_block_reason"
       echo ""
       print_info "Valid languages for $PLATFORM on $OS_TYPE:"
@@ -506,6 +743,12 @@ collect_project_info() {
   PROJECT_DIR="${PROJECT_DIR%\"}"
   PROJECT_DIR="${PROJECT_DIR#\'}"
   PROJECT_DIR="${PROJECT_DIR%\'}"
+  # BL-199: the DEFAULT above is already the sibling-of-the-clone path and is
+  # absolute, so it passes through the resolver untouched. Running the TYPED
+  # value through the same resolver is what makes a typed bare name ("my-app")
+  # land beside the clone too, instead of wherever the operator's shell
+  # happened to be. create_project() re-resolves and guards before mkdir.
+  PROJECT_DIR="$(soif_resolve_target_dir "$PROJECT_DIR" "$(soif_sibling_anchor)")"
 
   echo ""
   print_info "Project: $PROJECT_NAME"
@@ -513,7 +756,7 @@ collect_project_info() {
   print_info "Directory: $PROJECT_DIR"
   echo ""
 
-  read -rp "$(echo -e "${BOLD}Continue? [Y/n]${NC}: ")" confirm
+  read -rp "$(echo -e "${BOLD}Continue? [Y/n]${NC}: ")" confirm # lint-raw-read-prompt: allow init.sh interactive-only wizard (NON_INTERACTIVE=true path bypasses collect_inputs_interactive entirely; see init.sh:3532)
   if [[ "$confirm" =~ ^[Nn] ]]; then
     echo ""
     local choice
@@ -675,12 +918,33 @@ resolve_and_install_tools() {
   echo -e "${BOLD}└──────────────────────────────────────────────────────────┘${NC}"
   echo ""
 
-  # Confirm — skip prompt when there is nothing to install
+  # Confirm — skip prompt when there is nothing to install.
+  # BL-057: honor NON_INTERACTIVE + AUTO_INSTALL_TOOLS so the --non-interactive
+  # contract is upheld (closed stdin + `set -euo pipefail` + bare `read -rp`
+  # previously terminated the script silently with rc=1 the moment the resolved
+  # plan included an auto_install or manual_install entry — surfaced as a
+  # Step-5 dogfood DOGFOOD-001 on --platform mobile via Android Studio's
+  # auto_install row).
   local response="Y"
   if [ "$auto_count" -gt 0 ] || [ "$manual_count" -gt 0 ]; then
-    read -rp "$(echo -e "${YELLOW}▶ ${BOLD}Proceed with this plan? [Y/n]${NC}: ")" response
+    if [ "$NON_INTERACTIVE" = true ]; then
+      response="${AUTO_INSTALL_TOOLS:-Y}"
+    else
+      read -rp "$(echo -e "${YELLOW}▶ ${BOLD}Proceed with this plan? [Y/n]${NC}: ")" response # lint-raw-read-prompt: allow init.sh interactive-only tool-install plan; NON_INTERACTIVE branch above honors AUTO_INSTALL_TOOLS env var
+    fi
   fi
   if [[ "$response" =~ ^[Nn] ]]; then
+    # BL-057: under NON_INTERACTIVE, the user has already expressed an
+    # explicit decline via AUTO_INSTALL_TOOLS=N. Dropping into the
+    # interactive prompt_choice sub-menu (which assumes a TTY) would hang
+    # or surface a confusing EOF diagnostic. Skip the auto-install plan
+    # and let init.sh proceed with whatever is already present — anything
+    # truly required will be re-flagged at the phase-gate check.
+    if [ "$NON_INTERACTIVE" = true ]; then
+      print_info "AUTO_INSTALL_TOOLS=N — skipping tool auto-installation. Missing tools will be re-flagged at the next phase gate."
+      auto_count=0
+      return 0
+    fi
     echo ""
     local config_choice
     config_choice=$(prompt_choice "What would you like to do?" \
@@ -723,7 +987,7 @@ resolve_and_install_tools() {
         echo ""
         print_info "Default preferences written to: $PROJECT_DIR/.claude/tool-preferences.json"
         print_info "Edit the file, then press Enter to continue."
-        read -rp ""
+        read -rp "" # lint-raw-read-prompt: allow init.sh interactive-only "press Enter to continue" pause after manual tool-preferences edit; non-interactive path skips this whole branch (PROMPT_EDIT only used when -t 0 above)
         # Re-resolve after manual edit
         resolver_output=$("$SCRIPT_DIR/scripts/resolve-tools.sh" \
           --dev-os "$dev_os" \
@@ -989,61 +1253,27 @@ write_tool_preferences() {
     }' > "$project_dir/.claude/tool-preferences.json"
 }
 
-append_intake_tooling_summary() {
-  local resolver_output="$1"
-
-  cat >> PROJECT_INTAKE.md << 'TOOLHDR'
-
----
-
-## Tooling Configuration
-
-> Auto-generated by init.sh. Full machine-readable config: `.claude/tool-preferences.json`
-
-TOOLHDR
-
-  # Resolved for
-  echo "**Resolved for:** $OS_TYPE / $PLATFORM / $LANGUAGE / $TRACK track" >> PROJECT_INTAKE.md
-  echo "" >> PROJECT_INTAKE.md
-
-  # Installed table
-  local installed_count
-  installed_count=$(echo "$resolver_output" | jq '.already_installed | length')
-  if [ "$installed_count" -gt 0 ]; then
-    echo "### Installed" >> PROJECT_INTAKE.md
-    echo "| Tool | Category | Version |" >> PROJECT_INTAKE.md
-    echo "|---|---|---|" >> PROJECT_INTAKE.md
-    echo "$resolver_output" | jq -r '.already_installed[] | "| \(.name) | \(.category) | \(.version) |"' >> PROJECT_INTAKE.md
-    echo "" >> PROJECT_INTAKE.md
-  fi
-
-  # Manual setup table
-  local manual_count
-  manual_count=$(echo "$resolver_output" | jq '.manual_install | length')
-  if [ "$manual_count" -gt 0 ]; then
-    echo "### Manual Setup Required" >> PROJECT_INTAKE.md
-    echo "| Tool | Category | Instructions |" >> PROJECT_INTAKE.md
-    echo "|---|---|---|" >> PROJECT_INTAKE.md
-    echo "$resolver_output" | jq -r '.manual_install[] | "| \(.name) | \(.category) | \(.instructions) |"' >> PROJECT_INTAKE.md
-    echo "" >> PROJECT_INTAKE.md
-  fi
-
-  # Deferred table
-  local deferred_count
-  deferred_count=$(echo "$resolver_output" | jq '.deferred | length')
-  if [ "$deferred_count" -gt 0 ]; then
-    echo "### Deferred (Phase 3+)" >> PROJECT_INTAKE.md
-    echo "| Tool | Phase | Category |" >> PROJECT_INTAKE.md
-    echo "|---|---|---|" >> PROJECT_INTAKE.md
-    echo "$resolver_output" | jq -r '.deferred[] | "| \(.name) | \(.phase) | \(.category) |"' >> PROJECT_INTAKE.md
-    echo "" >> PROJECT_INTAKE.md
-  fi
-}
+# BL-109 S3 / BL-101: append_intake_tooling_summary was factored into
+# scripts/lib/render-project-docs.sh as soif_append_intake_tooling_summary
+# (parameterized on the output file + the four resolved-for vars) and is now
+# invoked by soif_render_project_intake. The former inline copy lived here.
 
 # ================================================================
 # PHASE 4: Create Project
 # ================================================================
 create_project() {
+  # BL-199 — THE AUTHORITATIVE GATE. Every path into the scaffold funnels
+  # through this single mkdir, so the resolve + guard pair belongs here:
+  #   • non-interactive flag path  — already resolved upstream (idempotent)
+  #   • config-file path           — resolved at the existence check
+  #   • INTERACTIVE prompt path    — resolved here and only here for a typed
+  #                                  bare name, and guarded here and only here
+  # The copy in main()'s early block is fast-fail UX (it fires before the log
+  # file and tool installation), not the enforcement point. If you delete one
+  # of the two, delete THAT one — not this.
+  PROJECT_DIR="$(soif_resolve_target_dir "$PROJECT_DIR" "$(soif_sibling_anchor)")"
+  guard_target_not_in_framework "$PROJECT_DIR" "$SCRIPT_DIR" || exit 1
+
   print_step "Creating project at $PROJECT_DIR..."
 
   mkdir -p "$PROJECT_DIR"
@@ -1051,7 +1281,13 @@ create_project() {
 
   # Copy framework documents
   print_info "Copying framework documents..."
-  mkdir -p docs/reference docs/platform-modules docs/test-results "docs/ADR documentation" "docs/api and interfaces" docs/snapshots docs/phase-0 docs/security-audits
+  # BL-103: docs/eval-results/ is the manifest's REQUIRED home — the Phase 3→4
+  # review gate reads docs/eval-results/review-manifest.json, and
+  # evaluation-prompts/Projects/run-reviews.sh writes it there. The scaffold never
+  # created the directory, so the gate's own remediation path pointed into a
+  # folder that did not exist. Create it up front, like every other gate-checked
+  # docs/ directory above.
+  mkdir -p docs/reference docs/platform-modules docs/test-results "docs/ADR documentation" "docs/api and interfaces" docs/snapshots docs/phase-0 docs/security-audits docs/eval-results
 
   cp "$SCRIPT_DIR/docs/builders-guide.md" docs/reference/
   cp "$SCRIPT_DIR/docs/governance-framework.md" docs/reference/
@@ -1059,6 +1295,13 @@ create_project() {
   cp "$SCRIPT_DIR/docs/cli-setup-addendum.md" docs/reference/
   cp "$SCRIPT_DIR/docs/user-guide.md" docs/reference/
   cp "$SCRIPT_DIR/docs/security-scan-guide.md" docs/reference/
+  # Audit uat-authoring-guide-2 (2026-06): the UAT authoring guide is
+  # referenced by init.sh's UAT-references fallback print_* strings AND
+  # by templates/uat/test-session-template.html line ~95. Without copying
+  # it into the generated project, those references resolve to nothing
+  # once the operator leaves the framework repo. Mirrors the pattern for
+  # the six sibling docs above.
+  cp "$SCRIPT_DIR/docs/uat-authoring-guide.md" docs/reference/
 
   # Copy evaluation prompts (project-level reviews for Phase 3 validation)
   print_info "Copying evaluation prompts..."
@@ -1070,9 +1313,45 @@ create_project() {
   # Copy utility scripts into the project (self-contained after init)
   print_info "Copying utility scripts..."
   mkdir -p scripts/lib
-  cp "$SCRIPT_DIR/scripts/lib/helpers.sh" scripts/lib/
+  # BL-046: helpers.sh split into a backwards-compat shim + core + full.
+  # All three files must be copied — the shim (helpers.sh) sources
+  # helpers-full.sh, which sources helpers-core.sh. Short-lived
+  # scripts (check-*, validate, test-gate, resume) source helpers-core.sh
+  # directly; long-running callers (init.sh, upgrade-project.sh,
+  # intake-wizard.sh, reconfigure-project.sh, verify-install.sh) source
+  # helpers.sh (which transitively loads full + core).
+  cp "$SCRIPT_DIR/scripts/lib/helpers.sh"       scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/helpers-core.sh"  scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/helpers-full.sh"  scripts/lib/
+  # BL-099: shared libs sourced by scripts/upgrade-project.sh --sync-framework
+  # (and, for hook-templates.sh, by this init.sh). Shipped so a project's own
+  # upgrade-project.sh copy stays source-closed after a sync replaces it.
+  cp "$SCRIPT_DIR/scripts/lib/hook-templates.sh"       scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/scaffold-shipped-set.sh" scripts/lib/
+  # BL-109 Currency System: the manifest currency-block reader/writer (S1) and
+  # the session-start freshness detector lib (S2). session-freshness-check.sh
+  # sources freshness-detect.sh, which sources currency-manifest.sh (which in
+  # turn sources scaffold-shipped-set.sh + hook-templates.sh, both above) — the
+  # whole chain must ship or the SessionStart hook is not source-closed
+  # downstream. (S1 carried obligation 5: currency-manifest.sh ships downstream.)
+  cp "$SCRIPT_DIR/scripts/lib/currency-manifest.sh"    scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/freshness-detect.sh"     scripts/lib/
+  # BL-109 S3 (Currency System staging): the A1 doc generator (sourced by init.sh
+  # AND by upgrade-project.sh's --plan path) and the plan-staging engine (sourced
+  # by --plan). Both are $SCRIPT_DIR siblings of the shipped upgrade-project.sh /
+  # init.sh, so the source-closure invariant (BL-088) requires them shipped even
+  # though --plan itself runs framework-side only.
+  cp "$SCRIPT_DIR/scripts/lib/render-project-docs.sh"  scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/plan-staging.sh"         scripts/lib/
   cp "$SCRIPT_DIR/scripts/validate.sh" scripts/
   cp "$SCRIPT_DIR/scripts/check-phase-gate.sh" scripts/
+  # BL-088: check-phase-gate.sh's Phase-3→4 gate auto-runs (and points the
+  # operator at) scripts/run-phase3-validation.sh via P3_DRIVER="$SCRIPT_DIR/
+  # run-phase3-validation.sh". Omitting it left the pass-path unreachable
+  # downstream — the gate failed closed but told the operator to run a script
+  # that did not exist in the scaffold. Ship the driver beside its caller.
+  cp "$SCRIPT_DIR/scripts/run-phase3-validation.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/check-gate.sh" scripts/
   cp "$SCRIPT_DIR/scripts/check-updates.sh" scripts/
   cp "$SCRIPT_DIR/scripts/resume.sh" scripts/
   cp "$SCRIPT_DIR/scripts/intake-wizard.sh" scripts/
@@ -1083,8 +1362,15 @@ create_project() {
   cp "$SCRIPT_DIR/scripts/test-gate.sh" scripts/
   cp "$SCRIPT_DIR/scripts/check-versions.sh" scripts/
   cp "$SCRIPT_DIR/scripts/session-version-check.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/session-freshness-check.sh" scripts/   # BL-109 S2 (Currency System, Layer 1)
   cp "$SCRIPT_DIR/scripts/session-test-gate-check.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/session-intake-check.sh" scripts/   # BL-202 (intake/Phase-0 dead-air)
+  # The SessionStart nag arm for the cadence checker (design v1 §8.3's second
+  # enforcement point). check-maintenance.sh itself is already copied below —
+  # §0.3-C1: the orphan was never the shipping, only the invocation.
+  cp "$SCRIPT_DIR/scripts/session-cadence-check.sh" scripts/
   cp "$SCRIPT_DIR/scripts/session-end-qdrant-reminder.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/session-mcp-gate.sh" scripts/
   cp "$SCRIPT_DIR/scripts/process-checklist.sh" scripts/
   cp "$SCRIPT_DIR/scripts/pre-commit-gate.sh" scripts/
   cp "$SCRIPT_DIR/scripts/track-tool-usage.sh" scripts/
@@ -1097,7 +1383,74 @@ create_project() {
   chmod +x scripts/hooks/bypass-detector.sh scripts/escalate-to-user.sh
   cp "$SCRIPT_DIR/scripts/pending-approval.sh" scripts/      # BL-015
   cp "$SCRIPT_DIR/scripts/lint-uat-scenarios.sh" scripts/    # BL-009
-  chmod +x scripts/validate.sh scripts/check-phase-gate.sh scripts/check-updates.sh scripts/resume.sh scripts/intake-wizard.sh scripts/resolve-tools.sh scripts/upgrade-project.sh scripts/reconfigure-project.sh scripts/verify-install.sh scripts/test-gate.sh scripts/check-versions.sh scripts/session-version-check.sh scripts/session-test-gate-check.sh scripts/session-end-qdrant-reminder.sh scripts/process-checklist.sh scripts/pre-commit-gate.sh scripts/track-tool-usage.sh scripts/pending-approval.sh scripts/lint-uat-scenarios.sh
+  cp "$SCRIPT_DIR/scripts/lint-fixture-envelopes.sh" scripts/  # BL-030
+  # BL-117/BL-108: guide-named in-project tools that were never shipped.
+  # check-maintenance.sh is Step 4.4's cadence checker (F20: "No such file"
+  # for a guide-following operator). The three lints below are documented as
+  # running project-side (pre-commit-gate.sh prefers $PROJECT_ROOT-local
+  # copies; the guide describes exactly that) — shipping them activates the
+  # documented path. tests/test-bl108-bl117-ship-closure.sh closes the class.
+  cp "$SCRIPT_DIR/scripts/check-maintenance.sh" scripts/
+  # Shipped lints MUST behave on a generated tree (no backlog, no tests.yml,
+  # no tests/): see `## BUG-008:` in solo-orchestrator-bugs.md. In particular
+  # lint-tests-registered.sh and lint-no-live-remote-in-tests.sh exit 2 on a
+  # generated tree today — do NOT add them to this list without giving them
+  # the same shipped-tree arm lint-backlog-references.sh carries.
+  cp "$SCRIPT_DIR/scripts/lint-backlog-references.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/lint-counter-antipattern.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/lint-review-manifest.sh" scripts/
+  # BL-030: enforcement-level lib, gate-principles lib, filesystem-gate
+  # installer, PostToolUse Claude-commit recorder, SessionStart out-of-
+  # band detector. Required by reconfigure --enforcement-level and by
+  # the strict-mode framework-gate.sh.
+  cp "$SCRIPT_DIR/scripts/lib/enforcement-level.sh" scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/gate-principles.sh"   scripts/lib/
+  # BL-088: sourced gate dependencies that shipped gate scripts load via
+  # "$SCRIPT_DIR/lib/<name>" but that this copy list never enumerated. Each
+  # absence is a silent downstream failure of the sourcing gate:
+  #   • tdd-classify.sh — pre-commit-gate.sh sources it for the tier-keyed TDD
+  #     hard block (BL-072 C2). Its silent-skip loop meant a test-less feat:
+  #     commit in a Sponsored-POC scaffold was ALLOWED (rc=0) — the flagship
+  #     gate no-op'd. (Empirically proven, PR #173 adversarial review.)
+  #   • phase2-state.sh — check-gate.sh sources it (no [-f] guard) for Phase-2
+  #     step write-back; absent, that path dies "No such file or directory".
+  #   • cdf-refresh.sh — upgrade-project.sh sources it to refresh CDF assets;
+  #     absent, every scaffolded project silently skipped the CDF sync on
+  #     upgrade. The source-closure check (tests/test-scaffold-source-closure.sh)
+  #     is the class fix: it fails if any shipped script sources an unshipped
+  #     sibling.
+  #   • adoption-stamp.sh — BOTH check-phase-gate.sh and pre-commit-gate.sh
+  #     source it (the brownfield adoption enabling arms: the `adopted` flag
+  #     accessor, the pre-adoption TDD bound, the regenerate-path loss
+  #     detector). It is a sourced lib like its neighbours above, so it gets NO
+  #     chmod — the `chmod +x` list below is entry scripts only. Shipping it is
+  #     NOT a behaviour change for a greenfield project: with no adoption block
+  #     in the manifest the accessor reads NOT ADOPTED and every arm no-ops
+  #     (pinned by A2/T5 in tests/test-brownfield-wp3-adoption-arms.sh). It
+  #     closes a DANGLING SOURCE in two shipped gates — and the closure test is
+  #     what caught it after two reviews had both graded the omission
+  #     "harmless today". It was not: it is a hard gate.
+  cp "$SCRIPT_DIR/scripts/lib/tdd-classify.sh"      scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/phase2-state.sh"      scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/cdf-refresh.sh"       scripts/lib/
+  cp "$SCRIPT_DIR/scripts/lib/adoption-stamp.sh"    scripts/lib/
+  cp "$SCRIPT_DIR/scripts/install-filesystem-gates.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/detect-out-of-band-commits.sh" scripts/
+  cp "$SCRIPT_DIR/scripts/hooks/record-claude-commit.sh" scripts/hooks/
+  chmod +x scripts/install-filesystem-gates.sh \
+           scripts/detect-out-of-band-commits.sh \
+           scripts/hooks/record-claude-commit.sh
+  # Host dispatcher + per-host drivers so check-gate.sh --backfill-host/
+  # --repair/--preflight and init's own host-aware code paths resolve
+  # inside the initialized project (audit: code-init-sh-2).
+  mkdir -p scripts/host-drivers
+  cp "$SCRIPT_DIR/scripts/lib/host.sh" scripts/lib/
+  # BL-204-ERROR-TRANSLATE: the drivers source ../lib/host-errors.sh relative
+  # to their own location, so it must land in the project alongside host.sh.
+  cp "$SCRIPT_DIR/scripts/lib/host-errors.sh" scripts/lib/
+  cp "$SCRIPT_DIR/scripts/host-drivers/"*.sh scripts/host-drivers/
+  chmod +x scripts/host-drivers/*.sh
+  chmod +x scripts/validate.sh scripts/check-phase-gate.sh scripts/run-phase3-validation.sh scripts/check-gate.sh scripts/check-updates.sh scripts/resume.sh scripts/intake-wizard.sh scripts/resolve-tools.sh scripts/upgrade-project.sh scripts/reconfigure-project.sh scripts/verify-install.sh scripts/test-gate.sh scripts/check-versions.sh scripts/session-version-check.sh scripts/session-freshness-check.sh scripts/session-test-gate-check.sh scripts/session-intake-check.sh scripts/session-cadence-check.sh scripts/session-end-qdrant-reminder.sh scripts/session-mcp-gate.sh scripts/process-checklist.sh scripts/pre-commit-gate.sh scripts/track-tool-usage.sh scripts/pending-approval.sh scripts/lint-uat-scenarios.sh scripts/check-maintenance.sh scripts/lint-backlog-references.sh scripts/lint-counter-antipattern.sh scripts/lint-review-manifest.sh
 
   # Copy intake suggestion files
   mkdir -p templates/intake-suggestions
@@ -1106,6 +1459,18 @@ create_project() {
   # Copy tool matrix files (for phase gate and track upgrade resolution)
   mkdir -p templates/tool-matrix
   cp "$SCRIPT_DIR/templates/tool-matrix/"*.json templates/tool-matrix/
+
+  # BL-131-DOM-SINKS: ship the project-owned DOM-XSS sink ruleset. The emitted
+  # pre-commit hook (scripts/lib/hook-templates.sh) and the generated CI both
+  # reference .semgrep/soif-dom-sinks.yml by repo-relative path as an extra
+  # --config; it covers the sinks NO public registry rule catches
+  # (insertAdjacentHTML, jQuery .html(), innerHTML/document.write in .vue/.html).
+  # Laid down HERE — before the initial commit below — so it is committed and CI
+  # (which checks out the committed tree) sees it. The hook passes it
+  # unconditionally, so a missing file makes semgrep exit non-zero and the SAST
+  # arm WARNs loudly (never a silent clean pass).
+  mkdir -p .semgrep
+  cp "$SCRIPT_DIR/templates/semgrep/soif-dom-sinks.yml" .semgrep/
 
   # Copy UAT template and create session directory structure
   mkdir -p tests/uat/templates tests/uat/sessions tests/uat/examples
@@ -1124,9 +1489,9 @@ create_project() {
   elif [ "$PLATFORM" = "other" ]; then
     print_info "Platform is 'other' — no UAT canned reference copied."
     print_info "When starting a UAT session, the agent will run the co-build Q&A"
-    print_info "protocol with you per docs/uat-authoring-guide.md § 5."
+    print_info "protocol with you per docs/reference/uat-authoring-guide.md § 5."
   else
-    print_warn "UAT reference files not found for platform '$PLATFORM'. Falling back to 'other'-style co-build protocol; see docs/uat-authoring-guide.md § 5."
+    print_warn "UAT reference files not found for platform '$PLATFORM'. Falling back to 'other'-style co-build protocol; see docs/reference/uat-authoring-guide.md § 5."
   fi
 
   # Copy the correct platform module (auto-discovered)
@@ -1134,6 +1499,33 @@ create_project() {
   if [ -f "$platform_module" ]; then
     cp "$platform_module" docs/platform-modules/
     print_ok "Platform module: $PLATFORM"
+    # BL-106-GOLIVE-TEMPLATE: render the module's MANDATORY Go-Live checklist
+    # into the artifact the phase-4 gate verifies (Karl's 2026-07-18
+    # machine-checkable decision). Single source: the module's H3 /Go-Live/
+    # section's top-level `- [ ]` items — the same grammar the
+    # # BL-106-GOLIVE-CHECKLIST arm in process-checklist.sh parses at
+    # go_live_verified time. The operator ticks every box and dates the
+    # header; the gate blocks on unticked/missing/undated.
+    local golive_items
+    golive_items=$(awk '/^###[^#].*[Gg]o-[Ll]ive/{f=1; next} f && /^#/{exit} f' "$platform_module" | grep -E '^- \[ \]' || true)
+    if [ -n "$golive_items" ]; then
+      {
+        echo "# Go-Live Checklist — $PROJECT_NAME ($PLATFORM)"
+        echo ""
+        echo "Rendered at scaffold time from \`docs/platform-modules/${PLATFORM}.md\` (its Go-Live"
+        echo "section is MANDATORY). Tick every box as you verify it in production; the"
+        echo "\`phase4_release:go_live_verified\` gate blocks while any box is unticked,"
+        echo "any module item is missing, or the Date below is a placeholder (BL-106)."
+        echo ""
+        echo "| Field | Value |"
+        echo "|---|---|"
+        echo "| **Date** | [YYYY-MM-DD] |"
+        echo "| **Verified by** | [name] |"
+        echo ""
+        printf '%s\n' "$golive_items"
+      } > docs/test-results/go-live-checklist.md
+      print_ok "Go-live checklist rendered: docs/test-results/go-live-checklist.md ($(printf '%s\n' "$golive_items" | grep -c .) items)"
+    fi
   else
     print_info "No platform module for '$PLATFORM'. The Builder's Guide works standalone."
   fi
@@ -1143,6 +1535,14 @@ create_project() {
   mkdir -p templates/generated
   cp "$SCRIPT_DIR/templates/generated/project-bible.tmpl" templates/generated/
   cp "$SCRIPT_DIR/templates/generated/product-manifesto.tmpl" templates/generated/
+  # BL-109-CURRENCY: record the A2 (agent-authored) render bases by TEMPLATE sha
+  # only — PROJECT_BIBLE.md / PRODUCT_MANIFESTO.md are created by no script and
+  # do not exist at birth (review-r1 B3a), so there is no rendered-output sha and
+  # no files{} entry. Captured here, at the copy site, from the template source.
+  soif_currency_record_render_base A2 PROJECT_BIBLE.md \
+    "$SCRIPT_DIR/templates/generated/project-bible.tmpl" ""
+  soif_currency_record_render_base A2 PRODUCT_MANIFESTO.md \
+    "$SCRIPT_DIR/templates/generated/product-manifesto.tmpl" ""
   cp "$SCRIPT_DIR/templates/generated/frd.tmpl" templates/generated/
   cp "$SCRIPT_DIR/templates/generated/user-journey.tmpl" templates/generated/
   cp "$SCRIPT_DIR/templates/generated/data-contract.tmpl" templates/generated/
@@ -1153,6 +1553,38 @@ create_project() {
   cp "$SCRIPT_DIR/templates/generated/changelog.tmpl" templates/generated/
   cp "$SCRIPT_DIR/templates/generated/bugs.tmpl" templates/generated/
   cp "$SCRIPT_DIR/templates/generated/release-notes.tmpl" templates/generated/
+  # Verifier nit-2 follow-up (PR #92 review): copy the canonical
+  # claude-md.tmpl into the project so verify-install.sh's self-
+  # bootstrap fallback in fix_claude_md (scripts/verify-install.sh:645
+  # — `elif [ -f "templates/generated/claude-md.tmpl" ]`) has something
+  # to read when $SOURCE_DIR is no longer reachable (developer rotated
+  # the orchestrator clone, CI restored only the project tree, etc.).
+  # Without this copy that fallback was dead code in practice.
+  cp "$SCRIPT_DIR/templates/generated/claude-md.tmpl" templates/generated/
+  # BL-108: the five GATE-DEMANDED templates that were never shipped — the
+  # gates' own error text and the builders-guide tell the operator to use
+  # them (8 of 25 were unshipped; these five are demanded by a gate arm).
+  # tests/test-bl108-bl117-ship-closure.sh closes the class mechanically.
+  cp "$SCRIPT_DIR/templates/generated/security-audit-findings.tmpl" templates/generated/
+  cp "$SCRIPT_DIR/templates/generated/security.tmpl" templates/generated/
+  cp "$SCRIPT_DIR/templates/generated/threat-model-validation.tmpl" templates/generated/
+  cp "$SCRIPT_DIR/templates/generated/rollback-test.tmpl" templates/generated/
+  cp "$SCRIPT_DIR/templates/generated/handoff-test-results.tmpl" templates/generated/
+
+  # BL-089-DOC-FOUNDATIONS-BEGIN
+  # The three documentation foundations, instantiated at birth (Pantheon's
+  # month without them: identifier-namespace collisions, a ghost ADR cited
+  # for three weeks, unmarked superseded docs). IDENTIFIERS ships PRE-SEEDED
+  # with the framework's own namespaces — an empty registry with a rule is a
+  # documented-but-unenforced promise.
+  cp "$SCRIPT_DIR/templates/generated/doc-index.tmpl" templates/generated/
+  cp "$SCRIPT_DIR/templates/generated/identifiers.tmpl" templates/generated/
+  cp "$SCRIPT_DIR/templates/generated/archive-readme.tmpl" templates/generated/
+  cp "$SCRIPT_DIR/templates/generated/doc-index.tmpl" docs/INDEX.md
+  cp "$SCRIPT_DIR/templates/generated/identifiers.tmpl" docs/IDENTIFIERS.md
+  mkdir -p docs/archive
+  cp "$SCRIPT_DIR/templates/generated/archive-readme.tmpl" docs/archive/README.md
+  # BL-089-DOC-FOUNDATIONS-END
 
   # Install vendored skills (project-level, .claude/skills/<name>/).
   # Skills are markdown SKILL.md files with NOTICE-attribution preserved.
@@ -1374,10 +1806,11 @@ PERMEOF
       # Map platform to framework's target platform format
       local target_platform="$PLATFORM"
       case "$PLATFORM" in
-        web) target_platform="web" ;;
-        desktop) target_platform="$dev_os desktop" ;;
-        mobile) target_platform="iOS/Android" ;;
-        *) target_platform="$PLATFORM" ;;
+        web)        target_platform="web" ;;
+        desktop)    target_platform="$dev_os desktop" ;;
+        mobile)     target_platform="iOS/Android" ;;
+        mcp_server) target_platform="MCP server (JSON-RPC)" ;;
+        *)          target_platform="$PLATFORM" ;;
       esac
 
       # Write pre-populated discovery JSON to temp file (avoids creating
@@ -1404,13 +1837,24 @@ PERMEOF
           }' > "$discovery_tmp"
       fi
 
-      # Map Solo Orchestrator platform to framework profile name
+      # Map Solo Orchestrator platform to framework profile name.
+      # CDF ships four profiles: web-app, web-api, desktop-app, mobile-app.
+      # MCP servers are JSON-RPC services over stdio/HTTP — the closest
+      # CDF profile is web-api, so we map mcp_server -> web-api
+      # explicitly (no silent wildcard fall-through). The wildcard arm
+      # remains as a defensive default for any future PLATFORM token
+      # that arrives without a matching CDF profile. See
+      # docs/platform-modules/mcp_server.md §2.1 for the rationale.
       local fw_profile
       case "$PLATFORM" in
-        web)     fw_profile="web-app" ;;
-        desktop) fw_profile="desktop-app" ;;
-        mobile)  fw_profile="mobile-app" ;;
-        *)       fw_profile="web-api" ;;
+        web)        fw_profile="web-app" ;;
+        desktop)    fw_profile="desktop-app" ;;
+        mobile)     fw_profile="mobile-app" ;;
+        mcp_server) fw_profile="web-api" ;;
+        *)
+          fw_profile="web-api"
+          print_warn "Unknown PLATFORM='$PLATFORM' — defaulting CDF profile to web-api. Add an explicit arm to init.sh to silence this warning."
+          ;;
       esac
 
       # Run the framework's init with:
@@ -1464,6 +1908,37 @@ PERMEOF
             && mv .claude/settings.json.tmp .claude/settings.json
           hooks_added=true
         fi
+        # BL-109 S2: freshness check hook (Currency System, Layer 1 — detection).
+        # Silent-when-current, zero-network, fail-open (exit 0 always), writes only
+        # .claude/cache/. Injected exactly like session-version-check.sh above.
+        if ! jq -e '.hooks.SessionStart[0].hooks[] | select(.command | contains("session-freshness-check.sh"))' .claude/settings.json >/dev/null 2>&1; then
+          jq '.hooks.SessionStart[0].hooks += [{"type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR\"/scripts/session-freshness-check.sh"}]' .claude/settings.json > .claude/settings.json.tmp \
+            && mv .claude/settings.json.tmp .claude/settings.json
+          hooks_added=true
+        fi
+        # BL-202-INTAKE-HOOK-BEGIN — intake/Phase-0 onboarding state on every
+        # launch surface (desktop/IDE included, where terminal prints cannot
+        # reach). Silent when healthy; the agent relays. Injected exactly like
+        # the three hooks above; fenced so the registration is excisable for
+        # mutation proofs without touching its siblings.
+        if ! jq -e '.hooks.SessionStart[0].hooks[] | select(.command | contains("session-intake-check.sh"))' .claude/settings.json >/dev/null 2>&1; then
+          jq '.hooks.SessionStart[0].hooks += [{"type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR\"/scripts/session-intake-check.sh"}]' .claude/settings.json > .claude/settings.json.tmp \
+            && mv .claude/settings.json.tmp .claude/settings.json
+          hooks_added=true
+        fi
+        # BL-202-INTAKE-HOOK-END
+        # CADENCE-NAG-HOOK-BEGIN — the maintenance-cadence nag (design v1 §8.3's
+        # SessionStart enforcement point, the soft half of the pair whose hard
+        # half is the release cut). Silent when every cadence is current,
+        # zero-network, fail-open (exit 0 under every failure mode). Injected
+        # exactly like the four hooks above; fenced so the registration is
+        # excisable for a mutation proof without touching its siblings.
+        if ! jq -e '.hooks.SessionStart[0].hooks[] | select(.command | contains("session-cadence-check.sh"))' .claude/settings.json >/dev/null 2>&1; then
+          jq '.hooks.SessionStart[0].hooks += [{"type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR\"/scripts/session-cadence-check.sh"}]' .claude/settings.json > .claude/settings.json.tmp \
+            && mv .claude/settings.json.tmp .claude/settings.json
+          hooks_added=true
+        fi
+        # CADENCE-NAG-HOOK-END
         # Add Qdrant reminder to Stop hook
         if jq -e '.hooks.Stop' .claude/settings.json >/dev/null 2>&1; then
           if ! jq -e '.hooks.Stop[0].hooks[] | select(.command | contains("session-end-qdrant-reminder.sh"))' .claude/settings.json >/dev/null 2>&1; then
@@ -1545,6 +2020,27 @@ PERMEOF
           hooks_added=true
         fi
 
+        # BL-030: PostToolUse hook for the Claude-commit recorder
+        # (always-on). Records SHA of every successful Claude-issued
+        # git commit into .claude/claude-commits.jsonl.
+        if ! jq -e '.hooks.PostToolUse[0].hooks[] | select(.command | contains("record-claude-commit.sh"))' .claude/settings.json >/dev/null 2>&1; then
+          jq '.hooks.PostToolUse[0].hooks += [{"type":"command","command":"bash \"$CLAUDE_PROJECT_DIR\"/scripts/hooks/record-claude-commit.sh"}]' .claude/settings.json > .claude/settings.json.tmp \
+            && mv .claude/settings.json.tmp .claude/settings.json
+          hooks_added=true
+        fi
+
+        # BL-030: SessionStart hook for the out-of-band detector. Self-
+        # no-ops when enforcement_level=no; runs on light + strict to
+        # surface user-terminal commits in .claude/bypass-audit.json.
+        if ! jq -e '.hooks.SessionStart[0].hooks[]? | select(.command | contains("detect-out-of-band-commits.sh"))' .claude/settings.json >/dev/null 2>&1; then
+          jq 'if (.hooks.SessionStart // []) | length == 0
+              then .hooks.SessionStart = [{"hooks":[{"type":"command","command":"bash \"$CLAUDE_PROJECT_DIR\"/scripts/detect-out-of-band-commits.sh"}]}]
+              else .hooks.SessionStart[0].hooks += [{"type":"command","command":"bash \"$CLAUDE_PROJECT_DIR\"/scripts/detect-out-of-band-commits.sh"}]
+              end' .claude/settings.json > .claude/settings.json.tmp \
+            && mv .claude/settings.json.tmp .claude/settings.json
+          hooks_added=true
+        fi
+
         if [ "$hooks_added" = true ]; then
           print_ok "Session hooks installed (version check, test gate, MCP gate, Qdrant reminder, commit gate, tool tracking, bypass detector)"
         fi
@@ -1552,39 +2048,33 @@ PERMEOF
     fi
   fi
 
-  # Copy intake template
-  cp "$SCRIPT_DIR/templates/project-intake.md" PROJECT_INTAKE.md
-
-  # Pre-fill Section 1 with init data so user doesn't enter it twice
-  local platform_module="None"
-  case "$PLATFORM" in
-    web) platform_module="SOI-PM-WEB" ;;
-    desktop) platform_module="SOI-PM-DESKTOP" ;;
-    mobile) platform_module="SOI-PM-MOBILE" ;;
-  esac
-  local track_display
-  track_display="$(echo "${TRACK:0:1}" | tr '[:lower:]' '[:upper:]')${TRACK:1}"
-  local deployment_display
-  deployment_display="$(echo "${DEPLOYMENT:0:1}" | tr '[:lower:]' '[:upper:]')${DEPLOYMENT:1}"
-
-  sed -i.bak \
-    -e "s~| \*\*Project name\*\* | |~| **Project name** | $PROJECT_NAME |~" \
-    -e "s~| \*\*One-sentence description\*\* | _What does this do, in plain language?_ |~| **One-sentence description** | $PROJECT_DESCRIPTION |~" \
-    -e "s~| \*\*Project track\*\* | Light / Standard / Full .*~| **Project track** | $track_display |~" \
-    -e "s~| \*\*Platform type\*\* | Web / Desktop / Mobile / CLI / Other: .*~| **Platform type** | $PLATFORM |~" \
-    -e "s~| \*\*Platform Module\*\* | SOI-PM-WEB / SOI-PM-DESKTOP / SOI-PM-MOBILE / None .*~| **Platform Module** | $platform_module |~" \
-    -e "s~| \*\*Is this a personal project or organizational deployment?\*\* | Personal / Organizational |~| **Is this a personal project or organizational deployment?** | $deployment_display |~" \
-    -e "s~__DATE__~$(date +%Y-%m-%d)~g" \
-    PROJECT_INTAKE.md
-  rm -f PROJECT_INTAKE.md.bak
+  # BL-109 S3 / BL-101: render PROJECT_INTAKE.md via the shared parameterized
+  # generator (the former inline cp + Section-1 pre-fill sed + tooling-summary
+  # append now live in scripts/lib/render-project-docs.sh). Byte-identical on
+  # identical inputs. The tooling summary is appended only when RESOLVER_OUTPUT is
+  # present (a birth-only value the plan-time render cannot recover — the user's
+  # tooling summary is instead preserved through the A1 three-way merge).
+  soif_render_project_intake "$SCRIPT_DIR/templates/project-intake.md" PROJECT_INTAKE.md \
+    "$PROJECT_NAME" "$PROJECT_DESCRIPTION" "$TRACK" "$PLATFORM" "$DEPLOYMENT" \
+    "$(date +%Y-%m-%d)" "${RESOLVER_OUTPUT:-}" "$OS_TYPE" "$LANGUAGE"
   print_ok "Intake Section 1 pre-filled with project info"
 
-  # Append tooling configuration summary to PROJECT_INTAKE.md
-  if [ -n "${RESOLVER_OUTPUT:-}" ]; then
-    append_intake_tooling_summary "$RESOLVER_OUTPUT"
-  fi
+  # BL-109-CURRENCY: capture the A1 render base for PROJECT_INTAKE.md HERE — at
+  # the end of its render (cp template → sed pre-fill → tooling append) — so the
+  # output sha is the render-time truth, never a post-hoc hash of a maybe-touched
+  # file (a MAJOR per the verify focus). {template sha, rendered-output sha}.
+  soif_currency_record_render_base A1 PROJECT_INTAKE.md \
+    "$SCRIPT_DIR/templates/project-intake.md" PROJECT_INTAKE.md
 
-  # Generate phase state tracking
+  # Generate phase state tracking.
+  # BL-073: `review_gate_enforced` is the grandfather cutover for the
+  # track-aware Phase 3→4 review-manifest gate. init.sh stamps it `true`
+  # at creation, so every project CREATED after BL-073 ships is subject to
+  # the track-aware FAIL (see scripts/check-phase-gate.sh review-manifest
+  # block). Projects created BEFORE BL-073 lack the field entirely — the
+  # gate reads its absence as "grandfathered" and keeps the legacy
+  # WARN-only behavior, so a pre-existing project is never retroactively
+  # blocked. upgrade-project.sh re-stamps it on any tier advance.
   print_info "Generating phase state..."
   mkdir -p .claude
   local poc_json="null"
@@ -1598,9 +2088,11 @@ PERMEOF
   "deployment": "$DEPLOYMENT",
   "poc_mode": $poc_json,
   "compliance_ready": false,
+  "review_gate_enforced": true,
   "gates": {
     "phase_0_to_1": null,
     "phase_1_to_2": null,
+    "phase_2_to_3": null,
     "phase_3_to_4": null
   }
 }
@@ -1737,6 +2229,20 @@ QDEOF
   print_info "Installing pre-commit hook..."
   install_precommit_hook
 
+  # --- Atomic initial-state preparation (code-init-sh-6) ---
+  # Pre-fix, BL-030 state files (manifest enforcement_level/deployment/poc_mode,
+  # bypass-audit.json init row, filesystem gate) and the host-manifest seed
+  # (host/mode/remote_url) were written AFTER the initial git commit. The chore-
+  # init commit captured none of them, leaving a half-initialized state on every
+  # init (especially severe on create_and_protect_remote failure, since BL-030
+  # writes happened unconditionally on top of the failed-remote state).
+  #
+  # Lay everything down BEFORE the initial commit so a single atomic commit
+  # captures the entire framework-managed state. Post-remote writes (remote_url
+  # update, attestation, phase2_init steps) are captured by finalize_init_commit
+  # below as a second commit when present.
+  prepare_initial_state_for_commit
+
   git add -A
   # Skip hooks for the initial commit — template files trigger false positives
   # in Semgrep/gitleaks. Hooks will enforce on all subsequent commits.
@@ -1746,6 +2252,11 @@ Project: $PROJECT_NAME
 Platform: $PLATFORM
 Track: $TRACK
 Framework: Solo Orchestrator v1.0"
+
+  # Refresh the BL-030 detection baseline to the chore-init commit. The file
+  # is gitignored (templates/generated/gitignore-base.tmpl), so updating it
+  # post-commit does NOT dirty the working tree.
+  ( git rev-parse HEAD 2>/dev/null > .claude/last-checked-commit.txt ) || true
 
   # --- Host-aware repo creation (spec 2026-04-21 host-aware repo gate) ---
   # Reads git_host + repo_visibility from intake-progress.json (set by
@@ -1766,7 +2277,23 @@ Framework: Solo Orchestrator v1.0"
     print_info "  scripts/check-gate.sh --repair           # to re-create remote and protection"
     print_info "  scripts/check-gate.sh --preflight        # to verify the remote is correctly set up"
     echo ""
+    # BL-064: record the host-setup failure so main()'s exit-time check
+    # prints "Setup INCOMPLETE" instead of "Setup Complete" and returns
+    # non-zero. Without this, the print_fail lines emitted inside
+    # create_and_protect_remote would be silently absorbed by `if !` and
+    # the operator would see rc=0 + a success banner. The summary cites
+    # the phase rather than each individual [FAIL] message — the lines
+    # themselves are already on stdout above; the summary's job is to
+    # surface that at least one phase failed so an operator scanning only
+    # the tail of the log still sees the gap.
+    record_init_failure "Host repo setup (create_and_protect_remote) — see [FAIL] lines above; remediate with scripts/check-gate.sh --repair"
   fi
+
+  # If create_and_protect_remote wrote new state (manifest.remote_url update,
+  # attestation, phase2_init.steps_completed), commit it as a second "finalize"
+  # commit so the working tree stays clean. No-op when nothing changed (e.g.
+  # --no-remote-creation, which set remote_url during prepare_initial_state).
+  finalize_init_commit
 
   echo ""
   print_ok "Project created at $PROJECT_DIR"
@@ -1776,45 +2303,29 @@ Framework: Solo Orchestrator v1.0"
 # Host-Aware Repo Creation (spec 2026-04-21)
 # ================================================================
 create_and_protect_remote() {
-  local host visibility
-  # BL-016: prefer non-interactive top-level variables when set.
-  if [ -n "${GIT_HOST:-}" ]; then
-    host="$GIT_HOST"
-  elif [ -f .claude/intake-progress.json ]; then
-    host=$(jq -r '.answers.git_host // empty' .claude/intake-progress.json 2>/dev/null || echo "")
-  fi
-  if [ -n "${VISIBILITY:-}" ]; then
-    visibility="$VISIBILITY"
-  elif [ -f .claude/intake-progress.json ]; then
-    visibility=$(jq -r '.answers.repo_visibility // empty' .claude/intake-progress.json 2>/dev/null || echo "")
-  fi
-  # Fallback: prompt inline if neither source supplied a value (interactive mode only).
-  [ -z "$host" ]       && host=$(prompt_choice "Git host:" "github" "gitlab" "bitbucket" "other")
-  [ -z "$visibility" ] && visibility=$(prompt_choice "Repository visibility:" "private" "public")
+  # Host/visibility/mode are pre-resolved by prepare_initial_state_for_commit
+  # and exported as _RESOLVED_HOST / _RESOLVED_VISIBILITY / _RESOLVED_MODE so
+  # the manifest can be written BEFORE the chore-init commit. We use those
+  # values here (the manifest.host/manifest.mode are already in HEAD).
+  local host="$_RESOLVED_HOST"
+  local visibility="$_RESOLVED_VISIBILITY"
+  local mode="$_RESOLVED_MODE"
 
-  # Map DEPLOYMENT "organizational" → "org" for consistency with spec
-  local mode="$DEPLOYMENT"
-  [ "$mode" = "organizational" ] && mode="org"
-  # Org forces private
-  if [ "$mode" = "org" ] && [ "$visibility" != "private" ]; then
-    print_warn "Org mode forces private visibility (overriding '$visibility')"
-    visibility="private"
-  fi
-
-  # T2-C: write manifest.host (and mode) early so check-gate.sh --preflight
-  # has a usable host field even if a downstream API call fails (missing CLI,
-  # 403, push failure, fake URL). Late-stage merges below add remote_url and
-  # update host/mode in place.
-  mkdir -p .claude
-  if [ -f .claude/manifest.json ]; then
-    jq --arg h "$host" --arg m "$mode" '.host = $h | .mode = $m' \
-       .claude/manifest.json > .claude/manifest.json.tmp \
-       && mv .claude/manifest.json.tmp .claude/manifest.json
-  else
-    cat > .claude/manifest.json <<MANIFESTEOF
-{"host": "$host", "mode": "$mode"}
-MANIFESTEOF
-  fi
+  # Audit finding specs-plans-host-aware-2: write phase2_init.steps_completed
+  # INCREMENTALLY after each successful host_ call so a mid-flight failure
+  # leaves accurate partial state for scripts/check-gate.sh --repair to
+  # consult (see check-gate.sh::cmd_repair). The four named steps in order:
+  #   remote_repo_created          — after host_create_repo + register
+  #   pushed_initial               — after host_push_initial
+  #   branch_protection_configured — after host_configure_protection (or attestation)
+  #   branch_protection_verified   — after host_verify_protection passes
+  #
+  # PR #97 verifier follow-up: _record_phase2_step lives in
+  # scripts/lib/phase2-state.sh so check-gate.sh::cmd_repair writes through
+  # the same helper after a successful resume step (the original inner-
+  # function placement made it invisible to check-gate.sh).
+  # shellcheck disable=SC1090
+  source "$SCRIPT_DIR/scripts/lib/phase2-state.sh"
 
   # T2-B: --no-remote-creation skips the host API entirely so UAT/CI runs do
   # not contaminate the user's GitHub/GitLab/Bitbucket account. Manifest already
@@ -1840,10 +2351,11 @@ MANIFESTEOF
     if [ -n "${REMOTE_URL:-}" ]; then
       remote_url="$REMOTE_URL"
     else
-      read -rp "Paste the HTTPS clone URL of the remote repo you've created: " remote_url
+      read -rp "Paste the HTTPS clone URL of the remote repo you've created: " remote_url # lint-raw-read-prompt: allow init.sh interactive-only "other host" URL paste; gated by REMOTE_URL env-var fast-path at line 1952 above for non-interactive callers (BL-016)
     fi
     [ -z "$remote_url" ] && { print_fail "Remote URL required for 'other' host"; return 1; }
     git remote add origin "$remote_url"
+    _record_phase2_step "remote_repo_created"
 
     # BL-024: record attestation BEFORE the push attempt. Attestation is a
     # forward-looking commitment ("I will configure protection on this remote")
@@ -1862,7 +2374,7 @@ MANIFESTEOF
       attest="yes"
       print_info "Branch protection attested via --branch-protection-attested flag."
     else
-      read -rp "Has branch protection been configured per the above? [type 'yes' to attest]: " attest
+      read -rp "Has branch protection been configured per the above? [type 'yes' to attest]: " attest # lint-raw-read-prompt: allow init.sh interactive-only attestation; gated by BRANCH_PROTECTION_ATTESTED env-var fast-path at line 1973 above for non-interactive callers (BL-016)
     fi
     [ "$attest" != "yes" ] && { print_fail "Attestation required — cannot proceed to Phase 0"; return 1; }
     # Record attestation in process-state.json (BEFORE push — see BL-024 above).
@@ -1874,16 +2386,108 @@ MANIFESTEOF
        '.phase2_init.attestations.branch_protection = {attested_by: "orchestrator", at: $at}' \
        .claude/process-state.json > .claude/process-state.json.tmp \
        && mv .claude/process-state.json.tmp .claude/process-state.json
+    # Attestation IS the verification step for 'other' host (manual contract).
+    _record_phase2_step "branch_protection_configured"
+    _record_phase2_step "branch_protection_verified"
 
     # Push happens AFTER attestation so a push failure cannot drop the
-    # attestation. The outer init.sh wraps create_and_protect_remote in
-    # `if ! ...; then warn ...` (BL-016/U-B fix at init.sh:1717-1730), so
-    # `return 1` here surfaces the push failure as a remediation prompt
-    # without aborting init.sh — and the attestation we just wrote
-    # persists for check-gate.sh --repair / --preflight to honor.
+    # attestation (BL-024). The attestation we just wrote persists for
+    # check-gate.sh --repair / --preflight to honor regardless of the
+    # outcome below.
+    #
+    # BL-084: TIER-AWARE handling of a FAILED initial push on the
+    # bring-your-own-host path. A prior draft made EVERY 'other'-host push
+    # failure a silent success (return 0) — that re-opened the project's #1
+    # defect class (BL-064 silent-success: init says "Setup Complete" while
+    # the code was never uploaded). Instead we thread the needle on the actual
+    # project TIER (deployment + poc_mode, via _bl084_tier_bypassable — NOT
+    # `track`, which a sponsored/production project can carry as light):
+    #
+    #   • NON-bypassable tier (POC-Sponsored / Production — deployment=
+    #     organizational OR poc_mode=sponsored_poc): a working remote is
+    #     MANDATORY. A failed push is a hard failure — no local-only, no
+    #     deferral, no flag helps. return 1 → the outer caller records an init
+    #     failure → init prints "Setup INCOMPLETE" + exits 2.
+    #
+    #   • BYPASSABLE tier (Personal / POC-Personal — deployment=personal AND
+    #     poc_mode≠sponsored_poc): the operator MAY proceed, but ONLY with an
+    #     EXPLICIT, on-the-record acknowledgment of the risk (never a silent
+    #     pass). Two acknowledged outcomes both exit 0:
+    #       - --accept-local-only-risk : keep the project LOCAL (no remote),
+    #         accept the data-loss risk. Recorded as local_only_acknowledged.
+    #       - --defer-remote-push      : push manually later. Recorded as
+    #         push_deferred_acknowledged — and the Phase 1→2 gate WILL block
+    #         until the remote actually has the branch (check-phase-gate.sh
+    #         BL-084 push-verification backstop).
+    #     Absent a flag (non-interactive) or a "yes" (interactive), a
+    #     bypassable-tier push failure is STILL a real failure (default = no
+    #     silent success): print_fail + return 1.
+    #
+    # Eligibility is decided by _bl084_tier_bypassable (keyed on deployment +
+    # poc_mode, NOT `track` — a sponsored/production project can carry
+    # track=light non-interactively). The `# BL-084-TIER-GATE` marker below is
+    # a mutation-proof target: removing the non-bypassable hard-fail branch
+    # flips the Sponsored/Production hard-fail tests RED; reverting
+    # _bl084_tier_bypassable to trust `track` flips the sponsored/production
+    # `--track light` bypass tests RED.
     if ! git push -u origin main 2>/dev/null && ! git push -u origin master 2>/dev/null; then
-      print_fail "Push failed — verify URL and credentials"
-      return 1
+      if ! _bl084_tier_bypassable; then  # BL-084-TIER-GATE
+        # NON-bypassable tier (POC-Sponsored / Production).
+        print_fail "Push failed — a working remote is MANDATORY for POC-Sponsored / Production (organizational or sponsored_poc) projects. Local-only and deferred-push are NOT permitted for this tier."  # lint-fail-emit-exit-status: allow BL-084 sponsored/production hard-fail — the `return 1` below (after 2 remediation-hint lines) propagates to record_init_failure + non-zero exit
+        print_info "Create/repair the remote and re-run, or remediate with:"
+        print_info "  scripts/check-gate.sh --repair     # re-attempt push + verify protection"
+        return 1
+      else
+        # BYPASSABLE tier (Personal / POC-Personal).
+        if [ "${ACCEPT_LOCAL_ONLY_RISK:-false}" = true ]; then
+          print_warn "Push failed — proceeding LOCAL-ONLY at your explicit request (--accept-local-only-risk)."
+          print_warn "DATA-LOSS RISK: this project has NO remote. A lost/failed disk loses ALL work. You accepted this."
+          _record_remote_ack "local_only_acknowledged" "initial push to '$remote_url' failed; operator accepts local-only operation and the data-loss risk"
+          # Legitimate operator choice, on the record — NOT a masked failure.
+          # Deliberately do NOT record pushed_initial (no push happened).
+        elif [ "${DEFER_REMOTE_PUSH:-false}" = true ]; then
+          print_warn "Push failed — DEFERRING the push at your explicit request (--defer-remote-push)."
+          print_warn "You MUST push before advancing Phase 1→2 — the gate WILL block you until the remote has the branch."
+          print_info "  git push -u origin main            # then verify with:"
+          print_info "  scripts/check-gate.sh --preflight"
+          _record_remote_ack "push_deferred_acknowledged" "initial push to '$remote_url' failed; operator will push manually before Phase 1→2"
+          # Deferral is on the record — init may exit 0, but the Phase 1→2
+          # gate enforces the eventual push. Do NOT record pushed_initial.
+        elif [ "$NON_INTERACTIVE" != true ]; then
+          # Interactive bypassable-tier: prompt, default = do NOT proceed.
+          echo ""
+          print_warn "Push to the remote failed (URL may be wrong, repo not yet created, or a proxy blocked it)."
+          echo "  This is a REAL failure. This is a Personal / POC-Personal project, so you MAY proceed anyway — at your own risk:"
+          echo "    [l] local-only  — keep the project LOCAL forever, accept DATA-LOSS risk"
+          echo "    [d] defer       — push manually later (the Phase 1→2 gate will block until you do)"
+          echo "    [N] abort       — treat as a failure (default)"
+          local _push_choice
+          read -rp "Proceed anyway? [l/d/N]: " _push_choice # lint-raw-read-prompt: allow init.sh interactive-only bypassable-tier push-failure escape prompt; non-interactive callers use --accept-local-only-risk / --defer-remote-push (gated by NON_INTERACTIVE check above)
+          case "$_push_choice" in
+            l|L)
+              print_warn "Proceeding LOCAL-ONLY — DATA-LOSS RISK accepted."
+              _record_remote_ack "local_only_acknowledged" "initial push to '$remote_url' failed; operator accepts local-only operation and the data-loss risk (interactive)"
+              ;;
+            d|D)
+              print_warn "DEFERRING the push — the Phase 1→2 gate will block until the remote has the branch."
+              _record_remote_ack "push_deferred_acknowledged" "initial push to '$remote_url' failed; operator will push manually before Phase 1→2 (interactive)"
+              ;;
+            *)
+              print_fail "Push failed — verify URL and credentials (no acknowledged escape chosen)."
+              return 1
+              ;;
+          esac
+        else
+          # Non-interactive bypassable-tier with NO escape flag: real failure.
+          print_fail "Push failed — verify URL and credentials."  # lint-fail-emit-exit-status: allow BL-084 bypassable-tier default failure — the `return 1` below (after 3 escape-flag-hint lines) propagates to record_init_failure + non-zero exit
+          print_info "This is a real failure. To proceed anyway (Personal / POC-Personal only), re-run with ONE of:"
+          print_info "  --accept-local-only-risk   # keep the project local, accept the data-loss risk"
+          print_info "  --defer-remote-push        # push manually later (Phase 1→2 gate blocks until you do)"
+          return 1
+        fi
+      fi
+    else
+      _record_phase2_step "pushed_initial"
     fi
   else
     # First-class host: dispatcher + driver
@@ -1898,35 +2502,56 @@ MANIFESTEOF
     print_ok "Remote created at $remote_url"
 
     host_register_remote "$remote_url"
+    _record_phase2_step "remote_repo_created"
 
     print_info "Pushing initial commit..."
     # Try main first, fall back to master
-    host_push_initial main 2>/dev/null || host_push_initial master || { print_fail "Push failed — $remote_url exists but empty"; return 1; }
+    host_push_initial main 2>/dev/null || host_push_initial master || { print_fail "Push failed — $remote_url exists but empty"; return 1; } # lint-diag-ok: BL-197 — first-attempt noise only; the DECISIVE second attempt (master) is unsilenced, so the failing path still reaches the operator with the host's own words
+    _record_phase2_step "pushed_initial"
 
     print_info "Configuring branch protection ($mode mode)..."
-    # BL-002: capture exit code 3 for github free-tier 403 (host_configure_protection
-    # detects the "Upgrade to GitHub Pro" pattern). Fall through to the attestation
-    # flow shared with the --git-host other path so init can complete cleanly.
+    # BL-002 / BL-031 / BL-032: exit codes 3 and 4 are both host-agnostic
+    # "expected partial failure — attestation fallback is appropriate"
+    # signals. The github driver returns 3 on free-tier 403; the gitlab
+    # driver returns 3 on a generic approvals PUT failure and 4 on the
+    # specific Premium-only failure (BL-032 / code-host-gitlab-8). Both
+    # route to the same attestation flow — the driver itself emits host-
+    # specific remediation on stderr BEFORE this block runs, so we echo a
+    # host-agnostic summary and defer detail to the driver (BL-031).
+    #
+    # BL-032 proactive attestation: when --approvals-attested is set (or
+    # the SOLO_APPROVALS_ATTESTED=1 env var is exported by an outer
+    # harness), the gitlab driver skips the approvals PUT entirely and
+    # emits a WARN pointing operators at Settings > Merge requests.
+    # host_configure_protection returns 0, so we take the success branch
+    # below and record the `gitlab_free_tier_approvals` reason separately.
+    if [ "${APPROVALS_ATTESTED:-false}" = true ]; then
+      export SOLO_APPROVALS_ATTESTED=1
+    fi
     local _hcp_rc=0
     host_configure_protection main "$mode" || _hcp_rc=$?
-    if [ "$_hcp_rc" -ne 0 ] && [ "$_hcp_rc" -ne 3 ]; then
+    if [ "$_hcp_rc" -ne 0 ] && [ "$_hcp_rc" -ne 3 ] && [ "$_hcp_rc" -ne 4 ]; then
       _hcp_rc=0
       host_configure_protection master "$mode" || _hcp_rc=$?
     fi
 
-    if [ "$_hcp_rc" -eq 3 ]; then
-      print_warn "Branch protection unavailable on this repo (free-tier limit)."
-      print_info "Falling back to attestation flow — see remediation message above."
+    if [ "$_hcp_rc" -eq 3 ] || [ "$_hcp_rc" -eq 4 ]; then
+      print_warn "Branch protection unavailable via standard API on this $host repo."
+      print_info "Falling back to attestation flow — see $host driver remediation message above."
       local attest
       if [ "${BRANCH_PROTECTION_ATTESTED:-false}" = true ]; then
         attest="yes"
         print_info "Branch protection attested via --branch-protection-attested flag."
       else
-        read -rp "Attest that protection will be enforced manually until you upgrade? [type 'yes' to attest]: " attest
+        read -rp "Attest that protection will be enforced manually? [type 'yes' to attest]: " attest # lint-raw-read-prompt: allow init.sh interactive-only attestation (manual-enforcement branch); gated by BRANCH_PROTECTION_ATTESTED env-var fast-path at line 2038 above for non-interactive callers (BL-016)
       fi
-      [ "$attest" != "yes" ] && { print_fail "Attestation required — cannot proceed (or upgrade to GitHub Pro)"; return 1; }
+      [ "$attest" != "yes" ] && { print_fail "Attestation required — cannot proceed (see $host driver remediation above)"; return 1; }
       # Record attestation with the github_free_tier reason so check-gate.sh
-      # --preflight skips the API verify.
+      # --preflight skips the API verify. The reason string is retained for
+      # backward compat with check-gate.sh and tests/test-check-gate.sh::T5;
+      # broadening the reason taxonomy is out of scope for BL-031 (UX-only
+      # fix). Downstream code reads the reason as a "skip API verify" sentinel
+      # regardless of host, so the wording is harmless for non-github paths.
       mkdir -p .claude
       if [ ! -f .claude/process-state.json ]; then
         echo '{"phase2_init":{"steps_completed":[],"attestations":{}}}' > .claude/process-state.json
@@ -1935,11 +2560,37 @@ MANIFESTEOF
          '.phase2_init.attestations.branch_protection = {attested_by: "orchestrator", at: $at, reason: "github_free_tier"}' \
          .claude/process-state.json > .claude/process-state.json.tmp \
          && mv .claude/process-state.json.tmp .claude/process-state.json
-      print_ok "Free-tier attestation recorded — check-gate.sh --preflight will honor it."
+      print_ok "Partial-protection attestation recorded — check-gate.sh --preflight will honor it."
+      # Tier-limited attestation IS the configured + verified state for this host
+      # (per spec category 6 / BL-002). Record both steps so --repair short-circuits.
+      _record_phase2_step "branch_protection_configured"
+      _record_phase2_step "branch_protection_verified"
     elif [ "$_hcp_rc" -ne 0 ]; then
       print_fail "Protection config failed — run 'scripts/check-gate.sh --repair' after troubleshooting"
       return 1
     else
+      _record_phase2_step "branch_protection_configured"
+      # BL-032 proactive path: when the operator pre-attested with
+      # --approvals-attested AND we're on gitlab in org mode, the driver
+      # took the SOLO_APPROVALS_ATTESTED shortcircuit (skipped the
+      # approvals PUT + emitted a WARN). Record the
+      # `gitlab_free_tier_approvals` attestation so check-gate.sh +
+      # check-phase-gate.sh honor it as the gate-pass. The
+      # host_verify_protection call below would still succeed on gitlab
+      # for the protected_branches half of the config, but the
+      # attestation IS the load-bearing gate on the approvals half —
+      # match the reactive-path discipline.
+      if [ "${APPROVALS_ATTESTED:-false}" = true ] && [ "$host" = "gitlab" ] && [ "$mode" = "org" ]; then
+        mkdir -p .claude
+        if [ ! -f .claude/process-state.json ]; then
+          echo '{"phase2_init":{"steps_completed":[],"attestations":{}}}' > .claude/process-state.json
+        fi
+        jq --arg at "$(date -u +%FT%TZ)" \
+           '.phase2_init.attestations.branch_protection = {attested_by: "orchestrator", at: $at, reason: "gitlab_free_tier_approvals"}' \
+           .claude/process-state.json > .claude/process-state.json.tmp \
+           && mv .claude/process-state.json.tmp .claude/process-state.json
+        print_ok "GitLab Free tier approvals attestation recorded (reason: gitlab_free_tier_approvals) — check-gate.sh --preflight will honor it."
+      fi
       print_info "Verifying protection..."
       if ! host_verify_protection main "$mode" 2>/dev/null && ! host_verify_protection master "$mode"; then
         # Retry once for API lag
@@ -1950,6 +2601,7 @@ MANIFESTEOF
         fi
       fi
       print_ok "Protection verified for $mode mode"
+      _record_phase2_step "branch_protection_verified"
     fi
   fi
 
@@ -1966,11 +2618,24 @@ MANIFESTEOF
 MANIFESTEOF
   fi
 
-  # Mark phase2_init steps complete
+  # BL-099 / BL-110: the soloFrameworkCommit birth-stamp used to live HERE
+  # (remote path only) — which left every --no-remote-creation scaffold born
+  # with NO pin (BL-110: the anchor of the Currency System absent on the
+  # blessed hermetic flow). The stamp now lives at the UNIVERSAL manifest-seed
+  # site in prepare_initial_state_for_commit (# BL-110-PIN-UNIVERSAL), which
+  # runs on EVERY path before this function — by the time this branch
+  # executes, the pin is already present. Nothing to do here.
+
+  # Trailing dedup pass. The named steps (remote_repo_created, pushed_initial,
+  # branch_protection_configured, branch_protection_verified) are now written
+  # incrementally above via _record_phase2_step after each successful host_
+  # call. The single batched write that used to live here was the spec drift
+  # closed by audit finding specs-plans-host-aware-2 — it left no
+  # intermediate state for scripts/check-gate.sh --repair to resume from.
   if [ ! -f .claude/process-state.json ]; then
     echo '{"phase2_init":{"steps_completed":[]}}' > .claude/process-state.json
   fi
-  jq '.phase2_init.steps_completed += ["remote_repo_created","branch_protection_configured"] | .phase2_init.steps_completed |= unique' \
+  jq '.phase2_init.steps_completed = ((.phase2_init.steps_completed // []) | unique)' \
      .claude/process-state.json > .claude/process-state.json.tmp \
      && mv .claude/process-state.json.tmp .claude/process-state.json
 }
@@ -1981,162 +2646,87 @@ MANIFESTEOF
 install_precommit_hook() {
   mkdir -p .git/hooks
 
-  # Determine source file extensions and test patterns for this language
-  local src_ext test_pattern
+  # BL-099: the fallback pre-commit hook body is generated by the shared
+  # soif_write_precommit_hook (scripts/lib/hook-templates.sh) so init.sh and
+  # scripts/upgrade-project.sh --sync-framework emit byte-identical hooks. The
+  # language->test-pattern table also lives there (soif_lang_test_pattern).
+  local test_pattern
+  test_pattern="$(soif_lang_test_pattern "$LANGUAGE")"
+
+  soif_write_precommit_hook ".git/hooks/pre-commit"
+  print_ok "Pre-commit hook installed (gitleaks + Semgrep + schema migration checks)"
+
+  # BL-072 Phase C2 + BL-107: install the tier-keyed TDD-ordering gate as a
+  # COMMIT-MSG hook -- the only git-hook point where .git/COMMIT_EDITMSG holds
+  # the CURRENT commit message (a pre-commit hook sees a stale message) and the
+  # staged index is intact.
+  #
+  # BL-107-UNIVERSAL-INSTALL: installed for EVERY language. It used to be
+  # skipped when soif_lang_test_pattern was empty (rust, `other`) — which
+  # silently left two whole language axes with NO TDD gate and NO BL-006
+  # message check, including on organizational/sponsored tiers where the docs
+  # advertise the block as non-bypassable. The gate's classifier is
+  # language-agnostic (tests/ trees + a cross-language filename table), and
+  # inline Rust tests are seen by the # BL-107-RUST-INLINE-TESTS content probe
+  # in pre-commit-gate.sh — so universal install is both safe and owed.
+  install_tdd_commit_msg_hook
   case "$LANGUAGE" in
-    typescript|javascript) src_ext="ts|tsx|js|jsx"; test_pattern="\\.(test|spec)\\.(ts|tsx|js|jsx)$" ;;
-    python)                src_ext="py";            test_pattern="(test_.*|.*_test)\\.py$" ;;
-    rust)                  src_ext="rs";            test_pattern="" ;;  # Rust tests are inline (#[cfg(test)])
-    csharp)                src_ext="cs";            test_pattern="Tests?\\.cs$" ;;
-    kotlin)                src_ext="kt";            test_pattern="Test\\.kt$" ;;
-    java)                  src_ext="java";          test_pattern="Test\\.java$" ;;
-    go)                    src_ext="go";            test_pattern="_test\\.go$" ;;
-    dart)                  src_ext="dart";          test_pattern="_test\\.dart$" ;;
-    swift)                 src_ext="swift";         test_pattern="Tests?\\.swift$" ;;
-    *)                     src_ext="";              test_pattern="" ;;
+    rust)
+      print_info "TDD gate note (rust): inline #[test]/#[cfg(test)] additions in staged .rs diffs count as tests (content probe); tests/-tree files and *_test.rs count by path." ;;
+    *)
+      if [ -z "$test_pattern" ]; then
+        print_info "TDD gate note (${LANGUAGE:-unknown}): no language-specific test-file convention — the gate uses the generic conventions (tests/ trees + common test-file names). Name your tests accordingly or they will not be recognized."
+      fi ;;
   esac
+}
 
-  cat > .git/hooks/pre-commit << 'HOOKEOF'
-#!/usr/bin/env bash
-# Solo Orchestrator — Fallback Pre-Commit Hook
-# Provides baseline enforcement: secret detection + SAST + test co-location check.
-# If Development Guardrails for Claude Code is active, its hooks provide deeper coverage.
-
-set -euo pipefail
-
-FAILED=0
-
-# --- Secret Detection (gitleaks) ---
-if command -v gitleaks &>/dev/null; then
-  if ! gitleaks git --staged 2>/dev/null; then
-    echo ""
-    echo "[BLOCKED] gitleaks detected secrets in staged files."
-    echo "  Remove the secrets, use environment variables or a secrets manager,"
-    echo "  and rotate any credentials that were exposed."
-    FAILED=1
+# install_tdd_commit_msg_hook — idempotently add a managed block to
+# .git/hooks/commit-msg that delegates to the framework gate's two message-scoped
+# commit-msg enforcers (`pre-commit-gate.sh --terminal-mode --tdd-only`): the
+# tier-keyed TDD-ordering gate (BL-072 C2) AND the BL-006 Build-Loop
+# commit-message check (BL-010) — the latter extends BL-006 to editor-opened /
+# human-terminal commits, which the AI-only PreToolUse hook cannot reach. A
+# non-zero exit aborts the commit. Composes with an existing commit-msg hook via
+# a marked block; graceful no-op if the gate script is absent at commit time.
+install_tdd_commit_msg_hook() {
+  local hook=".git/hooks/commit-msg"
+  # BL-099: markers + block body come from the shared hook-templates lib
+  # (SOIF_TDD_OPEN / soif_emit_tdd_commitmsg_block) so init.sh and the sync
+  # path stay byte-identical. Emission is unchanged from the pre-refactor
+  # inline `{ echo ""; echo "$mark_open"; ... }` — proven byte-for-byte.
+  mkdir -p .git/hooks
+  if [ ! -f "$hook" ]; then
+    printf '%s\n' '#!/usr/bin/env bash' > "$hook"
   fi
-else
-  echo "[WARN] gitleaks not found — secret detection skipped."
-  echo "  Install: brew install gitleaks (macOS) or https://github.com/gitleaks/gitleaks/releases"
-fi
-
-
-# --- SAST Quick Scan (Semgrep) ---
-if command -v semgrep &>/dev/null; then
-  # Scan only staged files for fast pre-commit feedback
-  staged_files=$(git diff --cached --name-only --diff-filter=ACM)
-  if [ -n "$staged_files" ]; then
-    if ! git diff --cached --name-only --diff-filter=ACM -z | xargs -0 semgrep scan --config=p/owasp-top-ten --quiet --no-git-ignore 2>/dev/null; then
-      echo ""
-      echo "[BLOCKED] Semgrep detected security issues in staged files."
-      echo "  Review and fix the findings above before committing."
-      FAILED=1
-    fi
+  if grep -qF "$SOIF_TDD_OPEN" "$hook" 2>/dev/null; then
+    chmod +x "$hook"
+    print_ok "TDD ordering gate already present in commit-msg hook (idempotent)"
+    return 0
   fi
-else
-  echo "[WARN] semgrep not found — pre-commit SAST skipped."
-  echo "  Install: brew install semgrep (macOS) or pip install semgrep"
-fi
-
-HOOKEOF
-
-  # Append the TDD ordering check only if we have a meaningful pattern
-  # (Rust uses inline tests so TDD ordering check doesn't apply)
-  if [ -n "$test_pattern" ] && [ -n "$src_ext" ]; then
-    cat >> .git/hooks/pre-commit << TDDEOF
-
-# --- TDD Ordering Check ---
-# Warns when implementation files are staged without any test files in the same commit.
-SRC_EXT_PATTERN="\\.(${src_ext})$"
-TEST_PATTERN="${test_pattern}"
-
-staged_impl=\$(git diff --cached --name-only --diff-filter=ACM \\
-  | grep -E "\$SRC_EXT_PATTERN" \\
-  | grep -vE "\$TEST_PATTERN" \\
-  | grep -vE "(config|setup|migration|seed|fixture|generated|__mocks__|\.d\.)" \\
-  || true)
-
-staged_tests=\$(git diff --cached --name-only --diff-filter=ACM \\
-  | grep -E "\$TEST_PATTERN" \\
-  || true)
-
-if [ -n "\$staged_impl" ] && [ -z "\$staged_tests" ]; then
-  echo ""
-  echo "[WARN] Implementation files staged without any test files:"
-  echo "\$staged_impl" | head -10 | sed 's/^/  /'
-  count=\$(echo "\$staged_impl" | wc -l | tr -d ' ')
-  [ "\$count" -gt 10 ] && echo "  ... and \$((\$count - 10)) more"
-  echo ""
-  echo "  The Solo Orchestrator methodology requires test-first development."
-  echo "  Consider committing tests before or alongside implementation."
-  echo "  (This is a warning — commit is not blocked.)"
-fi
-TDDEOF
-  fi
-
-  # Append the schema migration check (active in Phase 2+ only)
-  cat >> .git/hooks/pre-commit << 'SCHEMAEOF'
-
-# --- Schema Migration Check ---
-# Warns when schema files are edited directly instead of through migrations (Phase 2+).
-PHASE_STATE=".claude/phase-state.json"
-CURRENT_PHASE=0
-if [ -f "$PHASE_STATE" ]; then
-  CURRENT_PHASE=$(grep -o '"current_phase"[[:space:]]*:[[:space:]]*"*[0-9][0-9]*"*' \
-    "$PHASE_STATE" | grep -o '[0-9][0-9]*' || echo "0")
-fi
-
-if [ "$CURRENT_PHASE" -ge 2 ]; then
-  SCHEMA_PATTERNS='(schema\.prisma|schema\.sql|schema\.rb|models\.py|\.schema\.ts|\.entity\.ts|schema\.graphql)$'
-  staged_schema=$(git diff --cached --name-only --diff-filter=ACM \
-    | grep -E "$SCHEMA_PATTERNS" \
-    | grep -vE '(migrations?/|migrate/)' \
-    || true)
-
-  if [ -n "$staged_schema" ]; then
-    echo ""
-    echo "[WARN] Direct schema file changes detected (Phase $CURRENT_PHASE):"
-    echo "$staged_schema" | sed 's/^/  /'
-    echo ""
-    echo "  The Solo Orchestrator methodology requires data model changes"
-    echo "  through versioned migrations, not direct schema edits."
-    echo "  If this is intentional (e.g., Prisma schema before migration gen),"
-    echo "  this warning can be ignored."
-    echo "  (This is a warning — commit is not blocked.)"
-  fi
-fi
-SCHEMAEOF
-
-  # Append exit
-  cat >> .git/hooks/pre-commit << 'EXITEOF'
-
-exit $FAILED
-EXITEOF
-
-  chmod +x .git/hooks/pre-commit
-  print_ok "Pre-commit hook installed (gitleaks + Semgrep + TDD ordering + schema migration checks)"
+  soif_emit_tdd_commitmsg_block >> "$hook"
+  chmod +x "$hook"
+  print_ok "TDD ordering gate installed (commit-msg hook, tier-keyed hard block)"
 }
 
 # ================================================================
 # Template Generators
 # ================================================================
 generate_claude_md() {
-  sed -e "s|__PROJECT_NAME__|$PROJECT_NAME|g" \
-      -e "s|__PROJECT_DESCRIPTION__|$PROJECT_DESCRIPTION|g" \
-      -e "s|__PLATFORM__|$PLATFORM|g" \
-      -e "s|__TRACK__|$TRACK|g" \
-      -e "s|__LANGUAGE__|$LANGUAGE|g" \
-      -e "s|__TEST_INTERVAL__|$TEST_INTERVAL|g" \
-      "$SCRIPT_DIR/templates/generated/claude-md.tmpl" > CLAUDE.md
+  # BL-109 S3 / BL-101: render via the shared parameterized generator (the exact
+  # former inline sed + organizational-append body now lives in
+  # scripts/lib/render-project-docs.sh). Byte-identical on identical inputs; the
+  # Currency System's plan-time three-way merge re-renders through the SAME
+  # function so template improvements land without placeholder injection.
+  soif_render_claude_md "$SCRIPT_DIR/templates/generated/claude-md.tmpl" CLAUDE.md \
+    "$PROJECT_NAME" "$PROJECT_DESCRIPTION" "$PLATFORM" "$TRACK" "$LANGUAGE" \
+    "$TEST_INTERVAL" "$DEPLOYMENT"
 
-  # Add compliance note for organizational deployments
-  if [ "$DEPLOYMENT" = "organizational" ]; then
-    cat >> CLAUDE.md << 'COMPEOF'
-
-### Branch Protection (Organizational Deployments)
-Branch protection with required reviewers is recommended for organizational deployments and will be required when compliance modules are available. Until then, the Orchestrator creates and merges their own PRs with phase gate review at milestones. When branch protection is enabled, PRs require an independent reviewer before merge — this provides per-change code review that strengthens the governance audit trail.
-COMPEOF
-  fi
+  # BL-109-CURRENCY: capture the A1 render base for CLAUDE.md HERE — at the end of
+  # its render (sed substitution + the conditional organizational append) — so the
+  # output sha is the render-time truth, never a post-hoc hash (a MAJOR per the
+  # verify focus). {template sha, rendered-output sha}.
+  soif_currency_record_render_base A1 CLAUDE.md \
+    "$SCRIPT_DIR/templates/generated/claude-md.tmpl" CLAUDE.md
 }
 
 generate_approval_log() {
@@ -2156,6 +2746,17 @@ generate_approval_log() {
 
 generate_gitignore() {
   cp "$SCRIPT_DIR/templates/generated/gitignore-base.tmpl" .gitignore
+
+  # BL-109 S2 (Currency System, Layer 1): the session-start freshness detector's
+  # atomic cache (snooze store + warm-cache marker). Operational state, never
+  # project content — invariant I7 confines detection's only project-tree write
+  # to `.claude/cache/`, which must therefore be gitignored so it never dirties
+  # the tree or shows up as a diff.
+  cat >> .gitignore << 'CACHEEOF'
+
+# BL-109 freshness detector cache (session-start Currency System state)
+.claude/cache/
+CACHEEOF
 
   # Add platform-specific ignores
   case "$PLATFORM" in
@@ -2298,28 +2899,28 @@ SOEOF
 get_release_vars() {
   case "$LANGUAGE" in
     typescript|javascript)
-      RELEASE_SETUP_ACTION="actions/setup-node@v4"
+      RELEASE_SETUP_ACTION="actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7 (v7.0.0)"
       RELEASE_SETUP_VERSION_KEY="node-version"
       RELEASE_SETUP_VERSION_VALUE="'lts/*'"
       RELEASE_INSTALL_COMMAND="npm ci"
       RELEASE_BUILD_COMMAND="npm run build"
       ;;
     python)
-      RELEASE_SETUP_ACTION="actions/setup-python@v5"
+      RELEASE_SETUP_ACTION="actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7 (v7.0.0)"
       RELEASE_SETUP_VERSION_KEY="python-version"
       RELEASE_SETUP_VERSION_VALUE="'3.x'"
       RELEASE_INSTALL_COMMAND="pip install -r requirements.txt"
       RELEASE_BUILD_COMMAND="python -m build"
       ;;
     rust)
-      RELEASE_SETUP_ACTION="dtolnay/rust-toolchain@stable"
+      RELEASE_SETUP_ACTION="dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch head 2026-07-21"
       RELEASE_SETUP_VERSION_KEY="toolchain"
       RELEASE_SETUP_VERSION_VALUE="stable"
       RELEASE_INSTALL_COMMAND="echo 'No separate install step for Rust'"
       RELEASE_BUILD_COMMAND="cargo build --release"
       ;;
     csharp)
-      RELEASE_SETUP_ACTION="actions/setup-dotnet@v4"
+      RELEASE_SETUP_ACTION="actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6 (v6.0.0)"
       RELEASE_SETUP_VERSION_KEY="dotnet-version"
       # Current LTS — update when next LTS releases
       RELEASE_SETUP_VERSION_VALUE="'8.0.x'"
@@ -2327,7 +2928,7 @@ get_release_vars() {
       RELEASE_BUILD_COMMAND="dotnet build --configuration Release"
       ;;
     kotlin|java)
-      RELEASE_SETUP_ACTION="actions/setup-java@v4"
+      RELEASE_SETUP_ACTION="actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5 (v5.6.0)"
       RELEASE_SETUP_VERSION_KEY="java-version"
       # Current LTS — update when next LTS releases
       RELEASE_SETUP_VERSION_VALUE="'21'"
@@ -2335,14 +2936,14 @@ get_release_vars() {
       RELEASE_BUILD_COMMAND="./gradlew build"
       ;;
     go)
-      RELEASE_SETUP_ACTION="actions/setup-go@v5"
+      RELEASE_SETUP_ACTION="actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7 (v7.0.0)"
       RELEASE_SETUP_VERSION_KEY="go-version"
       RELEASE_SETUP_VERSION_VALUE="'stable'"
       RELEASE_INSTALL_COMMAND="echo 'Go modules download automatically'"
       RELEASE_BUILD_COMMAND="go build ./..."
       ;;
     dart)
-      RELEASE_SETUP_ACTION="subosito/flutter-action@v2"
+      RELEASE_SETUP_ACTION="subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2 (v2.23.0)"
       RELEASE_SETUP_VERSION_KEY="channel"
       RELEASE_SETUP_VERSION_VALUE="'stable'"
       RELEASE_INSTALL_COMMAND="flutter pub get"
@@ -2385,10 +2986,14 @@ generate_ci() {
     *)                     ci_template="other.yml" ;;
   esac
 
-  # Host-aware template selection (spec 2026-04-21). Read host from intake
-  # progress if available; default to github. Copy to host-appropriate path.
+  # Host-aware template selection (spec 2026-04-21). Prefer the in-process
+  # GIT_HOST var (set from --git-host in non-interactive mode), then fall
+  # back to intake-progress.json (set by intake-wizard.sh in interactive
+  # mode), then default to github.
   local host="github"
-  if [ -f .claude/intake-progress.json ]; then
+  if [ -n "${GIT_HOST:-}" ]; then
+    host="$GIT_HOST"
+  elif [ -f .claude/intake-progress.json ]; then
     host=$(jq -r '.answers.git_host // "github"' .claude/intake-progress.json 2>/dev/null || echo "github")
   fi
 
@@ -2416,9 +3021,13 @@ generate_ci() {
 }
 
 generate_release() {
-  # Host-aware release template selection (spec 2026-04-21).
+  # Host-aware release template selection (spec 2026-04-21). Prefer the
+  # in-process GIT_HOST var (set from --git-host) over intake-progress.json
+  # so non-interactive mode honors the flag.
   local host="github"
-  if [ -f .claude/intake-progress.json ]; then
+  if [ -n "${GIT_HOST:-}" ]; then
+    host="$GIT_HOST"
+  elif [ -f .claude/intake-progress.json ]; then
     host=$(jq -r '.answers.git_host // "github"' .claude/intake-progress.json 2>/dev/null || echo "github")
   fi
 
@@ -2430,21 +3039,51 @@ generate_release() {
     return 0
   fi
 
-  mkdir -p .github/workflows
+  # Host-specific output path: GitHub workflows live under .github/workflows,
+  # GitLab pipelines under .gitlab-ci/, Bitbucket under bitbucket-pipelines/
+  # (deploy phase is appended to bitbucket-pipelines.yml via include).
+  local target_dir target_file
+  case "$host" in
+    github)
+      target_dir=".github/workflows"
+      target_file="$target_dir/release.yml"
+      ;;
+    gitlab)
+      target_dir=".gitlab-ci"
+      target_file="$target_dir/release.yml"
+      ;;
+    bitbucket)
+      target_dir="bitbucket-pipelines"
+      target_file="$target_dir/release.yml"
+      ;;
+    *)
+      print_warn "Unknown host '$host'; defaulting release output to .github/workflows/release.yml"
+      target_dir=".github/workflows"
+      target_file="$target_dir/release.yml"
+      ;;
+  esac
+  mkdir -p "$target_dir"
 
   # Get language-specific build variables
   get_release_vars
 
   # Substitute placeholders into the release template
-  sed -e "s|__SETUP_ACTION__|$RELEASE_SETUP_ACTION|g" \
+  # BL-113: strip the template-only marker comment BEFORE substituting the
+  # placeholder. That comment carries the scanner suppression which keeps the
+  # TEMPLATE itself scan-clean, and it MUST NOT reach a generated project — a
+  # shipped suppression would silence the mutable-action-tag rule on that line in
+  # every downstream repo. Stripping is keyed on the marker token alone so no
+  # suppression directive text exists in any shipped script either.
+  sed -e 's|[[:space:]]*#.*__SOLO_TEMPLATE_ONLY__[[:space:]]*$||' \
+      -e "s|__SETUP_ACTION__|$RELEASE_SETUP_ACTION|g" \
       -e "s|__SETUP_VERSION_KEY__|$RELEASE_SETUP_VERSION_KEY|g" \
       -e "s|__SETUP_VERSION_VALUE__|$RELEASE_SETUP_VERSION_VALUE|g" \
       -e "s|__INSTALL_COMMAND__|$RELEASE_INSTALL_COMMAND|g" \
       -e "s|__BUILD_COMMAND__|$RELEASE_BUILD_COMMAND|g" \
       -e "s|__PROJECT_NAME__|$PROJECT_NAME|g" \
-      "$release_template" > .github/workflows/release.yml
+      "$release_template" > "$target_file"
 
-  print_info "Release pipeline created at .github/workflows/release.yml (platform: $PLATFORM)"
+  print_info "Release pipeline created at $target_file (host: $host, platform: $PLATFORM)"
   case "$TRACK" in
     light)
       print_info "Release pipeline is optional for light-track projects. Configure TODOs only if distributing externally."
@@ -2515,6 +3154,29 @@ print_next_steps() {
   echo -e "${BOLD}Project:${NC} $PROJECT_NAME"
   echo -e "${BOLD}Location:${NC} $PROJECT_DIR"
   echo ""
+  # BL-204-REMOTE-WHY (finding 8): state plainly what the remote is FOR, at
+  # the one screen every successful run ends on. Pre-fix this framing appeared
+  # ONLY inside the data-loss warning arm — i.e. only to users who had already
+  # hit a failure — so the users whose remote worked never learned what it was
+  # protecting them from, and the users whose remote did NOT work met the idea
+  # for the first time in an error message.
+  local _bl204_remote_url=""
+  if command -v jq >/dev/null 2>&1 && [ -f "$PROJECT_DIR/.claude/manifest.json" ]; then
+    _bl204_remote_url=$(jq -r '.remote_url // empty' "$PROJECT_DIR/.claude/manifest.json" 2>/dev/null || echo "")
+  fi
+  echo -e "${BOLD}Your backup:${NC}"
+  if [ -n "$_bl204_remote_url" ]; then
+    echo "  $_bl204_remote_url"
+    echo "  That remote is your backup — the copy that lives somewhere other than this"
+    echo "  machine. Keep pushing to it. If this disk dies and the work is only here,"
+    echo "  all of it is gone."
+  else
+    echo "  NONE YET — this project exists only on this disk."
+    echo "  A remote is your backup: the copy that lives somewhere other than this"
+    echo "  machine. Until you have one, a lost or failed disk loses all of the work."
+    echo "  Set one up with: cd $PROJECT_DIR && scripts/check-gate.sh --repair"
+  fi
+  echo ""
   echo -e "${BOLD}Next Steps:${NC}"
   echo ""
   echo "  1. AUTHENTICATE (manual — requires browser):"
@@ -2526,6 +3188,8 @@ print_next_steps() {
   echo "     cd $PROJECT_DIR"
   echo "     bash scripts/intake-wizard.sh          — guided wizard (interactive or AI-assisted)"
   echo "     Or edit directly: $PROJECT_DIR/PROJECT_INTAKE.md"
+  echo "     When the intake is done, 'bash scripts/resume.sh' prints the exact"
+  echo "     first message to paste into Claude Code."
   echo ""
   echo "     IMPORTANT: Run the wizard and edit the intake from your PROJECT directory,"
   echo "     not from the solo-orchestrator source directory."
@@ -2573,21 +3237,10 @@ print_next_steps() {
   echo "     cd $PROJECT_DIR"
   echo "     claude"
   echo ""
-  echo "     Then give the agent the full project context:"
-  echo "     ┌─────────────────────────────────────────────────────────────────┐"
-  echo "     │ Read the following files in order, then confirm what you        │"
-  echo "     │ understand about this project before taking any action:         │"
-  echo "     │                                                                 │"
-  echo "     │ 1. CLAUDE.md (your instructions and constraints)                │"
-  echo "     │ 2. PROJECT_INTAKE.md (the product definition)                   │"
-  echo "     │ 3. docs/reference/builders-guide.md (the phase-gate method)     │"
-  echo "     │ 4. docs/platform-modules/ (platform-specific guidance)          │"
-  echo "     │ 5. .claude/phase-state.json (current phase)                     │"
-  echo "     │                                                                 │"
-  echo "     │ After reading, summarize: the project goal, your constraints,   │"
-  echo "     │ the current phase, and what tools/MCP servers are available to   │"
-  echo "     │ you. Then begin Phase 0. Ask me only for clarifying questions.  │"
-  echo "     └─────────────────────────────────────────────────────────────────┘"
+  echo "     Then paste the first message printed by:  bash scripts/resume.sh"
+  echo "     (state-aware: it prints the intake prompt, the Phase-0 initialization"
+  echo "     prompt from PROJECT_INTAKE.md Section 13, or the resume prompt — and a"
+  echo "     blank Claude Code screen means it is ready and waiting, not stuck)"
   echo ""
 
   if [ -f "$PROJECT_DIR/.github/workflows/release.yml" ]; then
@@ -2640,6 +3293,52 @@ print_next_steps() {
 }
 
 # ================================================================
+# BL-064: Setup-INCOMPLETE summary (silent-success defect class)
+# ================================================================
+# Printed in place of "Setup Complete" when INIT_FAILURES is non-empty.
+# Re-lists every tracked failure so an operator scanning only the tail of
+# the log still sees the gap, regardless of whether they checked the exit
+# code. main() calls this and returns 2 when failures occurred.
+#
+# Failure categorisation:
+#   • Currently tracked: host repo setup (create_and_protect_remote
+#     return-1 paths — push fail, attestation missing, host CLI missing,
+#     protection config fail, verification fail).
+#   • NOT tracked (terminal-exit paths): missing prerequisites (line
+#     112-area + 322), incompatible OS/language (519, interactive
+#     recovery), --enforcement-level validation (3693, 3698). All of
+#     these already terminate via `exit 1` before reaching main()'s
+#     completion path, so no Setup-Complete banner can appear.
+#
+# See scripts/lint-fail-emit-exit-status.sh for the structural backstop
+# that prevents new print_fail sites from regressing this contract.
+print_init_failures_summary() {
+  local n="${#INIT_FAILURES[@]}"
+  echo ""
+  echo -e "${BOLD}${RED}╔══════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${RED}║                   Setup INCOMPLETE                       ║${NC}"
+  echo -e "${BOLD}${RED}╚══════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "${BOLD}${RED}${n} failure(s) occurred during init:${NC}"
+  local i=1
+  local msg
+  for msg in "${INIT_FAILURES[@]}"; do
+    echo -e "  ${RED}${i}.${NC} ${msg}"
+    i=$((i + 1))
+  done
+  echo ""
+  echo -e "${BOLD}Project files are in place; some setup steps did NOT complete.${NC}"
+  echo ""
+  echo "Typical remediation (consult the [FAIL] lines above for specifics):"
+  echo "  scripts/check-gate.sh --backfill-host    # if .claude/manifest.json lacks 'host'"
+  echo "  scripts/check-gate.sh --repair           # re-create remote + branch protection"
+  echo "  scripts/check-gate.sh --preflight        # verify the remote is set up correctly"
+  echo ""
+  echo "Exit status: 2 (init produced [FAIL] line(s) — wrapper scripts must observe)"
+  echo ""
+}
+
+# ================================================================
 dry_run_summary() {
   echo ""
   print_step "DRY RUN SUMMARY"
@@ -2647,10 +3346,32 @@ dry_run_summary() {
 
   echo -e "${BOLD}Project:${NC}"
   echo "  Name:      $PROJECT_NAME"
+  # BL-040 (2026-06-30): echo the operator-supplied description so the
+  # dry-run preview reflects every input that will be persisted to
+  # PROJECT_INTAKE.md / manifest. Omit the line entirely when the value
+  # is empty (keeps the summary clean for the "no description provided"
+  # default). Newlines and tabs are collapsed to spaces so a multi-line
+  # value reachable through --description $'foo\nbar' doesn't break the
+  # one-line-per-field column layout below.
+  if [ -n "${PROJECT_DESCRIPTION:-}" ]; then
+    local _summary_desc
+    _summary_desc=$(printf '%s' "$PROJECT_DESCRIPTION" | tr '\n\t' '  ')
+    echo "  Description: $_summary_desc"
+  fi
   echo "  Platform:  $PLATFORM"
   echo "  Track:     $TRACK"
   echo "  Language:  $LANGUAGE"
   echo "  Directory: $PROJECT_DIR"
+  # BL-180-DRYRUN-ENFORCEMENT: surface the RESOLVED enforcement level on
+  # STDOUT. The sibling log_line "…" calls in main() write to the log FILE
+  # only, so a piped fixture cannot observe them — which is why BL-180 (the
+  # interactive arm never resolving ENFORCEMENT_LEVEL at all) survived every
+  # fed-sequence --dry-run test in the repo. Printing it here makes the
+  # interactive resolution assertable without a pty; the value is echoed
+  # verbatim (NOT defaulted) so an unresolved level shows up as an empty
+  # field rather than being cosmetically repaired at the reporting layer.
+  # Pinned by tests/test-bl180-interactive-enforcement.sh.
+  echo "  Enforcement: $ENFORCEMENT_LEVEL"
   echo ""
 
   echo -e "${BOLD}Tool Resolution:${NC}"
@@ -2719,25 +3440,51 @@ init.sh --non-interactive — full reference
 
 Required flags (always):
   --project NAME           Project name. Lowercase letters, digits, hyphens; must start with letter.
-  --platform PLATFORM      One of: desktop, mobile, web, mcp_server
+  --platform PLATFORM      Any platform module under docs/platform-modules/,
+                           any release pipeline under templates/pipelines/release/github/,
+                           or 'other' as a fallback. Today: desktop, mobile, web, mcp_server, other.
+                           (Dynamic; ship a new platform-modules/<name>.md to extend.)
   --deployment KIND        One of: personal, organizational
   --language NAME          Primary language. Must be valid for the chosen platform.
 
 Required flags (conditional):
   --gov-mode MODE          One of: production, sponsored_poc, private_poc.
-                           REQUIRED when --deployment=organizational.
-                           NOT VALID when --deployment=personal.
+                           REQUIRED when --deployment=organizational
+                           (valid there: production, sponsored_poc).
+                           OPTIONAL when --deployment=personal
+                           (valid there: production, private_poc).
+                           private_poc is ALWAYS personal; sponsored_poc is
+                           ALWAYS organizational (baseline §2.5). BL-129:
+                           this text previously claimed the OPPOSITE mapping
+                           and following it verbatim was rejected.
   --remote-url URL         HTTPS or SSH URL of an existing remote repo.
                            REQUIRED when --git-host=other.
   --branch-protection-attested
                            Boolean flag (presence = true). Confirms branch
                            protection is configured on the remote.
                            REQUIRED when --git-host=other.
+  --approvals-attested     Boolean flag (presence = true). Skips the
+                           gitlab.com Free-tier `projects/:id/approvals` PUT
+                           (Premium-only) and records a
+                           `gitlab_free_tier_approvals` attestation. Only
+                           meaningful for --git-host=gitlab + --deployment
+                           =organizational; ignored otherwise. Equivalent to
+                           SOLO_APPROVALS_ATTESTED=1 in the environment.
+                           See BL-032 in solo-orchestrator-backlog.md.
 
 Optional flags (with defaults):
   --description TEXT       One-sentence project description. Default: "".
   --track TRACK            One of: light, standard, full. Default: standard.
-  --project-dir PATH       Project directory path. Default: $HOME/Code/$PROJECT.
+  --project-dir PATH       Project directory. Default: $HOME/Code/$PROJECT.
+                           A BARE NAME or any relative path is created BESIDE
+                           the framework clone — one level up from the
+                           directory holding init.sh, NOT relative to your
+                           current directory. So from a fresh clone:
+                             ./init.sh --project-dir my-project
+                           puts the project next to solo-orchestrator/.
+                           An absolute path is used exactly as given. Either
+                           way the target may not be the framework repo, a
+                           directory inside it, or another framework clone.
   --git-host HOST          One of: github, gitlab, bitbucket, other. Default: github.
   --visibility VIS         One of: private, public. Default: private.
                            NOTE: organizational deployments force private.
@@ -2750,6 +3497,17 @@ Optional flags (with defaults):
                            later with `scripts/check-gate.sh --repair`.
                            Useful for UAT/CI runs that must NOT contaminate
                            a real GitHub/GitLab/Bitbucket account.
+  --accept-local-only-risk Boolean flag (BL-084). track=light ONLY. If the
+                           initial push on --git-host other FAILS, keep the
+                           project LOCAL (no remote) and accept the data-loss
+                           risk; recorded in .claude/process-state.json. Has
+                           NO effect on track=standard|full (a failed push is
+                           a hard, non-bypassable failure there).
+  --defer-remote-push      Boolean flag (BL-084). track=light ONLY. If the
+                           initial push on --git-host other FAILS, defer it;
+                           init exits 0 but the Phase 1→2 gate BLOCKS until
+                           the remote actually has the branch. No effect on
+                           track=standard|full.
 
 Mode flags:
   --non-interactive        Required to enable this mode. Without it, all input
@@ -2776,6 +3534,7 @@ JSON config schema (snake_case keys; all fields optional, missing → use flag/d
   "visibility": "private",
   "remote_url": null,
   "branch_protection_attested": false,
+  "approvals_attested": false,
   "allow_existing_dir": false,
   "no_remote_creation": false
 }
@@ -2843,7 +3602,7 @@ collect_inputs_non_interactive() {
     fi
 
     # Warn on unknown fields (forward-compat per spec § 5.4).
-    local known_fields="project description platform track deployment gov_mode language project_dir git_host visibility remote_url branch_protection_attested allow_existing_dir no_remote_creation"
+    local known_fields="project description platform track deployment gov_mode language project_dir git_host visibility remote_url branch_protection_attested approvals_attested allow_existing_dir no_remote_creation accept_local_only_risk defer_remote_push"
     local field
     for field in $(jq -r 'keys[]' "$CONFIG_FILE"); do
       if ! echo " $known_fields " | grep -q " $field "; then
@@ -2874,6 +3633,13 @@ collect_inputs_non_interactive() {
       cfg_attest=$(cfg_get branch_protection_attested)
       [ "$cfg_attest" = "true" ] && ARG_BRANCH_PROTECTION_ATTESTED=true
     fi
+    # BL-032: honor approvals_attested from config file (parity with
+    # branch_protection_attested above; flag wins on conflict).
+    if [ "$ARG_APPROVALS_ATTESTED" != true ]; then
+      local cfg_appr_attest
+      cfg_appr_attest=$(cfg_get approvals_attested)
+      [ "$cfg_appr_attest" = "true" ] && ARG_APPROVALS_ATTESTED=true
+    fi
     if [ "$ARG_ALLOW_EXISTING_DIR" != true ]; then
       local cfg_allow
       cfg_allow=$(cfg_get allow_existing_dir)
@@ -2883,6 +3649,17 @@ collect_inputs_non_interactive() {
       local cfg_no_remote
       cfg_no_remote=$(cfg_get no_remote_creation)
       [ "$cfg_no_remote" = "true" ] && ARG_NO_REMOTE_CREATION=true
+    fi
+    # BL-084: honor the light-tier push-failure escape hatches from config.
+    if [ "$ARG_ACCEPT_LOCAL_ONLY_RISK" != true ]; then
+      local cfg_local_only
+      cfg_local_only=$(cfg_get accept_local_only_risk)
+      [ "$cfg_local_only" = "true" ] && ARG_ACCEPT_LOCAL_ONLY_RISK=true
+    fi
+    if [ "$ARG_DEFER_REMOTE_PUSH" != true ]; then
+      local cfg_defer_push
+      cfg_defer_push=$(cfg_get defer_remote_push)
+      [ "$cfg_defer_push" = "true" ] && ARG_DEFER_REMOTE_PUSH=true
     fi
   fi
 
@@ -2899,15 +3676,18 @@ collect_inputs_non_interactive() {
 
   # platform
   if [ -n "$ARG_PLATFORM" ]; then
-    case "$ARG_PLATFORM" in
-      desktop|mobile|web|mcp_server) ;;
-      *)
-        fail "invalid --platform '$ARG_PLATFORM'" \
-             "platform must be one of: desktop, mobile, web, mcp_server." \
-             "re-run with a supported --platform value." \
-             "--platform='$ARG_PLATFORM'"
-        return 1 ;;
-    esac
+    # Audit specs-plans-init-intake-noninteractive-2: validate against
+    # the same dynamic set the interactive flow uses, rather than a
+    # hardcoded list that drifts whenever a platform module ships.
+    local available
+    available=$(get_available_platforms)
+    if [[ ! " $available " == *" $ARG_PLATFORM "* ]]; then
+      fail "invalid --platform '$ARG_PLATFORM'" \
+           "platform must be one of:$available." \
+           "add a docs/platform-modules/<name>.md to extend, or pick a supported value." \
+           "--platform='$ARG_PLATFORM'"
+      return 1
+    fi
   fi
 
   # track
@@ -2999,7 +3779,7 @@ collect_inputs_non_interactive() {
   if [ -z "$ARG_PLATFORM" ]; then
     fail "--platform is required" \
          "every non-interactive invocation must specify a platform." \
-         "re-run with --platform {desktop|mobile|web|mcp_server}." \
+         "re-run with --platform <one of:$(get_available_platforms)>." \
          "(--platform unset)"
     return 1
   fi
@@ -3018,19 +3798,32 @@ collect_inputs_non_interactive() {
     return 1
   fi
 
-  # gov-mode required iff deployment=organizational
+  # gov-mode rules (baseline §2.5):
+  #   - Private POC is always personal (organizational + private_poc rejected).
+  #   - Sponsored POC is always organizational (personal + sponsored_poc rejected).
+  #   - Production is valid for both deployments.
+  # Audit code-init-sh-4 + tier-crosscheck-2: previously --gov-mode was
+  # required for organizational and rejected for personal, making Private
+  # POC unreachable for personal deployments.
   if [ "$ARG_DEPLOYMENT" = "organizational" ] && [ -z "$ARG_GOV_MODE" ]; then
     fail "--gov-mode is required when --deployment=organizational" \
          "organizational projects must specify a governance mode." \
-         "re-run with one of: --gov-mode production, --gov-mode sponsored_poc, --gov-mode private_poc." \
+         "re-run with --gov-mode production or --gov-mode sponsored_poc." \
          "--deployment=organizational, --gov-mode=(unset)"
     return 1
   fi
-  if [ "$ARG_DEPLOYMENT" = "personal" ] && [ -n "$ARG_GOV_MODE" ]; then
-    fail "--gov-mode is not valid for --deployment=personal" \
-         "personal projects do not have a governance mode." \
-         "remove --gov-mode and re-run." \
-         "--deployment=personal, --gov-mode='$ARG_GOV_MODE'"
+  if [ "$ARG_DEPLOYMENT" = "organizational" ] && [ "$ARG_GOV_MODE" = "private_poc" ]; then
+    fail "--gov-mode=private_poc is not valid for --deployment=organizational" \
+         "Private POC is always a personal deployment (baseline §2.5)." \
+         "use --deployment=personal --gov-mode=private_poc, or --deployment=organizational --gov-mode=sponsored_poc." \
+         "--deployment=organizational, --gov-mode=private_poc"
+    return 1
+  fi
+  if [ "$ARG_DEPLOYMENT" = "personal" ] && [ "$ARG_GOV_MODE" = "sponsored_poc" ]; then
+    fail "--gov-mode=sponsored_poc is not valid for --deployment=personal" \
+         "Sponsored POC is always an organizational deployment (baseline §2.5)." \
+         "use --deployment=organizational --gov-mode=sponsored_poc, or --deployment=personal --gov-mode=private_poc." \
+         "--deployment=personal, --gov-mode=sponsored_poc"
     return 1
   fi
 
@@ -3067,30 +3860,77 @@ collect_inputs_non_interactive() {
     print_warn "Proceeding because non-interactive mode treats explicit flags as confirmation."
   fi
 
-  # language validity for platform — look up the platform's allowed languages list
-  local lang_list_file=""
-  if [ -f "$SCRIPT_DIR/templates/intake-suggestions/${ARG_PLATFORM}.json" ]; then
-    lang_list_file="$SCRIPT_DIR/templates/intake-suggestions/${ARG_PLATFORM}.json"
-  elif [ -f "$SCRIPT_DIR/templates/intake-suggestions/common.json" ]; then
-    lang_list_file="$SCRIPT_DIR/templates/intake-suggestions/common.json"
-  fi
-  if [ -n "$lang_list_file" ] && command -v jq &>/dev/null; then
-    # Look for "languages" arrays at known schema paths.
-    # Fall back to skipping this check if the schema doesn't expose a list.
-    local supported
-    supported=$(jq -r '.. | objects | select(has("languages")) | .languages[]?' "$lang_list_file" 2>/dev/null | sort -u || true)
-    if [ -n "$supported" ]; then
-      if ! echo "$supported" | grep -qx "$ARG_LANGUAGE"; then
-        local supported_csv
-        supported_csv=$(echo "$supported" | tr '\n' ',' | sed 's/,$//; s/,/, /g')
-        fail "language '$ARG_LANGUAGE' is not supported for platform '$ARG_PLATFORM'" \
-             "the platform's intake suggestions list a different language set." \
-             "re-run with one of: $supported_csv (or pick a different platform)." \
-             "--platform='$ARG_PLATFORM', --language='$ARG_LANGUAGE'"
-        return 1
+  # language validity for platform — walk CI pipeline templates and accept only
+  # languages whose template marker lists the requested platform. This mirrors
+  # the interactive flow's `# solo-orchestrator: platforms=` filter (init.sh
+  # collect_inputs around line 468-499) so non-interactive and interactive
+  # share the single source of truth.
+  #
+  # Audit code-init-sh-5 + specs-plans-init-intake-noninteractive-5: the
+  # previous probe asked the intake-suggestions JSON for a top-level
+  # `languages` array; none of the shipped files exposed one, so the check
+  # was a silent no-op and any --language value passed through.
+  local _supported_for_platform=""
+  local _ci_dir="$SCRIPT_DIR/templates/pipelines/ci/github"
+  if [ -d "$_ci_dir" ]; then
+    local _ci_yml _lname _marker _platforms_csv
+    for _ci_yml in "$_ci_dir"/*.yml; do
+      [ -f "$_ci_yml" ] || continue
+      _lname=$(basename "$_ci_yml" .yml)
+      # `other` is the catch-all fallback (matches interactive flow): always
+      # accept it regardless of platform marker.
+      if [ "$_lname" = "other" ]; then
+        _supported_for_platform="$_supported_for_platform $_lname"
+        continue
       fi
-    fi
+      _marker=$(head -1 "$_ci_yml")
+      _platforms_csv=""
+      case "$_marker" in
+        *"# solo-orchestrator: platforms="*)
+          _platforms_csv="${_marker#*platforms=}"
+          ;;
+      esac
+      if [ -z "$_platforms_csv" ]; then
+        # No marker — be permissive (matches interactive backwards-compat).
+        _supported_for_platform="$_supported_for_platform $_lname"
+      else
+        case ",$_platforms_csv," in
+          *",$ARG_PLATFORM,"*)
+            _supported_for_platform="$_supported_for_platform $_lname"
+            ;;
+        esac
+      fi
+    done
   fi
+  if [ -n "$_supported_for_platform" ]; then
+    case " $_supported_for_platform " in
+      *" $ARG_LANGUAGE "*) : ;;
+      *)
+        local _supported_csv
+        _supported_csv=$(echo "$_supported_for_platform" | tr ' ' '\n' \
+                         | awk 'NF' | sort -u | paste -sd, - | sed 's/,/, /g')
+        fail "language '$ARG_LANGUAGE' is not supported for platform '$ARG_PLATFORM'" \
+             "no CI pipeline template (templates/pipelines/ci/github/<lang>.yml) lists $ARG_PLATFORM in its platforms marker for that language." \
+             "re-run with one of: $_supported_csv (or pick a different --platform)." \
+             "--platform='$ARG_PLATFORM', --language='$ARG_LANGUAGE'"
+        return 1 ;;
+    esac
+  fi
+
+  # OS-language compatibility (mirrors interactive Linux/Swift block at
+  # init.sh:506-537). Swift requires macOS (Xcode + Apple build toolchain).
+  case "$OS_TYPE" in
+    Linux)
+      case "$ARG_LANGUAGE" in
+        swift)
+          fail "language '$ARG_LANGUAGE' is not supported on $OS_TYPE for platform '$ARG_PLATFORM'" \
+               "Swift/iOS development requires macOS — Xcode and Apple's build toolchain are not available on Linux." \
+               "re-run on a macOS host, or pick a different --language." \
+               "--language='$ARG_LANGUAGE' on $OS_TYPE"
+          return 1 ;;
+      esac
+      ;;
+  esac
 
   # ----- Pass 3: resource validation -----
 
@@ -3110,31 +3950,45 @@ collect_inputs_non_interactive() {
     fi
   done
 
-  # git host CLI presence (skipped for 'other')
-  local effective_git_host="${ARG_GIT_HOST:-github}"
-  case "$effective_git_host" in
-    github)
-      if ! command -v gh &>/dev/null; then
-        fail "missing required tool for --git-host=github: gh" \
-             "the GitHub CLI is needed to create + protect the remote repo." \
-             "install: brew install gh (macOS) or apt install gh (Linux), then re-run." \
-             "--git-host=github"
-        return 1
-      fi ;;
-    gitlab)
-      if ! command -v glab &>/dev/null; then
-        fail "missing required tool for --git-host=gitlab: glab" \
-             "the GitLab CLI is needed to create + protect the remote repo." \
-             "install: brew install glab (macOS), then re-run." \
-             "--git-host=gitlab"
-        return 1
-      fi ;;
-    bitbucket)
-      # bitbucket uses curl + tokens; no CLI requirement
-      : ;;
-    other)
-      : ;;
-  esac
+  # git host CLI presence (skipped for 'other', and skipped entirely when
+  # --no-remote-creation: we will not call the host API in that mode, so
+  # the CLI is not actually needed).
+  if [ "$ARG_NO_REMOTE_CREATION" != true ]; then
+    local effective_git_host="${ARG_GIT_HOST:-github}"
+    case "$effective_git_host" in
+      github)
+        if ! command -v gh &>/dev/null; then
+          fail "missing required tool for --git-host=github: gh" \
+               "the GitHub CLI is needed to create + protect the remote repo." \
+               "install: brew install gh (macOS) or apt install gh (Linux), then re-run." \
+               "--git-host=github"
+          return 1
+        fi ;;
+      gitlab)
+        if ! command -v glab &>/dev/null; then
+          fail "missing required tool for --git-host=gitlab: glab" \
+               "the GitLab CLI is needed to create + protect the remote repo." \
+               "install: brew install glab (macOS), then re-run." \
+               "--git-host=gitlab"
+          return 1
+        fi ;;
+      bitbucket)
+        # bitbucket uses curl + tokens; no CLI requirement
+        : ;;
+      other)
+        : ;;
+    esac
+  fi
+
+  # BL-199: resolve a bare/relative project_dir BEFORE the existence check, so
+  # "already exists" tests the REAL target rather than a cwd-relative accident.
+  # The early block already resolved a --project-dir supplied as a flag; this
+  # call also covers the config-file source (cfg_get project_dir above), which
+  # is read after the early block. The resolver is idempotent — an absolute
+  # value passes through unchanged — so applying it twice is harmless.
+  if [ -n "${ARG_PROJECT_DIR:-}" ]; then
+    ARG_PROJECT_DIR="$(soif_resolve_target_dir "$ARG_PROJECT_DIR" "$(soif_sibling_anchor)")"
+  fi
 
   # project_dir existence check
   local effective_project_dir="${ARG_PROJECT_DIR:-$HOME/Code/$ARG_PROJECT}"
@@ -3169,8 +4023,11 @@ collect_inputs_non_interactive() {
   VISIBILITY="$ARG_VISIBILITY"
   REMOTE_URL="$ARG_REMOTE_URL"
   BRANCH_PROTECTION_ATTESTED="$ARG_BRANCH_PROTECTION_ATTESTED"
+  APPROVALS_ATTESTED="$ARG_APPROVALS_ATTESTED"
   ALLOW_EXISTING_DIR="$ARG_ALLOW_EXISTING_DIR"
   NO_REMOTE_CREATION="$ARG_NO_REMOTE_CREATION"
+  ACCEPT_LOCAL_ONLY_RISK="$ARG_ACCEPT_LOCAL_ONLY_RISK"
+  DEFER_REMOTE_PUSH="$ARG_DEFER_REMOTE_PUSH"
 
   # The interactive language_prompt() sets TEST_INTERVAL=2 mid-flow; the
   # non-interactive driver bypasses that prompt, so set the same default
@@ -3194,8 +4051,11 @@ collect_inputs_non_interactive() {
       --arg visibility "$VISIBILITY" \
       --arg remote_url "$REMOTE_URL" \
       --argjson attested "$([ "$BRANCH_PROTECTION_ATTESTED" = true ] && echo true || echo false)" \
+      --argjson approvals_attested "$([ "$APPROVALS_ATTESTED" = true ] && echo true || echo false)" \
       --argjson allow_dir "$([ "$ALLOW_EXISTING_DIR" = true ] && echo true || echo false)" \
       --argjson no_remote "$([ "$NO_REMOTE_CREATION" = true ] && echo true || echo false)" \
+      --argjson accept_local_only "$([ "$ACCEPT_LOCAL_ONLY_RISK" = true ] && echo true || echo false)" \
+      --argjson defer_push "$([ "$DEFER_REMOTE_PUSH" = true ] && echo true || echo false)" \
       '{
         _validated: true,
         _resolved_at: $ts,
@@ -3211,8 +4071,11 @@ collect_inputs_non_interactive() {
         visibility: $visibility,
         remote_url: (if $remote_url == "" then null else $remote_url end),
         branch_protection_attested: $attested,
+        approvals_attested: $approvals_attested,
         allow_existing_dir: $allow_dir,
-        no_remote_creation: $no_remote
+        no_remote_creation: $no_remote,
+        accept_local_only_risk: $accept_local_only,
+        defer_remote_push: $defer_push
       }'
   fi
   return 0
@@ -3281,10 +4144,27 @@ main() {
         ARG_REMOTE_URL="${1#*=}"; shift ;;
       --branch-protection-attested)
         ARG_BRANCH_PROTECTION_ATTESTED=true; shift ;;
+      --approvals-attested)
+        # BL-032: proactive gitlab.com Free approvals attestation.
+        ARG_APPROVALS_ATTESTED=true; shift ;;
       --allow-existing-dir)
         ARG_ALLOW_EXISTING_DIR=true; shift ;;
       --no-remote-creation)
         ARG_NO_REMOTE_CREATION=true; shift ;;
+      --accept-local-only-risk)
+        # BL-084: light-tier only — accept a local-only project (no remote)
+        # + its data-loss risk when the initial push fails.
+        ARG_ACCEPT_LOCAL_ONLY_RISK=true; shift ;;
+      --defer-remote-push)
+        # BL-084: light-tier only — defer the push; the Phase 1→2 gate
+        # will block until the remote actually has the branch.
+        ARG_DEFER_REMOTE_PUSH=true; shift ;;
+      --enforcement-level)
+        ARG_ENFORCEMENT_LEVEL="${2:-}"; shift 2 ;;
+      --enforcement-level=*)
+        ARG_ENFORCEMENT_LEVEL="${1#*=}"; shift ;;
+      --confirm-pitfalls)
+        ARG_CONFIRM_PITFALLS=true; shift ;;
       --help-non-interactive)
         print_help_non_interactive
         exit 0 ;;
@@ -3322,12 +4202,90 @@ HELPEOF
 
   print_header "$VERSION"
 
-  # UAT 2026-04-25 fix (U-N): refuse to scaffold a project inside the
-  # framework repo itself. (--dry-run is allowed for inspection.)
+  # BL-041 (2026-06-30): the write-permission preflight and the
+  # framework-repo guard share a target-dir resolution step. Compute
+  # _early_target once and feed it to BOTH checks, in the order:
+  #   1. preflight_target_writable        — operator-facing
+  #   2. guard_target_not_in_framework    — developer-facing
+  #
+  # BL-199 (2026-07-29) changed WHICH guard runs here, not the ordering.
+  # init.sh used to call guard_not_in_framework, whose first arm is an
+  # unconditional cwd check — which made the README's own Quick Start
+  # (clone → cd solo-orchestrator → ./init.sh) impossible: the script
+  # refused from inside the clone even with --project-dir pointing at a
+  # benign external path. Running from the clone is now the SUPPORTED
+  # flow, so init.sh guards the TARGET only. The cwd-first
+  # guard_not_in_framework is untouched and still used by the six other
+  # scripts / eight call sites (measured 2026-07-29:
+  # `grep -rn guard_not_in_framework --include='*.sh' scripts/`), which really
+  # do operate ON the cwd project.
+  #
+  # Rationale: a real operator who points --project-dir at an unwritable
+  # location should get the relevant permission error, not the framework-
+  # repo refusal. The framework-repo refusal still fires (defense-in-
+  # depth) when the preflight passes, and is the actual right answer for
+  # the developer scenario it was designed for.
+  #
+  # The previous ordering also blocked tests/edge-cases-pre-init.sh E8b:
+  # the harness runs init.sh from inside the framework checkout (cwd is
+  # the framework repo), so the cwd check in guard_not_in_framework fired
+  # before any write-permission probe had a chance. Reordering the two
+  # closes that test gap without weakening either guard.
+  #
+  # --dry-run skips BOTH because it never actually writes anything (the
+  # preview is allowed for inspection from any context, including from
+  # inside the framework repo itself).
   if [ "$DRY_RUN" != true ]; then
-    if ! guard_not_in_framework; then
+    # Resolve the effective target dir: explicit --project-dir wins; non-interactive
+    # default is $HOME/Code/$ARG_PROJECT; interactive flow resolves later via prompt.
+    # BL-199: in the interactive path this block has NO target to check — the old
+    # cwd arm used to fire there and no longer exists — so create_project()'s
+    # resolve+guard pair is the only gate that path passes through. That is why
+    # it, not this block, is the authoritative one.
+    _early_target=""
+    _early_from_flag=false
+    if [ -n "${ARG_PROJECT_DIR:-}" ]; then
+      _early_target="$ARG_PROJECT_DIR"
+      _early_from_flag=true
+    elif [ "$NON_INTERACTIVE" = true ] && [ -n "${ARG_PROJECT:-}" ]; then
+      _early_target="$HOME/Code/$ARG_PROJECT"
+    fi
+
+    # BL-199: resolve a bare/relative --project-dir to its sibling-of-the-clone
+    # absolute form BEFORE either check, so the preflight probes the real
+    # parent and the guard compares the real target. Absolute values pass
+    # through unchanged, so this is a no-op for every pre-BL-199 caller.
+    # Written back to ARG_PROJECT_DIR when that was the source, so the
+    # downstream existence check and PROJECT_DIR assignment see the same path.
+    if [ -n "$_early_target" ]; then
+      _early_target="$(soif_resolve_target_dir "$_early_target" "$(soif_sibling_anchor)")"
+      if [ "$_early_from_flag" = true ]; then
+        ARG_PROJECT_DIR="$_early_target"
+      fi
+    fi
+    unset _early_from_flag
+
+    # 1. Operator-facing: write-permission preflight (BL-041 / audit
+    # recommendation C). Must run BEFORE the framework-repo guard so the
+    # permission failure mode is reachable from any cwd. preflight_target_writable
+    # is a no-op when _early_target is empty (interactive flow resolves
+    # target later; the existing downstream existence check at
+    # collect_inputs_non_interactive::project_dir + create_project's
+    # mkdir surface the same failure mode in that path).
+    if ! preflight_target_writable "$_early_target"; then
       exit 1
     fi
+
+    # 2. Developer-facing: TARGET-only framework guard (BL-199). Refuses when
+    # the target is the framework root, inside the framework tree, or another
+    # framework clone (the security-audits-1 S3 vector, preserved). This is a
+    # fast-fail UX check only — create_project() runs the same guard again
+    # immediately before mkdir and is the authoritative gate, because the
+    # interactive and config-file paths resolve their target after this point.
+    if ! guard_target_not_in_framework "$_early_target" "$SCRIPT_DIR"; then
+      exit 1
+    fi
+    unset _early_target
   fi
 
   if [ "$DRY_RUN" = true ]; then
@@ -3356,6 +4314,38 @@ HELPEOF
       production) POC_MODE="" ;;
       *)          POC_MODE="$GOV_MODE" ;;
     esac
+
+    # BL-030: resolve enforcement_level. Choosable iff deployment=personal;
+    # otherwise forced strict. BL-129: the `organizational + private_poc`
+    # branch below is defensive dead code — the gov-mode rules above reject
+    # that combo ("Private POC is always personal"), so this arm only fires
+    # on a hand-edited manifest; do not describe it as a choosable tier.
+    ENFORCEMENT_LEVEL="$ARG_ENFORCEMENT_LEVEL"
+    [ "$ARG_CONFIRM_PITFALLS" = true ] && CONFIRM_PITFALLS=1
+    _bl030_choosable=0
+    if [ "$DEPLOYMENT" = "personal" ]; then _bl030_choosable=1; fi
+    if [ "$DEPLOYMENT" = "organizational" ] && [ "$POC_MODE" = "private_poc" ]; then _bl030_choosable=1; fi
+    if [ "$_bl030_choosable" = "0" ]; then
+      if [ -n "$ENFORCEMENT_LEVEL" ] && [ "$ENFORCEMENT_LEVEL" != "strict" ]; then
+        print_warn "BL-030: --enforcement-level '$ENFORCEMENT_LEVEL' ignored — deployment/poc_mode forces strict."
+      fi
+      ENFORCEMENT_LEVEL="strict"
+    else
+      [ -z "$ENFORCEMENT_LEVEL" ] && ENFORCEMENT_LEVEL="strict"
+      case "$ENFORCEMENT_LEVEL" in
+        strict) ;;
+        light|no)
+          if [ "$CONFIRM_PITFALLS" != "1" ]; then
+            print_fail "BL-030: non-interactive downgrade to '$ENFORCEMENT_LEVEL' requires --confirm-pitfalls."
+            exit 1
+          fi
+          ;;
+        *)
+          print_fail "BL-030: unknown --enforcement-level '$ENFORCEMENT_LEVEL' (expected: no | light | strict)."
+          exit 1
+          ;;
+      esac
+    fi
     # Pass 3 of collect_inputs_non_interactive already verified required tools.
   else
     if [ -n "$CONFIG_FILE" ]; then
@@ -3367,6 +4357,38 @@ HELPEOF
     check_prerequisites
     collect_project_info
   fi
+
+  # BL-180-ENFORCEMENT-DEFAULT: resolve ENFORCEMENT_LEVEL for EVERY path.
+  # The `# BL-030: resolve enforcement_level` block above lives inside the
+  # NON_INTERACTIVE arm, and the interactive arm (check_prerequisites +
+  # collect_project_info) has no enforcement-level prompt anywhere — so a
+  # hand-run `./init.sh` used to reach prepare_initial_state_for_commit with
+  # ENFORCEMENT_LEVEL still at its top-of-file "". That empty value flowed
+  # verbatim into the manifest, into the bypass-audit enforcement_level_set
+  # row, and made the `[ "$ENFORCEMENT_LEVEL" = "strict" ]` guard around
+  # install-filesystem-gates.sh --install a silent no-op: every interactively
+  # scaffolded project was born with NO commit-time gate while every
+  # lib-mediated diagnostic reported it as strict (read_enforcement_level maps
+  # "" → strict). It was also self-concealing — upgrade-project.sh's BL-030
+  # backfill could not repair it (see # BL-180-BACKFILL-EMPTY there).
+  #
+  # STRICT IS THE RIGHT DEFAULT, not merely a safe one: strict is what the
+  # non-interactive arm already resolves to when no --enforcement-level is
+  # supplied (both its forced arm and its choosable arm's own `-z` default),
+  # so this makes the two entry points agree instead of inventing a tier.
+  #
+  # INERT FOR THE NON-INTERACTIVE ARM: that arm assigns ENFORCEMENT_LEVEL on
+  # every one of its branches before falling through here, so the `-z` guard
+  # never fires there and an explicit `--enforcement-level light` survives
+  # untouched. Proven, not asserted — see T5/T6 of
+  # tests/test-bl180-interactive-enforcement.sh.
+  #
+  # CONFIRM_PITFALLS is deliberately NOT given the same treatment: its
+  # top-of-file default is already 0, it is only ever read as permission to
+  # DOWNGRADE, and the interactive arm offers no downgrade to permit — so 0
+  # is the correct interactive resolution and defaulting it to anything else
+  # would widen the bypass surface rather than close it.
+  [ -z "$ENFORCEMENT_LEVEL" ] && ENFORCEMENT_LEVEL="strict"
 
   log_section "Project Configuration"
   log_line "Project: $PROJECT_NAME"
@@ -3383,7 +4405,16 @@ HELPEOF
     resolve_and_install_tools
 
     log_section "Project Creation"
+    # BL-109-CURRENCY: start a fresh render-base scratch file BEFORE create_project
+    # so the render sites inside it (A2 template copies, PROJECT_INTAKE, CLAUDE.md)
+    # can stash {template sha, output sha} for the birth stamp.
+    soif_currency_renderbase_init
     create_project
+
+    # BL-030: persist enforcement_level + deployment + poc_mode to manifest,
+    # initialize detection baseline, audit-row the level set, and (if strict)
+    # install the filesystem gate.
+    bl030_finalize_init
 
     # Move log to project directory
     if [ -d "$PROJECT_DIR" ] && [ -n "$LOG_FILE" ]; then
@@ -3396,10 +4427,336 @@ HELPEOF
     fi
 
     bash "$PROJECT_DIR/scripts/verify-install.sh" --auto-fix || true
+    # BL-064: if any tracked failure occurred during the run, replace the
+    # "Setup Complete" banner with "Setup INCOMPLETE" and surface a
+    # non-zero exit so wrapper scripts that gate downstream actions on
+    # init.sh succeeding observe the gap. record_init_failure callers
+    # (currently the create_and_protect_remote outer wrap) populate the
+    # INIT_FAILURES array; see init.sh header block for the contract.
+    if [ "${#INIT_FAILURES[@]}" -gt 0 ]; then
+      print_init_failures_summary
+      finalize_log
+      return 2
+    fi
     print_next_steps
   fi
 
   finalize_log
+}
+
+# Resolve host/visibility/mode from --git-host / --visibility flags, intake
+# answers, or interactive prompts. Sets globals consumed by both
+# prepare_initial_state_for_commit and create_and_protect_remote so the
+# resolution happens exactly once per init.
+_resolve_host_visibility_mode() {
+  # BL-016: prefer non-interactive top-level variables when set.
+  if [ -n "${GIT_HOST:-}" ]; then
+    _RESOLVED_HOST="$GIT_HOST"
+  elif [ -f .claude/intake-progress.json ]; then
+    _RESOLVED_HOST=$(jq -r '.answers.git_host // empty' .claude/intake-progress.json 2>/dev/null || echo "")
+  fi
+  if [ -n "${VISIBILITY:-}" ]; then
+    _RESOLVED_VISIBILITY="$VISIBILITY"
+  elif [ -f .claude/intake-progress.json ]; then
+    _RESOLVED_VISIBILITY=$(jq -r '.answers.repo_visibility // empty' .claude/intake-progress.json 2>/dev/null || echo "")
+  fi
+
+  # BL-204-REMOTE-WHY (finding 8): nothing upstream of the choice explained
+  # what a remote is FOR. Say it before the prompt, not inside the failure arm.
+  if [ -z "${_RESOLVED_HOST:-}" ]; then
+    print_info "About this question: your remote is your backup — the copy that lives"
+    print_info "somewhere other than this machine. If this disk dies and there is no"
+    print_info "remote, every bit of the work is gone."
+  fi
+  # Fallback: prompt inline if neither source supplied a value (interactive mode only).
+  [ -z "${_RESOLVED_HOST:-}" ]       && _RESOLVED_HOST=$(prompt_choice "Git host:" "github" "gitlab" "bitbucket" "other")
+
+  # BL-204-VISIBILITY-EXPLAIN (finding 6): the bare `private|public` prompt
+  # never said what either word means, and never said that private on a
+  # free-tier personal GitHub account forfeits branch protection — a cost that
+  # only reappears much later as an attestation prompt with no context.
+  if [ -z "${_RESOLVED_VISIBILITY:-}" ]; then
+    _bl204_explain_visibility
+  fi
+  [ -z "${_RESOLVED_VISIBILITY:-}" ] && _RESOLVED_VISIBILITY=$(prompt_choice "Repository visibility:" "private" "public")
+
+  # Map DEPLOYMENT "organizational" → "org" for consistency with spec
+  _RESOLVED_MODE="$DEPLOYMENT"
+  [ "$_RESOLVED_MODE" = "organizational" ] && _RESOLVED_MODE="org"
+  # Org forces private
+  if [ "$_RESOLVED_MODE" = "org" ] && [ "$_RESOLVED_VISIBILITY" != "private" ]; then
+    print_warn "Org mode forces private visibility (overriding '$_RESOLVED_VISIBILITY')"
+    _RESOLVED_VISIBILITY="private"
+  fi
+
+  # BL-204-PROBE-AT-SELECT (finding 5): the host choice is SETTLED at this
+  # point — probe the CLI/credentials NOW rather than leaving the discovery to
+  # create_and_protect_remote, which runs after every remaining prompt has
+  # been answered and after the whole project tree has been scaffolded.
+  _bl204_probe_host_at_selection "$_RESOLVED_HOST"
+}
+
+# ================================================================
+# BL-204-VISIBILITY-PERSIST — record the visibility answer for the wizard
+# ================================================================
+# R-BL204-2: `.claude/intake-progress.json::answers.repo_visibility` had
+# exactly ONE writer in the whole repo — the intake wizard itself. init
+# RESOLVED the visibility (from --visibility, from a config file, or from its
+# own prompt) and then dropped it on the floor. So on every real first run the
+# wizard's BL-204-PREFILL lookup found nothing and blind-asked, which is the
+# precise thing finding 7 exists to stop: the user answers, then gets asked
+# again as if the answer never saved.
+#
+# Writing it here also feeds scripts/check-gate.sh, which reads the same key
+# with a silent `// "private"` default — a public repo was being described as
+# private there for the same reason.
+#
+# NEVER CLOBBER OPERATOR STATE. If the file exists and parses, merge into
+# .answers and keep every other key. If it exists and does NOT parse, do
+# nothing at all: an unreadable progress file is the operator's to recover,
+# and overwriting it with a one-key stub would destroy a part-finished intake.
+_bl204_persist_visibility_answer() {
+  local visibility="${1:-}"
+  [ -n "$visibility" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local prog=".claude/intake-progress.json"
+  mkdir -p .claude 2>/dev/null || return 0
+  local tmp built
+  tmp=$(mktemp) || return 0
+  if [ -f "$prog" ]; then
+    jq empty "$prog" >/dev/null 2>&1 || { rm -f "$tmp"; return 0; }
+    built=$(jq --arg v "$visibility" '.answers = ((.answers // {}) + {repo_visibility: $v})' "$prog") \
+      || { rm -f "$tmp"; return 0; }
+  else
+    built=$(jq -n --arg v "$visibility" '{answers: {repo_visibility: $v}}') \
+      || { rm -f "$tmp"; return 0; }
+  fi
+  printf '%s\n' "$built" > "$tmp" && mv "$tmp" "$prog"   # BL-204-VISIBILITY-PERSIST-WRITE
+  rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# ================================================================
+# BL-204-VISIBILITY-EXPLAIN — plain-language private vs public
+# ================================================================
+# Kept verbatim in step with the wizard's copy of this text
+# (scripts/intake-wizard.sh::_bl204_explain_visibility). Two prompts, one
+# explanation — a user who meets the question in either place gets the same
+# words, including the free-tier cost.
+_bl204_explain_visibility() {
+  print_info "Who can see this code?"
+  print_info "  private — only you and the people you invite can see the code. Most projects."
+  print_info "  public  — anyone on the internet can read the code. Only you can change it."
+  print_info ""
+  print_info "One trade-off worth knowing before you choose:"
+  print_info "  On a free personal GitHub account, a PRIVATE repo cannot have branch protection"
+  print_info "  (the safety rail that stops accidental force-pushes and deletions of main)."
+  print_info "  If you pick private on a free account, the framework will later ask you to"
+  print_info "  attest that you follow those rules by hand instead. A PUBLIC repo on the same"
+  print_info "  free account gets the real thing, and so does a private repo on a paid plan."
+}
+
+# ================================================================
+# BL-204-PROBE-AT-SELECT — probe the host at the moment of choice
+# ================================================================
+# BL-204 finding 5: `host_require_cli` ran ONLY immediately before
+# `host_create_repo`, so choosing a host whose CLI is missing (or whose
+# credentials are not exported — bitbucket without BITBUCKET_API_TOKEN is the
+# audited case) was discovered many prompts later. This probe runs at the
+# selection point and is ADVISORY: it always returns 0, because the
+# pre-create probe in create_and_protect_remote is still the decisive gate and
+# still records the failure via record_init_failure. Making this one fatal
+# would move the gate and change the exit contract; making it loud is enough
+# to fix the discovery problem the finding actually describes.
+_bl204_probe_host_at_selection() {
+  local host="${1:-}"
+  # Nothing to probe when no remote will be created.
+  [ "${NO_REMOTE_CREATION:-false}" = true ] && return 0
+  case "$host" in
+    github|gitlab|bitbucket) ;;
+    *) return 0 ;;   # 'other' has no CLI to probe
+  esac
+  local dispatcher="$SCRIPT_DIR/scripts/lib/host.sh"
+  local driver="$SCRIPT_DIR/scripts/host-drivers/$host.sh"
+  if [ ! -f "$dispatcher" ] || [ ! -f "$driver" ]; then
+    return 0
+  fi
+  # Subshell: the driver defines host_* functions, and create_and_protect_remote
+  # sources them itself later. Keeping them out of this scope means the probe
+  # cannot change which implementation the create path ends up running.
+  local probe_out probe_rc
+  probe_out=$(
+    # shellcheck disable=SC1090
+    source "$dispatcher"
+    # shellcheck disable=SC1090
+    source "$driver"
+    host_require_cli 2>&1
+  ) && probe_rc=0 || probe_rc=$?
+  if [ "$probe_rc" -eq 0 ]; then
+    # Deliberately not "CLI found": bitbucket has no CLI, it checks exported
+    # credentials. One sentence that is true for all three drivers.
+    print_ok "Your $host access is set up and working."
+    return 0
+  fi
+  echo ""
+  print_warn "The tools for '$host' are not ready yet — found this while checking your choice."
+  print_info "Telling you now rather than after the rest of the questions: this is what"
+  print_info "stops the backup copy of your project from being created."
+  [ -n "$probe_out" ] && printf '%s\n' "$probe_out" >&2
+  print_info "Setup will keep going and try again when it creates the repository."
+  print_info "If it still is not ready then, the project stays on this machine and you can"
+  print_info "finish the remote later with: scripts/check-gate.sh --repair"
+  echo ""
+  return 0
+}
+
+# Lay down ALL durable state BEFORE the chore-init commit so it is captured
+# atomically. Combines what used to be (a) create_and_protect_remote's early
+# manifest seed (host/mode), (b) bl030_finalize_init's manifest BL-030 fields
+# + bypass-audit init row + filesystem gate install. The chore-init commit
+# now includes manifest with all fields, bypass-audit.json with the init
+# row, and the filesystem-gate hooks when strict.
+prepare_initial_state_for_commit() {
+  [ -d "$PROJECT_DIR" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  _resolve_host_visibility_mode
+
+  mkdir -p .claude
+
+  # R-BL204-2: persist the resolved visibility so the intake wizard can
+  # CONFIRM it instead of blind-asking. The host needs no equivalent — it
+  # lands in .claude/manifest.json a few lines below, which is where the
+  # wizard's BL-204-PREFILL reads it from. Visibility has no manifest field,
+  # so without this line the prefill has nothing to find.
+  _bl204_persist_visibility_answer "$_RESOLVED_VISIBILITY"   # BL-204-VISIBILITY-PERSIST
+
+  # Seed manifest with all framework-managed fields. remote_url stays "" until
+  # create_and_protect_remote actually creates the repo; if it doesn't, the
+  # empty value is the documented "no remote" sentinel.
+  local poc_val
+  if [ -n "$POC_MODE" ]; then
+    poc_val="$POC_MODE"
+  else
+    poc_val=""
+  fi
+  local manifest=".claude/manifest.json"
+  if [ -f "$manifest" ]; then
+    local tmp
+    tmp=$(mktemp)
+    if [ -n "$poc_val" ]; then
+      jq --arg h "$_RESOLVED_HOST" --arg m "$_RESOLVED_MODE" \
+         --arg dep "$DEPLOYMENT" --arg pm "$poc_val" --arg lvl "$ENFORCEMENT_LEVEL" \
+         '. + {host:$h, mode:$m, remote_url:"", deployment:$dep, poc_mode:$pm, enforcement_level:$lvl}' \
+         "$manifest" > "$tmp" && mv "$tmp" "$manifest"
+    else
+      jq --arg h "$_RESOLVED_HOST" --arg m "$_RESOLVED_MODE" \
+         --arg dep "$DEPLOYMENT" --arg lvl "$ENFORCEMENT_LEVEL" \
+         '. + {host:$h, mode:$m, remote_url:"", deployment:$dep, poc_mode:null, enforcement_level:$lvl}' \
+         "$manifest" > "$tmp" && mv "$tmp" "$manifest"
+    fi
+  else
+    if [ -n "$poc_val" ]; then
+      jq -n --arg h "$_RESOLVED_HOST" --arg m "$_RESOLVED_MODE" \
+            --arg dep "$DEPLOYMENT" --arg pm "$poc_val" --arg lvl "$ENFORCEMENT_LEVEL" \
+            '{host:$h, mode:$m, remote_url:"", deployment:$dep, poc_mode:$pm, enforcement_level:$lvl}' \
+        > "$manifest"
+    else
+      jq -n --arg h "$_RESOLVED_HOST" --arg m "$_RESOLVED_MODE" \
+            --arg dep "$DEPLOYMENT" --arg lvl "$ENFORCEMENT_LEVEL" \
+            '{host:$h, mode:$m, remote_url:"", deployment:$dep, poc_mode:null, enforcement_level:$lvl}' \
+        > "$manifest"
+    fi
+  fi
+
+  # BL-109-CURRENCY: stamp the currency inventory block (design v1.1 §2-L0) into
+  # .claude/manifest.json at birth, immediately AFTER the framework-managed
+  # manifest seed above. Additive — every pre-existing field (soloFrameworkCommit
+  # / frameworkCommit / host / mode / … pins included) is preserved. files{} is
+  # derived MECHANICALLY from the shipped-set parsers and hashed from the
+  # just-scaffolded project tree (all cp/render/hook steps precede this call);
+  # render bases were captured AT the render sites into
+  # $SOIF_CURRENCY_RENDERBASE_FILE. This is the UNIVERSAL birth site —
+  # prepare_initial_state_for_commit runs on EVERY path (incl.
+  # --no-remote-creation), unlike the soloFrameworkCommit stamp, which is
+  # remote-path-only (see the S1 PR body's declared deviation). Skipped as a
+  # no-op when jq is unavailable (same contract as the soloFrameworkCommit stamp).
+  # Re-stamping on sync/apply (soloFrameworkPath refresh) is S3a — out of scope.
+  # BL-110-PIN-UNIVERSAL — birth-stamp .claude/manifest.json.soloFrameworkCommit
+  # at the UNIVERSAL seed site (this function runs on EVERY path, including
+  # --no-remote-creation), fixing BL-110: the stamp's old home inside
+  # create_and_protect_remote() sat AFTER that function's --no-remote-creation
+  # early return, so every hermetic scaffold was born with NO pin — degrading
+  # the entire Currency System (BL-109) and --sync-framework drift reporting.
+  # Same contract as before: camelCase, sits BESIDE CDF's frameworkCommit;
+  # skipped with a note when the framework dir isn't a git checkout (sync
+  # treats absent as unpinned); idempotent (skip when already present).
+  if [ "$(jq -r '.soloFrameworkCommit // ""' "$manifest" 2>/dev/null)" = "" ]; then
+    if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+      _solo_fw_commit="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo "")"
+      if [ -n "$_solo_fw_commit" ]; then
+        jq --arg c "$_solo_fw_commit" '.soloFrameworkCommit = $c' "$manifest" > "$manifest.tmp" \
+          && mv "$manifest.tmp" "$manifest"
+      fi
+      unset _solo_fw_commit
+    else
+      print_info "solo-orchestrator framework dir is not a git checkout — skipping soloFrameworkCommit birth-stamp"
+    fi
+  fi
+
+  soif_currency_stamp "$manifest" "$SCRIPT_DIR/init.sh" "$SCRIPT_DIR" "." "$LANGUAGE" "$SCRIPT_DIR"   # BL-109-CURRENCY load-bearing stamping call
+
+  # Seed bypass-audit.json with the init enforcement_level_set row.
+  [ -f .claude/bypass-audit.json ] || echo "[]" > .claude/bypass-audit.json
+  local _ts _row _tmp
+  _ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  _row=$(jq -nc \
+    --arg ts "$_ts" \
+    --arg lvl "$ENFORCEMENT_LEVEL" \
+    --arg confirmed "$CONFIRM_PITFALLS" \
+    '{timestamp:$ts, session_id:null, type:"enforcement_level_set", actor:"framework",
+      enforcement_level_at_event:$lvl,
+      details:{level:$lvl, confirmed_pitfalls:($confirmed=="1"), source:"init"},
+      user_response:"n/a", final_outcome:"recorded_only"}')
+  _tmp=$(mktemp)
+  jq --argjson r "$_row" '. + [$r]' .claude/bypass-audit.json > "$_tmp" \
+    && mv "$_tmp" .claude/bypass-audit.json
+
+  # Install filesystem gate when strict (puts the hook in .git/hooks/ before
+  # the chore-init commit so the marker block is consistent with the rest of
+  # the BL-030 surface).
+  if [ "$ENFORCEMENT_LEVEL" = "strict" ]; then
+    bash "$SCRIPT_DIR/scripts/install-filesystem-gates.sh" --install "$PROJECT_DIR" >/dev/null 2>&1 || \
+      print_warn "BL-030: filesystem-gate install failed — strict enforcement degraded."
+  fi
+}
+
+# Capture any post-remote state writes (manifest.remote_url update, branch-
+# protection attestation, phase2_init.steps_completed) in a chore-finalize
+# commit so the working tree stays clean after init.sh exits. No-op when
+# nothing changed (e.g. --no-remote-creation, which sets remote_url to the
+# same "" already in HEAD).
+finalize_init_commit() {
+  [ -d "$PROJECT_DIR/.git" ] || return 0
+  if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+    return 0
+  fi
+  git add -A
+  git commit -q --no-verify -m "chore: record host setup outcome (init finalize)" 2>/dev/null || true
+  # Refresh detection baseline to the finalize commit so subsequent commits
+  # are correctly detected as new work, not as init-time activity.
+  ( git rev-parse HEAD 2>/dev/null > .claude/last-checked-commit.txt ) || true
+}
+
+# Legacy entry point. Pre-fix this function did all the BL-030 state writes
+# (manifest fields, bypass-audit init row, filesystem gate install) AFTER
+# the chore-init commit, leaving them uncommitted. The writes have moved
+# into prepare_initial_state_for_commit so they land in the initial commit.
+# The function is retained as a no-op so any external caller continues to
+# work; the baseline refresh now happens in create_project after each
+# commit point (chore-init + chore-finalize) so this is correctly redundant.
+bl030_finalize_init() {
+  return 0
 }
 
 main "$@"

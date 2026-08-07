@@ -5,8 +5,8 @@
 | Field | Value |
 |---|---|
 | **Document ID** | SOI-007-GUIDE |
-| **Version** | 1.3 |
-| **Date** | 2026-04-10 |
+| **Version** | 1.5 |
+| **Date** | 2026-08-01 |
 | **Classification** | User Guide |
 | **Companion Documents** | SOI-002-BUILD v1.0 (Builder's Guide), SOI-003-GOV v1.0 (Governance Framework), SOI-004-INTAKE v1.0 (Project Intake Template) |
 
@@ -14,27 +14,27 @@
 
 This guide walks you through using the Solo Orchestrator Framework from first setup to production maintenance. It covers what you do, when, and why — with separate paths for personal projects and organizational deployments.
 
-For what the framework *is*, how it works at a conceptual level, and what it is not suited for, see the [README](../README.md). This guide assumes you have read that and decided to proceed.
+For what the framework *is*, how it works at a conceptual level, and what it is not suited for, see the [README](https://github.com/kraulerson/solo-orchestrator#readme). This guide assumes you have read that and decided to proceed.
 
 ### Document Map
 
 | Document | Priority | What It Contains | When You Need It |
 |---|---|---|---|
 | **This guide** (user-guide.md) | **Follow** | What you do, step by step, from setup to maintenance | Start here |
-| [**Project Intake**](../templates/project-intake.md) | **Fill out** | Your product definition — wizard available | Pre-Phase 0 |
-| [**Platform Module**](platform-modules/) | **Reference** | Platform-specific architecture, tooling, testing, distribution | Phases 1-4 |
-| [**README**](../README.md) | Skim | Framework overview, prerequisites, platform/language support | Before starting |
+| **Project Intake** (`PROJECT_INTAKE.md`, created by `init.sh` in your project root) | **Fill out** | Your product definition — wizard available | Pre-Phase 0 |
+| [**Platform Module**](https://github.com/kraulerson/solo-orchestrator/tree/main/docs/platform-modules) | **Reference** | Platform-specific architecture, tooling, testing, distribution | Phases 1-4 |
+| [**README**](https://github.com/kraulerson/solo-orchestrator#readme) | Skim | Framework overview, prerequisites, platform/language support | Before starting |
 | [**Builder's Guide**](builders-guide.md) | Reference | The complete methodology — deep reference for phases, glossary, and advanced procedures | When you need detail beyond what this guide provides |
 | [**CLI Setup Addendum**](cli-setup-addendum.md) | Reference | Claude Code configuration, Superpowers, MCP servers | After init, before Phase 0 |
 | [**Security Scan Guide**](security-scan-guide.md) | Reference | Plain-language guide to common scan findings | When you get scan results |
 | [**Governance Framework**](governance-framework.md) | Org only | Approval authorities, compliance, risk, portfolio governance | Organizational deployments |
 | [**Executive Review**](executive-review.md) | Org only | Business case for CIO evaluation | Organizational evaluation |
 | [**Example Project**](https://github.com/kraulerson/solo-orchestrator-example-project) | Browse | Complete artifact trail from building MeshScope — see what each phase produces | Before starting, or anytime |
-| [**Extending Platforms**](extending-platforms.md) | Contributor | How to add a new platform type to the framework | When adding platforms |
-| [**Framework Evaluation Prompts**](../evaluation-prompts/Framework/) | Evaluation | Adversarial reviews of the framework itself from 6 professional perspectives | After framework updates or retooling |
-| [**Project Evaluation Prompts**](../evaluation-prompts/Projects/) | Evaluation | Adversarial reviews of any project built with the framework from 6 professional perspectives | Phase 3 validation, before production deployment |
+| [**Extending Platforms**](https://github.com/kraulerson/solo-orchestrator/blob/main/docs/extending-platforms.md) | Contributor | How to add a new platform type to the framework | When adding platforms |
+| [**Framework Evaluation Prompts**](https://github.com/kraulerson/solo-orchestrator/tree/main/evaluation-prompts/Framework) | Evaluation | Adversarial reviews of the framework itself from 6 professional perspectives | After framework updates or retooling |
+| [**Project Evaluation Prompts**](https://github.com/kraulerson/solo-orchestrator/tree/main/evaluation-prompts/Projects) | Evaluation | Adversarial reviews of any project built with the framework from 6 professional perspectives | Phase 3 validation, before production deployment |
 
-**What you actually need open:** This guide, the [Project Intake](../templates/project-intake.md), and your [Platform Module](platform-modules/). Everything else is reference material — the table above tells you when each document becomes relevant.
+**What you actually need open:** This guide, your project's `PROJECT_INTAKE.md`, and your [Platform Module](https://github.com/kraulerson/solo-orchestrator/tree/main/docs/platform-modules). Everything else is reference material — the table above tells you when each document becomes relevant.
 
 **How to read this guide:** Follow it step by step. Read the section for your current step, do the step, then read the next section. You do not need to read this guide end-to-end before starting. Each section tells you exactly what to do, what the AI agent does, and what to review before moving on.
 
@@ -46,11 +46,11 @@ For what the framework *is*, how it works at a conceptual level, and what it is 
 
 ### What This Framework Is
 
-A structured methodology for a single experienced technologist to build MVP-quality applications with a clear path to production, using AI as the execution layer. You define intent, constraints, and validation. The AI generates architecture, code, tests, and documentation within those constraints. It is phase-gated, test-driven, and security-scanned at every step. The output is a functional, tested, security-scanned MVP — production deployment requires additional hardening, operational readiness, and (for organizational projects) governance completion. See the [README](../README.md) for the full overview.
+A structured methodology for a single experienced technologist to build MVP-quality applications with a clear path to production, using AI as the execution layer. You define intent, constraints, and validation. The AI generates architecture, code, tests, and documentation within those constraints. It is phase-gated, test-driven, and security-scanned at every step. The output is a functional, tested, security-scanned MVP — production deployment requires additional hardening, operational readiness, and (for organizational projects) governance completion. See the [README](https://github.com/kraulerson/solo-orchestrator#readme) for the full overview.
 
 ### What You Should Know Before You Start
 
-**AI-generated code IP:** Software built using this framework is generated in part by AI. The copyright status of AI-generated code is legally unsettled under current U.S. and international law. The framework's human-directed phase gates strengthen copyright claims but do not guarantee protection. Do not assume full copyright protection for AI-generated code without consulting qualified IP counsel. See the [README Legal Notices](../README.md#legal-notices) for the full disclosure.
+**AI-generated code IP:** Software built using this framework is generated in part by AI. The copyright status of AI-generated code is legally unsettled under current U.S. and international law. The framework's human-directed phase gates strengthen copyright claims but do not guarantee protection. Do not assume full copyright protection for AI-generated code without consulting qualified IP counsel. See the [README Legal Notices](https://github.com/kraulerson/solo-orchestrator#legal-notices) for the full disclosure.
 
 **AI-generated legal documents:** Any Privacy Policies, Terms of Service, or other legal documents produced during the build process must be reviewed by qualified legal counsel before deployment.
 
@@ -77,6 +77,31 @@ Before starting, confirm you can do the following. If more than 2 items are unfa
 
 The framework has three tiers of control, plus an intermediate tier for CI-based warnings. Understanding which tier a rule falls into tells you where the safety nets are — and where you are the safety net.
 
+**Before the tier breakdown — your project's enforcement level matters.** Solo Orchestrator projects ship with one of three enforcement levels (`strict` / `light` / `no`), set at `init.sh` time and changeable later via `scripts/reconfigure-project.sh --enforcement-level`. The level controls **how aggressively the framework treats user-terminal git commits**:
+
+| Level | User-terminal commits | `--no-verify` behavior | Default for |
+|---|---|---|---|
+| `strict` | Blocked in `.git/hooks/pre-commit` (framework-gate.sh) when they violate the Build Loop / Phase classifier | Bypass-able at commit time, but **the next SessionStart hook records the commit to `.claude/bypass-audit.json`** — you can route around the block, you cannot route around the audit trail | All projects (default) |
+| `light` | Allowed at commit time | Allowed at commit time; commit is still recorded by the SessionStart out-of-band detector | Personal exploration projects that explicitly opt in |
+| `no` | Allowed at commit time | Allowed at commit time; **not** recorded | Personal projects that opt in AND accept losing the W7 successor-handoff narrative |
+
+**Tier semantics (baseline §2.5):** `strict` is forced for organizational projects in Sponsored POC or Production mode. Personal projects and organizational/Private POC projects are "choosable" — they can pick any of the three levels.
+
+**Files:**
+- The project's level lives in `.claude/manifest.json::.enforcement_level`.
+- The strict-mode block hook is `.git/hooks/framework-gate.sh` (installed/uninstalled by `scripts/install-filesystem-gates.sh` on level transitions).
+- The audit log is `.claude/bypass-audit.json`. Every user-terminal commit captured by the detector appears as a row with `type: "out_of_band_commit"`; every framework-gate block appears as `type: "terminal_commit_blocked"`. A clean pass through the gate writes **no** ledger row — only a non-tracked `.claude/last-gate-pass.txt` receipt — so the tracked ledger records real events only (BL-161); `terminal_commit_passed` is a legacy type that historical ledgers may still contain. For the full row schema, per-type lifecycle, and cold-pickup successor jq recipes, see `docs/audit-log-lifecycle.md`.
+
+**Operator commands:**
+- `bash init.sh --non-interactive ... --enforcement-level <no|light|strict> [--confirm-pitfalls]` — set at project creation (`--confirm-pitfalls` is required to go below strict).
+- `bash scripts/reconfigure-project.sh --enforcement-level <no|light|strict> [--confirm-pitfalls]` — transition an existing project (refused for tiers that force strict, refused for downgrade without `--confirm-pitfalls`).
+- `bash scripts/upgrade-project.sh --backfill-only` — migrate a pre-BL-030 project's manifest in place (defaults to strict).
+
+Throughout the rest of this section, the tier breakdown describes the **shape of enforcement at each tier**. Your enforcement level controls **which of those tiers actually fire on user-terminal commits**:
+- `strict` (default): every tier listed below applies to both Claude-issued commits AND your terminal commits.
+- `light`: every tier applies to Claude. Your terminal commits skip Tier 2 hooks but are still captured by Tier 1 CI and recorded post-hoc by the audit detector.
+- `no`: every tier applies to Claude. Your terminal commits are entirely unchecked by the framework.
+
 **Tier 1 — Mechanically enforced (CI pipeline).** These checks run automatically on every push. They block merges when they fail. You cannot accidentally bypass them.
 
 | Control | Mechanism |
@@ -99,9 +124,9 @@ The framework has three tiers of control, plus an intermediate tier for CI-based
 
 | Control | Mechanism | Limitation |
 |---|---|---|
-| Secret detection (gitleaks) | Pre-commit hook + CI pipeline scan — blocks commit and PR | Only catches patterns gitleaks knows; pre-commit bypassable with `--no-verify` but CI backstop catches it |
-| SAST quick scan (Semgrep) | Pre-commit hook — blocks commit on findings; CI runs full scan | Pre-commit scans only staged files with `p/owasp-top-ten`; bypassable with `--no-verify` but CI backstop catches it |
-| TDD ordering check | Pre-commit hook — warns when implementation files are committed without any test files | Heuristic; checks file presence, not test quality or ordering. Does not apply to config, migrations, or generated files. |
+| Secret detection (gitleaks) | Pre-commit hook + CI pipeline scan — blocks commit and PR | Only catches patterns gitleaks knows. `--no-verify` skips the hook but the CI scan is a hard backstop. In `strict` enforcement mode, the SessionStart out-of-band detector also records any commit that landed via `--no-verify` to `.claude/bypass-audit.json`. |
+| SAST quick scan (Semgrep) | Pre-commit hook — blocks commit on findings; CI runs full scan | Pre-commit scans only staged files with `p/owasp-top-ten`. `--no-verify` skips the hook; the CI scan is a hard backstop and (in `strict` mode) the audit detector records the bypass. |
+| TDD ordering check (BL-072) | **`commit-msg`** git hook (covers both agent and human/editor commits) delegating to `pre-commit-gate.sh --terminal-mode --tdd-only`. **Tier-keyed on `deployment`+`poc_mode`:** WARN-only on Personal / Private-POC (and unscaffolded repos); **hard block** (rc=1) on Sponsored-POC / Production. Fires when a `feat`/`fix`/`refactor` commit ships implementation with no matching test. | Heuristic — checks test-file presence, not test quality; excludes `*.md`, lockfiles, and pure deletions. On a hard-block tier, `SOLO_TDD_ATTESTED=1` (recorded to `.claude/process-state.json::tdd_attestations[]`) is the attested escape — an escape that cannot be durably recorded refuses the commit. See the Builder's Guide, "TDD ordering enforcement (BL-072)." |
 | Schema migration check | Pre-commit hook — warns when schema files are edited directly in Phase 2+ | Only active in Phase 2+; initial schema creation in Phase 0-1 is expected |
 | TDD discipline (RED-GREEN-REFACTOR) | Superpowers plugin (optional) | Strongly encourages, does not prevent non-TDD code from being committed |
 
@@ -113,7 +138,7 @@ The framework has three tiers of control, plus an intermediate tier for CI-based
 | Context Health Checks every 3-4 features | Builder's Guide |
 | Approval log entries authored by the approver | Governance Framework |
 
-**What this means in practice:** The CI pipeline is your hard floor — it catches security, dependency, build issues, and phase gate violations mechanically. CI annotations warn you about documentation freshness without blocking your work. The pre-commit hooks are your early warning system — they catch secrets, nudge you on test co-location, and flag direct schema edits. Everything else depends on you following the process and reviewing the agent's output at decision gates.
+**What this means in practice:** The CI pipeline is your hard floor — it catches security, dependency, build issues, and phase gate violations mechanically. CI annotations warn you about documentation freshness without blocking your work. The pre-commit hooks are your early warning system — they catch secrets, nudge you on test co-location, and flag direct schema edits. In the **default `strict` enforcement level**, a second hard floor exists locally: `.git/hooks/framework-gate.sh` blocks user-terminal commits that violate the Build Loop / Phase classifier, and the SessionStart detector records any commit that landed via `--no-verify` to `.claude/bypass-audit.json`. You can route around the block; you cannot route around the audit. Everything else depends on you following the process and reviewing the agent's output at decision gates.
 
 **Strict mode:** Organizations that want tighter enforcement can set environment variables in their CI workflow to upgrade warnings to hard blocks:
 
@@ -189,6 +214,8 @@ Post-launch maintenance stabilizes to 1-2 hours/week (50-80 hours/year). The fir
 |---|---|---|
 | Git | Yes | [git-scm.com](https://git-scm.com/downloads) |
 | Language runtime | Yes | Node.js, Python, Rust, Go, Java/Kotlin, C#/.NET, or Dart/Flutter — depends on your language choice |
+| jq | Yes | Init offers auto-install (brew/apt/dnf). Required by the Development Guardrails for Claude Code for JSON operations. |
+| Git host CLI (`gh` or `glab`) | Yes, if using GitHub or GitLab (default host: GitHub) | **Install and authenticate before running init** — not auto-installed. `gh`: `brew install gh`, then `gh auth login`. `glab`: `brew install glab`, then `glab auth login`. Bitbucket needs no CLI (just `curl`) — export `BITBUCKET_API_TOKEN` + `BITBUCKET_API_TOKEN_EMAIL` + `BITBUCKET_WORKSPACE` instead. See [CLI Setup Addendum § Git Host CLIs](cli-setup-addendum.md#git-host-clis). |
 | Docker | Recommended | Init offers auto-install. macOS: Colima (recommended, headless) or Docker Desktop. Linux: system package. Needed for Qdrant semantic memory and OWASP ZAP DAST scanning. |
 | Claude Code | Recommended | Installed by `init.sh`, or manually: `brew install claude-code` (macOS) |
 
@@ -196,7 +223,7 @@ Post-launch maintenance stabilizes to 1-2 hours/week (50-80 hours/year). The fir
 
 **Accounts to create:**
 
-- **GitHub** — free tier is fine
+- **GitHub** (or GitLab/Bitbucket, matching your host choice) — free tier is fine
 - **AI subscription** — Claude Max (consumer tier) works for personal projects
 
 That is everything. No governance. No approvals. No paperwork. You can start building immediately after running `init.sh`.
@@ -238,7 +265,7 @@ If you want to validate the framework before completing all governance approvals
 | Mode | What's Required | What's Deferred |
 |---|---|---|
 | **Sponsored POC** | AI deployment path, project sponsor, time allocation | Insurance, liability entity, ITSM, exit criteria, backup maintainer |
-| **Private POC** | Nothing — personal exploration on your own time | All 8 pre-conditions |
+| **Private POC** | Nothing — personal exploration on your own time | All 6 pre-conditions |
 
 **POC constraints:** No production deployment, no real user data, no external users. All technical work (code, tests, scans, documentation) is production-grade and carries forward unchanged.
 
@@ -282,20 +309,22 @@ These are not framework-specific issues — they apply to any AI-assisted develo
 git clone https://github.com/kraulerson/solo-orchestrator.git
 cd solo-orchestrator
 chmod +x init.sh
-./init.sh
+./init.sh --project-dir my-project
 ```
 
-The script prompts for 7 inputs:
+Running init.sh from inside the clone is the supported flow. `--project-dir my-project` — a bare folder name — creates the project **beside** the clone, as a sibling of `solo-orchestrator/`, and skips the directory prompt below. Pass an absolute path instead and it is used exactly as given. Plain `./init.sh` with no flags still works and asks you interactively. Either way init refuses a target that would write onto the framework itself — the clone, anything inside it, or another copy of solo-orchestrator.
+
+The script prompts for 7 inputs (6 if you passed `--project-dir`):
 
 | Prompt | What You Enter | Guidance |
 |---|---|---|
 | **Project name** | Lowercase, no spaces (e.g., `invoice-tool`) | This becomes the directory name and appears in generated files. |
 | **One-sentence description** | What does it do, in plain language | Used in CLAUDE.md and the Intake template. |
-| **Platform type** | Web / Desktop / Mobile / MCP Server / Other | Determines which Platform Module is loaded and which release pipeline is generated. Pick the primary delivery surface. See the [Extending Platforms Guide](extending-platforms.md) to add new platform types. |
+| **Platform type** | Web / Desktop / Mobile / MCP Server / Other | Determines which Platform Module is loaded and which release pipeline is generated. Pick the primary delivery surface. See the [Extending Platforms Guide](https://github.com/kraulerson/solo-orchestrator/blob/main/docs/extending-platforms.md) to add new platform types. |
 | **Project track** | Light / Standard / Full | **Light:** internal tools, <10 users, skip market audit. **Standard:** external users, moderate complexity. **Full:** enterprise buyers, sensitive data, pen testing mandatory. |
 | **Personal or Organizational** | Personal / Organizational | Organizational adds governance pre-flight requirements and approval authority structures. |
 | **Primary language** | TypeScript, Python, Rust, C#, Kotlin, Java, Go, Dart, Swift, Other | Determines the CI pipeline template (testing, linting, SAST, dependency audit). |
-| **Project directory** | Path (default: `~/projects/your-project`) | Where the project is created. |
+| **Project directory** | Path — press Enter to accept the default | Where the project is created. The default is the **clone's parent directory** plus your project name, i.e. a sibling of `solo-orchestrator/` (it falls back to `~/projects/` only if that parent cannot be resolved). Typing a bare name here resolves against that same parent, so it also lands beside the clone; type an absolute path to put it anywhere else. Skipped entirely when you pass `--project-dir`. |
 
 ### What Gets Generated
 
@@ -316,6 +345,15 @@ Each project is self-contained. No runtime dependency on the solo-orchestrator r
 
 The init script also generates **two pipelines**: a CI pipeline (`ci.yml`) selected by your language (handles testing, linting, SAST, dependency audit, license checking) and a release pipeline (`release.yml`) selected by your platform (handles building, signing, packaging, and distribution). CI pipelines are working GitHub Actions workflows that run immediately on first push. Release pipelines are production-ready templates that require configuration — code signing, deployment secrets, and store credentials must be set up before your first release.
 
+**`--git-host other` (bring-your-own host and CI).** For the `other` git host (Gitea, Codeberg, self-hosted, or any SCM without a first-class driver), init.sh deliberately does **not** lay down `ci.yml` / `release.yml` — there is no canonical destination, so you configure your own CI/CD (a `.gitlab-ci.yml`, a Jenkinsfile, or your host's pipeline format). That is a one-time manual setup item, **not a failure**: `verify-install.sh` surfaces it as a non-blocking *"configure manually"* warning (it never counts toward the manual-action total that fails the check).
+
+Because `other` is also the bring-your-own-*host* path, init.sh runs `git push` to the URL you paste — and a **failed** push is a **real failure**, handled by your project's **tier** (never silently masked). The tier is decided by your `deployment` + governance mode, **not** by the `track` field (so a Sponsored/Production project can never bypass a failed push by carrying `--track light`):
+
+- **POC-Sponsored / MVP-Production (`deployment=organizational`, or `poc_mode=sponsored_poc`):** a working remote is **mandatory**. A failed push makes init print **"Setup INCOMPLETE"** and exit non-zero — no flag bypasses it (not even `--track light`).
+- **Personal / POC-Personal (`deployment=personal`):** the push failure is still a real failure by default, but you may **explicitly acknowledge** it and proceed: `--accept-local-only-risk` keeps the project local (no remote) and accepts the **data-loss risk**; `--defer-remote-push` lets you push later (`git push -u origin main`). Both are recorded in `.claude/process-state.json`, and init exits 0. Interactively, init prompts and defaults to treating the failure as a failure.
+
+Either way, the **Phase 1→2 gate enforces a verified remote**, keyed on the same tier: for POC-Sponsored / MVP-Production it is non-bypassable (a local-only acknowledgment does not let these advance), and a Personal / POC-Personal project that *deferred* its push cannot advance until the remote actually has the branch (only an acknowledged *local-only* project may advance without one). First-class hosts (`github`/`gitlab`/`bitbucket`) always keep the hard-fail contract: a real push or protection failure there makes init exit non-zero.
+
 ### What Is Auto-Generated vs. What You Configure
 
 | File | Created By | You Must | Notes |
@@ -333,7 +371,7 @@ The init script also generates **two pipelines**: a CI pipeline (`ci.yml`) selec
 | `docs/platform-modules/` | init.sh (copied) | Nothing | Platform-specific guidance |
 | `docs/reference/security-scan-guide.md` | init.sh (copied) | Nothing | Plain-language guide for common scan findings |
 | `scripts/intake-wizard.sh` | init.sh (copied) | Run to fill out the Intake | Guided script or AI-assisted conversation |
-| `scripts/resume.sh` | init.sh (copied) | Run at session start | Generates resume prompt from project state |
+| `scripts/resume.sh` | init.sh (copied) | Run at session start | Prints the exact first message to paste — state-aware: intake prompt, Phase-0 initialization prompt (Intake §13), or the classic resume prompt |
 | `templates/intake-suggestions/` | init.sh (copied) | Nothing | Context-aware suggestions for the wizard |
 | **Superpowers** | You (optional) | Install plugin, configure in CLAUDE.md | See [CLI Setup Addendum](cli-setup-addendum.md#1-superpowers) |
 | **Context7 MCP** | You (optional) | One command to add MCP server | See [CLI Setup Addendum](cli-setup-addendum.md#4-context7) |
@@ -343,7 +381,8 @@ The init script also generates **two pipelines**: a CI pipeline (`ci.yml`) selec
 
 The manifest is a JSON file maintained jointly by CDF (for framework version pin) and solo-orchestrator (for host/mode/remote). Notable fields:
 
-- `version` — framework version pin (maintained by CDF)
+- `frameworkVersion` — CDF (Development Guardrails) version pin. Written at init and re-bumped by `scripts/upgrade-project.sh` when it refreshes CDF assets (see [Refreshing CDF framework assets](#refreshing-cdf-framework-assets) below).
+- `frameworkCommit` — the CDF clone commit the pinned assets were synced from. Re-bumped alongside `frameworkVersion`.
 - `host` — git host type: `github` | `gitlab` | `bitbucket` | `other`. Written at init time; consumed by host-aware scripts to route calls through the correct driver.
 - `mode` — project mode: `personal` | `org`. Controls protection bar and some governance paths.
 - `remote_url` — HTTPS clone URL of the remote created at init.
@@ -503,14 +542,17 @@ The Intake has a checklist at the bottom. Verify every item before starting:
 
 ```bash
 cd ~/projects/your-project
-claude
+bash scripts/resume.sh   # prints the exact first message for where you are
+claude                   # paste it as your first message
 ```
 
-The agent reads `CLAUDE.md` automatically. This file contains your project configuration, framework rules, and tool constraints.
+Claude Code loads `CLAUDE.md` — your project configuration, framework rules, and tool constraints — when the session starts, but the agent does not **act on** any of it until you send your **first message**. Until then nothing happens: a blank Claude Code screen means it is ready and waiting, not stuck.
+
+`scripts/resume.sh` is the one place that decides what that first message should be. It is state-aware: the intake prompt while your Intake is unfinished, the Section 13 initialization prompt once the Intake is done and Phase 0 has not started, and a resume prompt once work is under way.
 
 ### The Initialization Prompt
 
-Section 12 of the Intake contains a ready-to-use initialization prompt. Copy and paste it into the agent at the start of Phase 0. It tells the agent:
+Section 13 of the Intake contains a ready-to-use initialization prompt. `bash scripts/resume.sh` prints it verbatim at the point you need it, so you do not have to find and copy it by hand — but you can also paste it in yourself at the start of Phase 0. Either way, it tells the agent:
 
 - The Intake is the primary constraint
 - The Builder's Guide is the process reference
@@ -574,7 +616,7 @@ AI coding agents have context limits. For long-running projects:
 
 ## 5. Phase-by-Phase Walkthrough
 
-This section covers what **you** do at each phase — not what the agent does. For the agent's process, prompts, and remediation procedures, see the [Builder's Guide](builders-guide.md). For platform-specific instructions at each phase, see your [Platform Module](platform-modules/).
+This section covers what **you** do at each phase — not what the agent does. For the agent's process, prompts, and remediation procedures, see the [Builder's Guide](builders-guide.md). For platform-specific instructions at each phase, see your [Platform Module](https://github.com/kraulerson/solo-orchestrator/tree/main/docs/platform-modules).
 
 **How to read this section:** Each phase has a table showing your actions with separate columns for personal and organizational paths. "Same" means no difference between paths. Where the organizational path has additional requirements, they are listed explicitly.
 
@@ -861,7 +903,7 @@ For each feature in the MVP Cutline, ordered by risk (highest-risk first):
 |---|---|
 | **1. Tests first (RED)** | Review the agent's test suite. Verify it includes: success-state tests, negative tests (invalid/empty/malicious input), and boundary tests. Then **write at least 3 test assertions yourself** — business logic tests, not "response is not null." Confirm all tests fail before implementation exists. |
 | **2. Implementation (GREEN)** | The agent implements code to pass the tests. Run the full test suite — all tests must pass. Manually verify the feature works as expected. If something is wrong, direct specific fixes. |
-| **3. Security audit** | Run `semgrep scan --config=p/owasp-top-ten --config=p/security-audit src/`. Review findings against the Phase 1 threat model. Check specifically for: data isolation (can one user access another's data?), input validation at all entry points, hardcoded secrets, N+1 queries, and structured logging of significant operations. |
+| **3. Security audit** | Run `semgrep scan --config=p/owasp-top-ten --config=p/security-audit --config=r/javascript.browser.security.insecure-document-method --config=.semgrep/soif-dom-sinks.yml --max-target-bytes=0 src/` — the same rule set the pre-commit gate enforces, plus the audit pack. (A narrower audit command passes and the commit is then blocked by rules the audit never ran; see the Builder's Guide Step 2.4 note.) Review findings against the Phase 1 threat model. Check specifically for: data isolation (can one user access another's data?), input validation at all entry points, hardcoded secrets, N+1 queries, and structured logging of significant operations. |
 | **4. AI-specific scrutiny** | The agent's code has known blind spots. For each feature, check: auth/access control (write explicit negative tests for unauthorized access), state management (if concurrent operations exist, write concurrency tests), data access efficiency (run EXPLAIN on AI-generated database queries touching user data), and input validation (test every user-facing input with injection payloads). |
 | **5. Documentation update** | Verify the agent updates CHANGELOG.md (feature name, date, new interfaces), interface documentation (API endpoints, contracts, error codes), and the Project Bible (new interfaces, data changes, configuration, dependencies). |
 | **6. Data model changes** | If the feature requires data model changes: generate a versioned change with "apply" and "rollback" operations, verify existing tests still pass, verify rollback cleanly reverts (against realistic data, not empty state), update data model documentation in the Bible. Never modify the data model directly — all changes through the versioning tool. |
@@ -955,7 +997,7 @@ If any check fails, return to the Build Loop. Do not proceed to Phase 3.
 | Run E2E/integration tests on all target platforms | Fix failures — these are integration gaps | Same |
 | Run full SAST: `semgrep scan --config=p/owasp-top-ten --config=p/security-audit --severity ERROR --severity WARNING .` | Fix all critical/high findings | Same |
 | Run dependency scan: `snyk test` | Fix vulnerable dependencies | Same |
-| Run secret scan: `gitleaks detect --source . --verbose` | Remove any detected secrets | Same |
+| Run secret scan: `gitleaks dir . --verbose` | Remove any detected secrets | Same |
 | Generate SBOM (CycloneDX or equivalent) | Archive in docs/test-results/ | Same |
 | Validate threat model — every vector from Phase 1 has a verified mitigation or documented acceptance | Fix gaps | Same |
 | Run chaos/edge-case tests | Verify error recovery and input abuse defenses | Same |
@@ -971,6 +1013,10 @@ If any check fails, return to the Build Loop. Do not proceed to Phase 3.
 **Interpreting scan results:** See the [Security Scan Interpretation Guide](security-scan-guide.md) for plain-language explanations of common Semgrep and Snyk findings, including how to determine if a finding is real or a false positive.
 
 **Test results archival:** Save ALL scan results to `docs/test-results/` using the naming convention: `[date]_[scan-type]_[pass|fail].[ext]` (e.g., `2026-04-15_semgrep_pass.json`). These are audit evidence for the Phase 3 gate and are referenced in APPROVAL_LOG.md.
+
+**Gate enforcement (not just manual scans):** The scans above are also framework-run and mechanically verified at the Phase 3 → 4 transition — they are not a purely manual step. `scripts/check-phase-gate.sh` auto-invokes `scripts/run-phase3-validation.sh` and blocks the transition unless an aggregate summary (`docs/test-results/phase3/summary-*.md`) shows every registered scanner — `semgrep-full-tree`, `license`, `snyk`, `zap-dast`, `threat-model` (all five real as of BL-070) — as PASS or an **attested skip**. Attest an unavailable tool with `bash scripts/run-phase3-validation.sh --attest <scanner> --reason "<why>"` (recorded to `.claude/phase-state.json::phase3.attestations.<scanner>` — skips are attested, not silenced). The summary is bound to the tree it validated (BL-082), so a stale summary can't satisfy the gate. See the Builder's Guide, "Phase 3 → Phase 4 Gate," for the full contract.
+
+**License compliance is a real gate, not just an inventory (BL-086).** The `license` scanner doesn't only list your dependencies' licenses — it enforces a **deny policy** against strong copyleft (GPL / AGPL / SSPL). On the **corporate track** — an organizational deployment, a Sponsored POC, **or a Private POC** — a denied license **hard-blocks** the Phase 3→4 gate. On a **purely personal** project it PASSES but prints a large, unmissable warning naming each copyleft package and spelling out that if you ever distribute, sell, run it as a commercial service (AGPL triggers on network service alone), or move it onto the corporate track, you must remove the dependency, buy a commercial license, or open-source your own code. LGPL / MPL / EPL and permissive licenses are **not** denied, and a dual license like `MIT OR GPL-3.0` passes (you may elect the safe side). Override the list or exempt a commercially-licensed package via `.claude/license-policy.json`, or record a deliberate exception on a blocked tier with `SOLO_LICENSE_ATTESTED=1 SOLO_LICENSE_REASON="…"` (recorded to `phase3.license_exceptions[]`, never silenced). Full details, including the default deny list and the policy-file schema, are in the [Security Scan Interpretation Guide](security-scan-guide.md#license-compliance--deny-policy).
 
 **Pre-launch preparation (Standard+ track):**
 
@@ -1004,6 +1050,7 @@ If any check fails, return to the Build Loop. Do not proceed to Phase 3.
 
 | Your Action | Personal | Organizational |
 |---|---|---|
+| If `poc_mode` is set, run `scripts/upgrade-project.sh --to-production` first (see §1.2). Phase 4 is hard-blocked otherwise at both `check-phase-gate.sh` and `process-checklist.sh --start-phase4`. | Required | Required |
 | Verify production build on all target platforms | Same | Same |
 | Configure secrets in CI/CD (API keys, signing certs, deployment credentials) | Same | Same |
 | Review incident response playbook (INCIDENT_RESPONSE.md) | Self-review | Same — share with backup maintainer |
@@ -1066,9 +1113,11 @@ At every phase gate. The agent will prompt you. The gates are:
 
 | Gate | What Is Approved | Personal | Organizational |
 |---|---|---|---|
-| Phase 0 completion | Product Manifesto | Self-review | Project Sponsor |
-| Phase 1 completion | Project Bible | Self-review | Senior Technical Authority |
-| Phase 3 completion | Go-live readiness | Self-review | Application Owner + IT Security |
+| Phase 0 → 1 | Product Manifesto (problem, scope, success criteria) | Self-review | Project Sponsor |
+| Phase 1 → 2 | Project Bible (architecture, build plan, risk register) | Self-review | Senior Technical Authority |
+| Phase 2 → 3 | Build Loop complete; FRD, test coverage, code review done | Self-review | Senior Technical Authority |
+| Phase 3 → 4 | Go-live readiness (security scans, pen test, runbook, rollback) | Self-review | Application Owner + IT Security |
+| Phase 4 release | Production cutover (deployment, monitoring, handoff) | Self-review | Application Owner + IT Security |
 
 ### What Counts as Evidence
 
@@ -1162,6 +1211,139 @@ After launch, you are the operations team. Schedule these activities.
 Expect 2-4 hours/week for the first 3 months post-launch. It stabilizes to 1-2 hours/week (50-80 hours/year per application). Maintenance is bursty — a security advisory can consume a full day, and then nothing happens for two weeks.
 
 **Scaling warning:** At 10 applications, maintenance alone is a half-time job. If you are managing a portfolio, track hours per application. If total maintenance consistently exceeds your available hours, either graduate applications to engineering teams or stop taking new projects.
+
+### Refreshing CDF framework assets
+
+Your project's `.claude/framework/` subtree holds the Development Guardrails (CDF) hooks, rules, and gates — the machinery behind Claude Code's pre-commit checks (config-guard, branch-safety, plan-tracking, test-strategy, and friends). CDF ships these at project creation and continues to land fixes upstream. **Existing projects do not pick up those fixes automatically** — you refresh them by running an upgrade.
+
+**One-time setup:** keep the CDF clone current so there is something to sync from:
+
+```bash
+cd ~/.claude-dev-framework && git pull --ff-only
+```
+
+(If you do not have the clone: `git clone https://github.com/kraulerson/claude-dev-framework.git ~/.claude-dev-framework`. The default location is `~/.claude-dev-framework`; override with the `CDF_HOME` environment variable if your clone lives elsewhere.)
+
+**Refresh the assets in your project:**
+
+```bash
+cd ~/projects/your-project
+bash scripts/upgrade-project.sh --backfill-only     # lightest upgrade — syncs CDF only, no track/deployment change
+```
+
+`--backfill-only` is the lightest invocation: it refreshes CDF assets (and runs the manifest backfills) without changing your track or deployment. Any full `upgrade-project.sh` run (e.g. `--track`, `--deployment`, `--to-production`) also refreshes CDF assets as part of the upgrade.
+
+What the refresh does:
+
+- Fast-forwards the CDF clone (`git pull --ff-only`), then re-copies its `hooks/`, `rules/`, and `gates/` into your project's `.claude/framework/`, marking hook and gate scripts executable.
+- Bumps `.claude/manifest.json`'s `frameworkVersion` and `frameworkCommit` to the clone's current values, so `scripts/check-updates.sh` and the session-start version check report the version now on disk.
+
+**Graceful degradation:** if the CDF clone is missing (or the upgrade runs non-interactively without a clone), the refresh prints a `[WARN]` to stderr, keeps your project's existing `.claude/framework/` assets untouched, and the upgrade completes normally — a missing clone never blocks an upgrade. If the clone's `git pull --ff-only` fails (dirty tree or local commits), the refresh warns and proceeds using the clone's current working tree; resolve the clone's state and re-run to pick up the latest upstream fixes.
+
+**Frequency:** refresh biannually alongside the framework-document check below, or immediately whenever a CDF fix you need lands upstream.
+
+### Keeping your project current: `--sync-framework`
+
+CDF's `--backfill-only` (above) refreshes the *Development Guardrails* assets. A
+separate concern is the **solo-orchestrator** side of your project: the vendored
+gate scripts (`pre-commit-gate.sh`, `check-phase-gate.sh`, …), the helper libs,
+your git hooks, and the framework reference docs. Those are copied in at project
+creation and, at your current tier, only refresh as a side effect of a *tier
+change*. `scripts/upgrade-project.sh --sync-framework` is the same-tier refresh —
+it brings a month-old project up to current framework behaviour without changing
+your track or deployment.
+
+Run it from **inside your project**, using the **framework clone's** copy of the
+script (not your project's vendored copy — the script refuses that, because a
+copy syncing onto itself is a no-op):
+
+```bash
+cd ~/projects/your-project
+# Preview first — computes every change and writes NOTHING:
+bash ~/solo-orchestrator/scripts/upgrade-project.sh --sync-framework --dry-run
+# Then apply:
+bash ~/solo-orchestrator/scripts/upgrade-project.sh --sync-framework
+```
+
+Always run `--dry-run` first. It prints one line per file it *would* change and
+touches nothing on disk — no tmp files, no CDF calls, no manifest writes.
+
+**What it syncs (applies for you):**
+
+- **Vendored scripts + helper libs** — every script `init.sh` ships is compared
+  to the framework and re-copied when it drifts (file modes mirrored, so
+  executables stay executable). One line per *changed* file.
+- **Git hooks (ask-first).** The commit-msg TDD gate and the fallback pre-commit
+  hook are installed or refreshed **only with your consent**: interactively you
+  are prompted per hook; non-interactively nothing is touched unless you pass
+  `--install-hooks`. Refreshes replace only the framework-managed marker block —
+  anything you added outside it is preserved. A pre-`--sync-framework` hook with
+  no marker block is treated as entirely yours: it is never overwritten; a
+  `<hook>.new` sidecar is written for you to diff and adopt.
+- It also runs the manifest/host **backfills** and the **CDF asset refresh**, and
+  stamps `.claude/manifest.json`'s `soloFrameworkCommit` to the framework commit
+  you synced from (distinct from CDF's `frameworkCommit`).
+
+**What it only notices (never applies unless you say so):**
+
+- **Framework reference docs** (`docs/reference/*.md`) — you get a drift notice
+  with a capped diff. Interactively you are then asked per doc: skip, write a
+  `<doc>.new` sidecar, or overwrite in place. **A non-interactive run applies
+  nothing by default** — it prints the notice and moves on.
+- **`CLAUDE.md` and `PROJECT_INTAKE.md`** are *rendered* from templates for your
+  project, so this mode **never** rewrites them — it shows a template-level diff
+  (or an upstream-revision count) and points at the assisted-apply follow-up.
+  Your customised `CLAUDE.md` is safe, under every flag below. Nothing is written
+  *beside* them either: no `.new`, no `.bak`, no template copy — a sync leaves no
+  new `CLAUDE.md*` / `PROJECT_INTAKE.md*` file of any kind on disk.
+
+#### Applying doc updates without a prompt: `--apply-doc-updates`
+
+Scripted / CI runs have no one to answer the prompt, so if you want a
+non-interactive sync to *act* on drifted reference docs you must say so on the
+command line. There is no environment variable and no hidden default:
+
+```bash
+# Notice only (this is also what you get with no flag at all):
+bash ~/solo-orchestrator/scripts/upgrade-project.sh --sync-framework \
+  --apply-doc-updates skip
+
+# Write <doc>.new next to each drifted doc; your files are untouched:
+bash ~/solo-orchestrator/scripts/upgrade-project.sh --sync-framework \
+  --apply-doc-updates sidecar
+
+# Replace drifted docs in place — needs the second, destructive-step consent:
+bash ~/solo-orchestrator/scripts/upgrade-project.sh --sync-framework \
+  --apply-doc-updates overwrite --confirm-doc-overwrite
+```
+
+- `--apply-doc-updates <skip|sidecar|overwrite>` — what a **non-interactive** run
+  does with a drifted `docs/reference/*.md`. An unknown value is a hard usage
+  error. Interactive runs ignore it and ask you per doc, as before.
+- `--confirm-doc-overwrite` — the separate consent for the one destructive
+  action. `--apply-doc-updates overwrite` **without** it is refused per doc
+  ("in-place overwrite NOT confirmed"), and your file is left byte-identical.
+  Interactively, the same second confirmation is a `[y/N]` prompt that defaults
+  to **no**.
+- **Overwrite always backs up first.** A dated `<doc>.bak.<YYYY-MM-DD>` is written
+  and verified *before* your file is touched. If that backup cannot be written
+  (read-only directory, no space), the sync **refuses to overwrite that doc**,
+  leaves it untouched, says so loudly, and exits non-zero. It never overwrites an
+  unbacked file.
+- **A write that does not land is never reported as success.** Every apply — the
+  sidecar copy, the backup, the overwrite itself — is checked *and re-read* from
+  disk afterwards. If any of them fails (unwritable file, no space), the sync
+  prints a `[FAIL]` line naming the doc and the operation, leaves your original
+  bytes intact (restoring them from the dated backup if need be, which is kept),
+  keeps going with the *other* docs, and then **exits non-zero**. You will never
+  see `[OK]` for a doc that was not actually written.
+- **`--non-interactive`** forces this declared-flag channel even on a terminal:
+  with it, hooks need `--install-hooks` and doc applies need `--apply-doc-updates`
+  — no prompt is shown, and nothing is auto-answered `yes`.
+- Both flags are valid **only** with `--sync-framework`, and they apply **only**
+  to the seven verbatim `docs/reference/*.md` files. `CLAUDE.md` and
+  `PROJECT_INTAKE.md` stay notice-only no matter what you pass — including
+  `--apply-doc-updates sidecar`, which writes nothing next to them.
 
 ### Governance Health Checks
 
@@ -1306,7 +1488,7 @@ All scripts live in `scripts/` and can be run with `bash scripts/<name>.sh`. Scr
 | `check-updates.sh` | Framework update availability check | `bash scripts/check-updates.sh` | Any |
 | `intake-wizard.sh` | Interactive project intake questionnaire | `bash scripts/intake-wizard.sh` | Pre-0 |
 | `upgrade-project.sh` | Track/deployment upgrade (Light→Standard, personal→org) | `bash scripts/upgrade-project.sh --help` | Any |
-| `reconfigure-project.sh` | Regenerate CLAUDE.md, Approval Log, .gitignore, CI | `bash scripts/reconfigure-project.sh --help` | Any |
+| `reconfigure-project.sh` | Regenerate CLAUDE.md, APPROVAL_LOG header, intake-progress, CI/release pipelines on name/platform/language change (track/deployment use upgrade-project.sh) | `bash scripts/reconfigure-project.sh --help` | Any |
 | `resolve-tools.sh` | Tool matrix resolution by platform/language/track/phase | `bash scripts/resolve-tools.sh --help` | Any |
 | `resume.sh` | Generate session resume context for copy/paste | `bash scripts/resume.sh` | Any |
 
@@ -1379,7 +1561,7 @@ npm install -g snyk
 
 **"My project is too complex for one person."**
 
-If your project needs multiple concurrent developers, microservices, or 99.99%+ SLA, it is outside the framework's current scope. Regulated-industry compliance (SOC 2, HIPAA, PCI-DSS) is a planned extension — the governance structure already provides role-based approval gate separation, but compliance-specific modules have not yet been built. See "What This Is Not (Today)" in the [README](../README.md).
+If your project needs multiple concurrent developers, microservices, or 99.99%+ SLA, it is outside the framework's current scope. Regulated-industry compliance (SOC 2, HIPAA, PCI-DSS) is a planned extension — the governance structure already provides role-based approval gate separation, but compliance-specific modules have not yet been built. See "What This Is Not (Today)" in the [README](https://github.com/kraulerson/solo-orchestrator#readme).
 
 ---
 
@@ -1401,6 +1583,18 @@ Each session, provide the current `PROJECT_BIBLE.md` as context. The Bible is th
 
 ---
 
+**"What's the difference between `strict`, `light`, and `no` enforcement?"**
+
+`strict` (the default) installs `.git/hooks/framework-gate.sh` which blocks user-terminal git commits that violate the Build Loop / Phase classifier. `--no-verify` skips that block but the SessionStart out-of-band detector still records the commit to `.claude/bypass-audit.json`, so the audit trail is preserved. `light` removes the local block but keeps the SessionStart audit — user-terminal commits land freely and are recorded. `no` disables both — only the Claude-side audit (BL-029) keeps running. Pick `strict` unless you have a specific operational reason not to; the audit-vs-block tradeoff at the level boundary is what governance frameworks generally call defense in depth. See `init.sh --enforcement-level` and `scripts/reconfigure-project.sh --enforcement-level`.
+
+---
+
+**"Can I downgrade enforcement on an organizational/Production project?"**
+
+No. Baseline §2.5 forces `strict` for organizational projects in Sponsored POC or Production mode. `reconfigure-project.sh --enforcement-level` will refuse the transition (the lib's `validate_transition` checks deployment + poc_mode before any state change). To get to `light` or `no` on an organizational project, you would first need to be in Private POC (the personal-only POC tier) — which the framework does not let you transition to from organizational. The intentional dead-end: organizational projects don't get to opt out of governance.
+
+---
+
 **"The CI pipeline failed on first push."**
 
 Review the error. Common causes: missing secrets in GitHub (API keys, tokens), language version mismatch between your machine and the CI runner, or a dependency that requires authentication. Fix the pipeline before entering the Build Loop — a broken CI pipeline means you have no automated safety net.
@@ -1418,7 +1612,7 @@ When a CI security check blocks your build:
 | **License violation** | Find an alternative dependency with a compatible license. Do not override copyleft blocks without Legal review. |
 | **Secret detection (gitleaks)** | Remove the secret from code. Rotate the exposed credential immediately. Use environment variables or a secrets manager instead. |
 
-**Never** disable CI, commit directly to main, or use `--no-verify` to bypass security checks. If genuinely blocked, ask a security-knowledgeable peer for review.
+**Never** disable CI, commit directly to main, or use `--no-verify` to bypass security checks. If genuinely blocked, ask a security-knowledgeable peer for review. (On `strict` projects, every `--no-verify` commit is recorded to `.claude/bypass-audit.json` by the SessionStart detector — the bypass is allowed at commit time but lands in the W7 successor-handoff audit. A reviewer reading the project's history will see it.)
 
 ---
 
@@ -1457,6 +1651,8 @@ Pick the primary platform and use its module. Cross-platform concerns (e.g., a w
 
 | Version | Date | Changes |
 |---|---|---|
+| 1.5 | 2026-08-01 | Prerequisite-honesty audit: added jq and Git host CLI (`gh`/`glab`/Bitbucket credentials) rows to the Personal Project Prerequisites table (1.1), cross-referenced from the Organizational table (1.2) via "same as personal". |
+| 1.4 | 2026-08-01 | Session Start: corrected the claim that the agent acts on `CLAUDE.md` when the session opens — context is loaded at startup but not acted on until the first message, which is the dead-air this section now names; added `scripts/resume.sh` to the session-start commands and the blank-screen reassurance. The Initialization Prompt: noted that `scripts/resume.sh` prints the Intake Section 13 prompt verbatim, so it need not be found and copied by hand (the manual path is retained). |
 | 1.3 | 2026-04-10 | Added MCP Server platform to domain modules table, Extending Platforms Guide to document map, updated platform selection guidance. |
 | 1.2 | 2026-04-08 | Added Process Enforcement Details subsection (7 items) and POC Mode Lifecycle subsection (4 items) to close UAT documentation gaps. |
 | 1.1 | 2026-04-02 | Added evaluation prompts documentation (framework and project review prompts). |

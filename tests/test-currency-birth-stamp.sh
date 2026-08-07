@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# tests/test-currency-birth-stamp.sh — BL-109 S1 AGGREGATOR fidelity test.
+#
+# The BL-088 precedent: fixtures hide scaffold gaps, so this test runs the REAL
+# init.sh into a hermetic scratch project and proves the `currency` block is
+# stamped at birth with shas that recompute end-to-end. It exercises init.sh's
+# OWN copy/render/hook mechanism — the only way to catch a shipped-set or
+# render-site drift that a hand-built fixture would paper over.
+#
+# It runs init.sh THREE times (typescript / rust / other) to exercise init.sh's
+# real language→hook install decision across three representative language
+# classes. Post-BL-107 (# BL-107-UNIVERSAL-INSTALL, PR #205) the commit-msg TDD
+# gate installs for EVERY language tier, so all three scaffolds now record
+# commit-msg `present`; the enum's absent-intentional / absent-unavailable
+# states are HISTORICAL — retained only for READERS of pre-BL-107 manifests (see
+# scripts/lib/currency-manifest.sh :: soif_currency_hook_state), and NEVER
+# written by a fresh scaffold. That is why it is an AGGREGATOR: it is registered
+# ONLY in tests/full-project-test-suite.sh (SUITE_SKIP_AGGREGATORS-gated), NEVER
+# in the tests.yml unit list — it executes init.sh.
+#
+# Hermetic: mktemp, GITHUB_BASE_REF unset, init.sh run with --no-remote-creation
+# (the blessed no-live-remote path). bash-3.2 safe.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+INIT="$REPO_ROOT/init.sh"
+
+# The mechanical shipped-set parsers — the SAME source of truth the product uses to
+# build files{}, so the M/T count assertions below are independently re-derived,
+# never hardcoded (BL-109 S2 carried-obligation-7 + S3 .tmpl class rule).
+# shellcheck source=/dev/null
+. "$REPO_ROOT/scripts/lib/scaffold-shipped-set.sh"
+
+unset GITHUB_BASE_REF 2>/dev/null || true
+
+PASSED=0
+FAILED=0
+pass()  { echo "  [PASS] $1"; PASSED=$((PASSED + 1)); }
+fail_() { echo "  [FAIL] $1 — $2"; FAILED=$((FAILED + 1)); }
+
+TOPTMP="$(mktemp -d)"
+trap 'rm -rf "$TOPTMP"' EXIT
+
+# Dependency guard — init.sh needs jq + git.
+if ! command -v jq >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+  echo "SKIP: jq/git required for the init.sh-driven currency birth-stamp test"
+  echo "Results: 0 passed, 0 failed"
+  exit 0
+fi
+
+# run_init <language> <project-name> <out-scaffold-dir>
+run_init() {
+  local lang="$1" name="$2" out="$3" errf="$TOPTMP/$2.err"
+  ( cd "$TOPTMP" && "$INIT" --non-interactive \
+      --project "$name" \
+      --platform web \
+      --deployment personal \
+      --gov-mode private_poc \
+      --language "$lang" \
+      --project-dir "$out" \
+      --no-remote-creation ) >"$TOPTMP/$name.out" 2>"$errf"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Scaffold 1 — typescript: the FULL fidelity pass (shas, render bases, path,
+# present hook enum).
+# ════════════════════════════════════════════════════════════════════════════
+echo "=== Scaffolding typescript project via real init.sh (hermetic) ==="
+TS="$TOPTMP/ts"
+if ! run_init typescript curbl109ts "$TS"; then
+  fail_ "ts-scaffold-init" "init.sh exited non-zero; stderr tail: $(tail -6 "$TOPTMP/curbl109ts.err" | tr '\n' '|')"
+  echo "Results: $PASSED passed, $FAILED failed"
+  exit 1
+fi
+MAN="$TS/.claude/manifest.json"
+
+# — currency block present —
+if jq -e '.currency' "$MAN" >/dev/null 2>&1; then
+  pass "currency block present in .claude/manifest.json"
+else
+  fail_ "currency block present" "no .currency key in the birth manifest"
+  echo "Results: $PASSED passed, $FAILED failed"
+  exit 1
+fi
+
+# — exactly the six schema keys —
+keys="$(jq -r '.currency | keys | join(" ")' "$MAN")"
+if [ "$keys" = "files hooks mcpProbe renderBases schemaVersion soloFrameworkPath" ]; then
+  pass "currency has exactly the six schema keys"
+else
+  fail_ "currency schema keys" "got [$keys]"
+fi
+
+# — schemaVersion == 1 —
+[ "$(jq -r '.currency.schemaVersion' "$MAN")" = "1" ] \
+  && pass "schemaVersion == 1" || fail_ "schemaVersion" "not 1"
+
+# — every files{} sha256 recomputes against the scaffolded tree —
+jq -r '.currency.files | keys[]' "$MAN" > "$TOPTMP/ts.keys"
+sha_bad=0; sha_tot=0
+while IFS= read -r rel; do
+  [ -n "$rel" ] || continue
+  sha_tot=$((sha_tot + 1))
+  if [ ! -f "$TS/$rel" ]; then
+    sha_bad=$((sha_bad + 1)); echo "    missing on disk: $rel"; continue
+  fi
+  exp="$(shasum -a 256 "$TS/$rel" | awk '{print $1}')"
+  got="$(jq -r --arg p "$rel" '.currency.files[$p].sha256' "$MAN")"
+  [ "$exp" = "$got" ] || { sha_bad=$((sha_bad + 1)); echo "    sha mismatch: $rel"; }
+done < "$TOPTMP/ts.keys"
+if [ "$sha_bad" -eq 0 ] && [ "$sha_tot" -gt 0 ]; then
+  pass "every files{} sha256 recomputes independently ($sha_tot files)"
+else
+  fail_ "files{} sha recompute" "$sha_bad of $sha_tot mismatched/missing"
+fi
+
+# — every files{} entry has mode + state:"current" —
+non_current="$(jq -r '[.currency.files[] | select(.state != "current")] | length' "$MAN")"
+[ "$non_current" = "0" ] && pass "every files{} entry state == current" \
+  || fail_ "files{} state" "$non_current entries not current"
+no_mode="$(jq -r '[.currency.files[] | select(.mode == null or .mode == "")] | length' "$MAN")"
+[ "$no_mode" = "0" ] && pass "every files{} entry has a mode" \
+  || fail_ "files{} mode" "$no_mode entries lack a mode"
+
+# — class breakdown: A1 == 2; T and M INDEPENDENTLY re-derived (never hardcoded) —
+t_count="$(jq -r '[.currency.files[] | select(.class == "T")] | length' "$MAN")"
+a1_count="$(jq -r '[.currency.files[] | select(.class == "A1")] | length' "$MAN")"
+m_count="$(jq -r '[.currency.files[] | select(.class == "M")] | length' "$MAN")"
+
+# Class T = the docs/reference verbatim set + the bulk templates/generated/*.tmpl
+# skeletons init.sh ships verbatim (BL-109 S3 .tmpl class rule). Re-derive both via
+# the SAME lib the product uses, count those present in the scaffolded tree exactly
+# as the row emitter does (skip-if-missing), and assert EXACT parity — so adding or
+# dropping a shipped doc/template moves both sides together, never a literal.
+exp_t=0
+while IFS= read -r _rel; do
+  [ -n "$_rel" ] || continue
+  [ -f "$TS/$_rel" ] && exp_t=$((exp_t + 1))
+done <<EOF
+$(soif_parse_shipped_reference_docs "$INIT")
+$(soif_parse_shipped_templates "$INIT")
+EOF
+if [ "$t_count" = "$exp_t" ] && [ "$exp_t" -gt 7 ]; then
+  pass "Class T == independently lib-derived count ($exp_t: docs/reference + bulk .tmpl)"
+else
+  fail_ "Class T count" "manifest T=$t_count but independent lib-derived T=$exp_t (expected >7 after the .tmpl rule)"
+fi
+[ "$a1_count" = "2" ] && pass "Class A1 == 2 (CLAUDE.md + PROJECT_INTAKE.md)" \
+  || fail_ "Class A1 count" "expected 2, got $a1_count"
+
+# — Class M count: INDEPENDENTLY re-derived, not a hardcoded number (BL-109 S2
+#   carried-obligation-7 tightening of the S1 '>0' placeholder). Recompute the
+#   shipped M set (scripts + vendored skills) via the SAME lib the product uses
+#   (scripts/lib/scaffold-shipped-set.sh) against the PRISTINE framework checkout,
+#   count those present in the scaffolded tree exactly as the product's row
+#   emitter does (skip-if-missing), and assert the manifest's M count matches
+#   EXACTLY. If init.sh grows/loses a shipped script or skill, both sides move
+#   together — the test can never drift the way a literal would.
+# shellcheck source=/dev/null
+. "$REPO_ROOT/scripts/lib/scaffold-shipped-set.sh"
+exp_m=0
+while IFS= read -r _rel; do
+  [ -n "$_rel" ] || continue
+  [ -f "$TS/$_rel" ] && exp_m=$((exp_m + 1))
+done <<EOF
+$(soif_parse_shipped_scripts "$INIT" "$REPO_ROOT/scripts")
+$(soif_parse_shipped_skills  "$INIT" "$REPO_ROOT/templates/generated/skills")
+EOF
+if [ "$m_count" = "$exp_m" ] && [ "$exp_m" -gt 0 ]; then
+  pass "Class M == independently lib-derived shipped-M count ($exp_m: scripts + skills)"
+else
+  fail_ "Class M count" "manifest M=$m_count but independent lib-derived M=$exp_m"
+fi
+
+# — A2 agent-authored artifacts NOT in files{} (do not exist at birth) —
+if [ "$(jq -r '.currency.files["PRODUCT_MANIFESTO.md"] // "null"' "$MAN")" = "null" ] \
+   && [ "$(jq -r '.currency.files["PROJECT_BIBLE.md"] // "null"' "$MAN")" = "null" ]; then
+  pass "A2 artifacts (manifesto/bible) are NOT in files{}"
+else
+  fail_ "A2 in files{}" "an A2 artifact leaked into files{}"
+fi
+
+# — render bases recompute (A1 template+output; A2 template-only) —
+rb_ok=1
+# A1 CLAUDE.md
+exp="$(shasum -a 256 "$REPO_ROOT/templates/generated/claude-md.tmpl" | awk '{print $1}')"
+[ "$(jq -r '.currency.renderBases.A1["CLAUDE.md"].templateSha' "$MAN")" = "$exp" ] || { rb_ok=0; echo "    A1 CLAUDE tmpl sha diff"; }
+exp="$(shasum -a 256 "$TS/CLAUDE.md" | awk '{print $1}')"
+[ "$(jq -r '.currency.renderBases.A1["CLAUDE.md"].outputSha' "$MAN")" = "$exp" ] || { rb_ok=0; echo "    A1 CLAUDE out sha diff"; }
+# A1 PROJECT_INTAKE.md
+exp="$(shasum -a 256 "$REPO_ROOT/templates/project-intake.md" | awk '{print $1}')"
+[ "$(jq -r '.currency.renderBases.A1["PROJECT_INTAKE.md"].templateSha' "$MAN")" = "$exp" ] || { rb_ok=0; echo "    A1 INTAKE tmpl sha diff"; }
+exp="$(shasum -a 256 "$TS/PROJECT_INTAKE.md" | awk '{print $1}')"
+[ "$(jq -r '.currency.renderBases.A1["PROJECT_INTAKE.md"].outputSha' "$MAN")" = "$exp" ] || { rb_ok=0; echo "    A1 INTAKE out sha diff"; }
+# A2 templates
+exp="$(shasum -a 256 "$REPO_ROOT/templates/generated/project-bible.tmpl" | awk '{print $1}')"
+[ "$(jq -r '.currency.renderBases.A2["PROJECT_BIBLE.md"].templateSha' "$MAN")" = "$exp" ] || { rb_ok=0; echo "    A2 bible tmpl sha diff"; }
+exp="$(shasum -a 256 "$REPO_ROOT/templates/generated/product-manifesto.tmpl" | awk '{print $1}')"
+[ "$(jq -r '.currency.renderBases.A2["PRODUCT_MANIFESTO.md"].templateSha' "$MAN")" = "$exp" ] || { rb_ok=0; echo "    A2 manifesto tmpl sha diff"; }
+# A2 records template ONLY — no outputSha
+[ "$(jq -r '.currency.renderBases.A2["PROJECT_BIBLE.md"].outputSha // "null"' "$MAN")" = "null" ] || { rb_ok=0; echo "    A2 bible has outputSha (should not)"; }
+# A1 files{} sha reuses the captured render-time output sha (single hash, no post-hoc)
+[ "$(jq -r '.currency.files["CLAUDE.md"].sha256' "$MAN")" = "$(jq -r '.currency.renderBases.A1["CLAUDE.md"].outputSha' "$MAN")" ] || { rb_ok=0; echo "    A1 files sha != render outputSha"; }
+if [ "$rb_ok" -eq 1 ]; then pass "render bases recompute (A1 tmpl+out, A2 tmpl-only)"; else fail_ "render bases" "see diffs above"; fi
+
+# — soloFrameworkPath == the framework checkout used —
+got_path="$(jq -r '.currency.soloFrameworkPath' "$MAN")"
+[ "$got_path" = "$REPO_ROOT" ] && pass "soloFrameworkPath == framework checkout ($REPO_ROOT)" \
+  || fail_ "soloFrameworkPath" "expected [$REPO_ROOT], got [$got_path]"
+
+# — mcpProbe is a valid present/absent enum —
+mcp="$(jq -r '.currency.mcpProbe.context7' "$MAN")"
+{ [ "$mcp" = "present" ] || [ "$mcp" = "absent" ]; } \
+  && pass "mcpProbe.context7 is a valid enum ($mcp)" \
+  || fail_ "mcpProbe" "got [$mcp]"
+
+# — pre-existing pins/fields preserved (additive stamp) —
+[ "$(jq -r '.frameworkCommit // "MISSING"' "$MAN")" != "MISSING" ] \
+  && pass "additive: CDF frameworkCommit pin preserved" \
+  || fail_ "additive pin" "frameworkCommit lost"
+
+# — typescript hooks: commit-msg + pre-commit present —
+[ "$(jq -r '.currency.hooks["commit-msg"]' "$MAN")" = "present" ] \
+  && pass "typescript -> commit-msg hook present" \
+  || fail_ "ts commit-msg" "not present"
+[ "$(jq -r '.currency.hooks["pre-commit"]' "$MAN")" = "present" ] \
+  && pass "pre-commit hook present" \
+  || fail_ "pre-commit" "not present"
+
+# — BL-090 ref-integrity arm, exercised against a REAL generated project —
+# scripts/lint-doc-anchors.sh's cross-file reference arm (# BL-090-DOC-REFS)
+# had only ever been dogfooded against the FRAMEWORK repo's OWN docs/ tree,
+# where docs/user-guide.md and docs/builders-guide.md live ONE LEVEL
+# SHALLOWER (docs/) than where init.sh ships them (docs/reference/ — one
+# level deeper). A relative link that resolves at one depth silently breaks
+# at the other, and the framework's own dogfood run can never catch it,
+# because it never scans a SHIPPED copy — only a generated project's docs/
+# tree exercises the depth the reader actually sees. Run the ref-integrity
+# arm in --strict-refs mode against THIS scaffold's real docs/ tree (root
+# docs + docs/reference + docs/platform-modules) so a future edit to either
+# guide that reintroduces a depth-mismatched or ghost relative link fails
+# HERE, not silently in every downstream project.
+doc_refs_out="$(bash "$REPO_ROOT/scripts/lint-doc-anchors.sh" --docs-dir "$TS" --strict-refs 2>&1)"
+doc_refs_rc=$?
+if [ "$doc_refs_rc" -eq 0 ]; then
+  pass "generated project docs/ tree: BL-090 ref-integrity arm clean (--strict-refs)"
+else
+  fail_ "generated project doc-ref integrity" "lint-doc-anchors --strict-refs exited $doc_refs_rc against $TS — $(printf '%s' "$doc_refs_out" | tail -6 | tr '\n' '|')"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# Scaffold 2 — rust: commit-msg hook is PRESENT. Pre-BL-107 rust got no TDD gate
+# (inline tests → empty soif_lang_test_pattern → install skipped, recorded as
+# absent-intentional); # BL-107-UNIVERSAL-INSTALL (PR #205) now installs it for
+# EVERY language, so a fresh rust scaffold records `present`. The old
+# absent-intentional value is a legacy-reader state only (see the header block).
+# ════════════════════════════════════════════════════════════════════════════
+echo "=== Scaffolding rust project via real init.sh (hermetic) ==="
+RS="$TOPTMP/rs"
+if run_init rust curbl109rs "$RS"; then
+  st="$(jq -r '.currency.hooks["commit-msg"]' "$RS/.claude/manifest.json")"
+  [ "$st" = "present" ] \
+    && pass "rust -> commit-msg present (BL-107 universal install)" \
+    || fail_ "rust commit-msg" "expected present (# BL-107-UNIVERSAL-INSTALL, PR #205), got [$st]"
+else
+  fail_ "rust-scaffold-init" "init.sh exited non-zero; stderr tail: $(tail -6 "$TOPTMP/curbl109rs.err" | tr '\n' '|')"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# Scaffold 3 — other: commit-msg hook is PRESENT. The `other` catch-all language
+# likewise gets the universal commit-msg gate (# BL-107-UNIVERSAL-INSTALL, PR
+# #205); pre-BL-107 it recorded absent-unavailable. A LEGACY manifest still
+# carrying absent-unavailable is surfaced as a finding at the enforcement tier,
+# never laundered into a fact — but a fresh scaffold records `present`.
+# ════════════════════════════════════════════════════════════════════════════
+echo "=== Scaffolding 'other'-language project via real init.sh (hermetic) ==="
+OT="$TOPTMP/ot"
+if run_init other curbl109ot "$OT"; then
+  st="$(jq -r '.currency.hooks["commit-msg"]' "$OT/.claude/manifest.json")"
+  [ "$st" = "present" ] \
+    && pass "other -> commit-msg present (BL-107 universal install)" \
+    || fail_ "other commit-msg" "expected present (# BL-107-UNIVERSAL-INSTALL, PR #205), got [$st]"
+else
+  fail_ "other-scaffold-init" "init.sh exited non-zero; stderr tail: $(tail -6 "$TOPTMP/curbl109ot.err" | tr '\n' '|')"
+fi
+
+# ── Tally ───────────────────────────────────────────────────────────────────
+echo ""
+echo "Results: $PASSED passed, $FAILED failed"
+[ "$FAILED" -eq 0 ] && exit 0 || exit 1

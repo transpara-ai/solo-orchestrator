@@ -19,7 +19,16 @@ set -euo pipefail
 #   scripts/process-checklist.sh --help
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/helpers.sh"
+# BL-046: uses print_ok/warn/fail/info + prompt_yes_no + guard_not_in_framework
+# only — source core subset.
+source "$SCRIPT_DIR/lib/helpers-core.sh"
+
+# security-audits-2 (S3, 2026-04-26 audit sweep): the helpers.sh docstring at
+# guard_not_in_framework names scripts/process-checklist.sh as a script that
+# MUST invoke the guard. The script writes .claude/process-state.json and
+# .claude/phase-state.json — running it from the framework root would scatter
+# state files into the framework itself. Refuse early.
+guard_not_in_framework || exit 1
 
 PROCESS_STATE=".claude/process-state.json"
 PHASE_STATE=".claude/phase-state.json"
@@ -51,10 +60,197 @@ _set_current_phase_min() {
   fi
 }
 
+# ── DELTA-SEAM-BEGIN ─────────────────────────────────────────────────────────
+# THE ONE SEAM into the post-MVP delta module.
+#
+# SPEC: docs/designs/2026-08-02-delta-track-v1.md §3.1 (the module inventory and
+# "the one seam"), §7.1 (the state schema and D7's single-writer rule), §7.2
+# (the project-owned policy schema), §3.2 (NOTICE-ONLY), §0.3-C9/C10.
+#
+# WHY THIS FILE AND NO OTHER (C10). `pre-commit-gate.sh` already invokes this
+# script (`# BL-010-COMMITMSG-BL006` and the `--check-commit-ready --subject`
+# call), so it is BOTH the commit-gate classifier and D7's designated single
+# writer of `.claude/delta-state.json`. "One narrow seam into the commit gate"
+# (D1) and "single writer = process-checklist.sh" (D7) therefore name ONE
+# core -> delta edge, not two. scripts/lint-delta-boundary.sh allowlists exactly
+# this path and ASSERTS the allowlist length is 1 — a second seam is a design
+# change, not an append.
+#
+# D7, THE SINGLE-WRITER RULE, AND WHAT IT COSTS. Nothing else writes
+# `.claude/delta-state.json` — not `delta.sh`, not `cut-release.sh`, not the
+# session hook. They all ROUTE their writes through `--delta-state-update`.
+# §0.3-C9 records that this is a NEW, stricter invariant than the framework's
+# own practice (`.claude/process-state.json` has four writers today), so it is
+# not inherited and cannot be assumed: the lint is what makes it checkable.
+#
+# THE SURFACE, AND WHY IT IS THIS SMALL
+#   --delta-state-read              print the state document (§7.1), or the
+#                                   empty schema when there is none. rc 0.
+#                                   TOLERANT ON PURPOSE — a corrupt file warns
+#                                   on stderr and reads as empty, so one bad
+#                                   edit cannot kill the whole toolchain. That
+#                                   is right for every PER-DELTA operation and
+#                                   WRONG for exactly one question; see below.
+#   --delta-state-read-strict       the same document, but NEVER falling back:
+#                                   rc 0 with the document; rc 3 when the file
+#                                   exists and cannot be read as a state
+#                                   document; rc 4 when there is no file at all.
+#                                   Nothing on stdout in either failure case.
+#                                   FOR RELEASE-GATING READS (R-WP5-2). An
+#                                   adversarial review showed that with a hotfix
+#                                   retro owed, corrupting the state file makes
+#                                   the tolerant read answer with the empty
+#                                   schema at rc 0 and DELETING it is silent —
+#                                   so §9.2's "any open retro blocks the cut"
+#                                   never fires and `rm` is loan forgiveness in
+#                                   one keystroke. Illegibility of a due DATE is
+#                                   treated as overdue (WP5); illegibility of
+#                                   the LEDGER must not be treated as absolution.
+#   --delta-state-update <jq>       read -> apply the filter -> ATOMIC write
+#                                   under the APPEND rule. ONE guarded primitive
+#                                   rather than a verb per caller (activation /
+#                                   gates_completed append / retro append /
+#                                   cadence stamp / closed append): five verbs
+#                                   would be five places to forget the guard,
+#                                   and the guard — not the verb — is what D7 is
+#                                   actually about.
+#                                   WHAT THE GUARD ACTUALLY REFUSES, precisely,
+#                                   because "anything that violates the schema"
+#                                   was an over-claim: a candidate that is not an
+#                                   object with exactly the five §7.1 keys;
+#                                   schemaVersion that is not a number;
+#                                   active_delta that is neither object nor null;
+#                                   hotfix_retros / closed that are not arrays;
+#                                   cadence that is not an object; a closed row
+#                                   that is not an object; and any drop, reorder
+#                                   or rewrite of an existing closed row. WP4
+#                                   added one more: a candidate that swaps a
+#                                   DIFFERENT delta id into an already-occupied
+#                                   active_delta slot, which would discard the
+#                                   open delta's gates_completed history. The
+#                                   operator-facing refusal stays in delta.sh
+#                                   where it can name the delta in the way; this
+#                                   one closes the crafted-filter path into the
+#                                   same loss.
+#                                   WHAT IT DOES NOT REFUSE, deliberately:
+#                                   MUTATING an open active_delta in place — a
+#                                   gates_completed append, a close-time
+#                                   attribute raise. Every legitimate write has
+#                                   that shape, so only the id swap is refused.
+#                                   Inner shapes of cadence / hotfix_retros /
+#                                   active_delta are likewise later WPs' — see
+#                                   the WHAT IT DELIBERATELY DOES NOT ENFORCE
+#                                   block in scripts/lib/delta-state.sh.
+#   --delta-state-ship <id> <ver>   record `shipped_in` on an already-closed
+#                                   delta — §7.1's cut-time write, which
+#                                   `cut-release.sh` (§9) reaches through here
+#                                   and never by touching the file. A SEPARATE,
+#                                   narrower pathway on purpose: the append rule
+#                                   is not widened by one character, and this
+#                                   action permits EXACTLY ONE mutation shape —
+#                                   one closed row's shipped_in going null -> a
+#                                   non-empty string, everything else identical.
+#                                   WRITE-ONCE: a row that already has a version
+#                                   is refused, never overwritten.
+#   --delta-policy-init             seed `.claude/delta-policy.json` with the
+#                                   §7.2 defaults, ONCE. Never overwrites.
+#   --delta-policy-get <key>        dotted-key read with per-key fallback to the
+#                                   framework defaults. rc 1 if the key exists
+#                                   nowhere.
+#   --delta-policy-notice           the §3.2 NOTICE-ONLY key-diff. Prints one
+#                                   line naming policy keys the framework has
+#                                   learned that the project file lacks, and
+#                                   writes nothing. Silent when there is no
+#                                   policy file or nothing is missing.
+#
+# WHY THE BLOCK IS HERE AND CONTIGUOUS. Every reference to the delta module in
+# this file lives between these two markers — including the flag matching — so
+# §3.1's severability test (WP7: delete the module, revert the seam, the full
+# suite still passes) is a single-block revert. That is also why the delta
+# actions are NOT listed in `--help` below: the help text would be a second,
+# non-contiguous delta reference in a core file.
+#
+# It sits AFTER `guard_not_in_framework` on purpose — the seam writes into
+# `.claude/`, so it must refuse to run inside the framework repo exactly like
+# every other action here. Tests therefore run in fixtures, never in-tree.
+#
+# The dispatch runs BEFORE the main argument loop so a delta action never
+# touches `.claude/process-state.json` (`ensure_state_file`) as a side effect.
+_delta_seam_dispatch() {
+  local action="${1:-}"; shift || true
+  local libdir="$SCRIPT_DIR/lib"
+
+  # The module is severable, so it can genuinely be absent. Fail loudly with a
+  # dedicated code (2 = environment/invocation) rather than crashing on a
+  # missing source file.
+  if [ ! -f "$libdir/delta-state.sh" ] || [ ! -f "$libdir/delta-policy.sh" ]; then
+    echo "process-checklist: the delta module is not installed in $libdir — no delta actions are available." >&2
+    return 2
+  fi
+  # shellcheck source=/dev/null
+  . "$libdir/delta-state.sh"
+  # shellcheck source=/dev/null
+  . "$libdir/delta-policy.sh"
+
+  # All delta paths resolve against the CWD, exactly like PROCESS_STATE and
+  # PHASE_STATE above — the whole script is already cwd-relative.
+  case "$action" in
+    --delta-state-read)
+      delta_state_read "."
+      ;;
+    --delta-state-read-strict)
+      delta_state_read_strict "."
+      ;;
+    --delta-state-update)
+      if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
+        echo "process-checklist --delta-state-update: a jq filter argument is required." >&2
+        return 2
+      fi
+      delta_state_update "." "$1"
+      ;;
+    --delta-state-ship)
+      if [ $# -lt 2 ] || [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+        echo "process-checklist --delta-state-ship: a delta id and a version are both required (e.g. --delta-state-ship DELTA-005 v1.2.1)." >&2
+        return 2
+      fi
+      delta_state_ship "." "$1" "$2"
+      ;;
+    --delta-policy-init)
+      delta_policy_seed "."
+      ;;
+    --delta-policy-get)
+      if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
+        echo "process-checklist --delta-policy-get: a dotted policy key is required (e.g. size_thresholds.small)." >&2
+        return 2
+      fi
+      delta_policy_get "." "$1"
+      ;;
+    --delta-policy-notice)
+      delta_policy_notice "."
+      ;;
+    *)
+      echo "process-checklist: unknown delta action '$action'." >&2
+      return 2
+      ;;
+  esac
+}
+
+# The `if` form is load-bearing under `set -euo pipefail`: it suspends errexit
+# for the whole dynamic extent of the call, so a legitimate non-zero return
+# (a refused write, an unknown policy key) reaches `exit` as itself instead of
+# aborting the shell somewhere inside the module.
+case "${1:-}" in
+  --delta-state-read|--delta-state-read-strict|--delta-state-update|--delta-state-ship|--delta-policy-init|--delta-policy-get|--delta-policy-notice)
+    if _delta_seam_dispatch "$@"; then exit 0; else exit $?; fi
+    ;;
+esac
+# ── DELTA-SEAM-END ───────────────────────────────────────────────────────────
+
 # --- Argument parsing ---
 ACTION=""
 ARG_VALUE=""
 COMMIT_MSG=""
+COMMIT_SUBJECT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -64,17 +260,21 @@ while [ $# -gt 0 ]; do
     --start-phase1)     ACTION="start-phase1";      shift ;;
     --start-phase3)     ACTION="start-phase3";      shift ;;
     --start-phase4)     ACTION="start-phase4";      shift ;;
+    --finalize-phase)   ACTION="finalize-phase";   ARG_VALUE="$2"; shift 2 ;;
     --verify-init)      ACTION="verify-init";       shift ;;
     --status)           ACTION="status";            shift ;;
     --check-commit-ready) ACTION="check-commit-ready"; shift ;;
     --check-commit-message) ACTION="check-commit-message"; COMMIT_MSG="$2"; shift 2 ;;
     --reset)            ACTION="reset";             ARG_VALUE="$2"; shift 2 ;;
     --reset-all)        ACTION="reset-all";         shift ;;
+    --invariant-check)  ACTION="invariant-check";   shift ;;
+    --subject)          COMMIT_SUBJECT="$2";        shift 2 ;;
     --help|-h)
       echo "Usage: scripts/process-checklist.sh [COMMAND]"
       echo ""
       echo "Commands:"
       echo "  --start-feature NAME        Start a new build loop for the named feature"
+      echo "  --start-phase1              Begin Phase 1 architecture planning (consults the 0->1 gate first — BL-114)"
       echo "  --complete-step PROC:STEP   Complete a step in a process (sequential enforcement)"
       echo "  --start-uat N               Start UAT session N"
       echo "  --start-phase3              Start Phase 3 validation"
@@ -82,9 +282,12 @@ while [ $# -gt 0 ]; do
       echo "  --verify-init               Auto-verify Phase 2 initialization steps"
       echo "  --status                    Print human-readable status of all processes"
       echo "  --check-commit-ready        Check if commit is allowed (used by PreToolUse hook)"
+      echo "  --check-commit-ready --subject SUBJ  Short-circuit Phase 2 source block when subject"
+      echo "                                       does NOT match feat-prefix (chore/fix/refactor/etc)"
       echo "  --check-commit-message MSG  Check commit-message prefix (feat:) against Build Loop state (BL-006)"
       echo "  --reset PROCESS             Reset a single process to initial state"
       echo "  --reset-all                 Reset all processes to initial state"
+      echo "  --invariant-check           Self-test: every get_steps_for_process key has a reset arm + template entry"
       echo "  --help                      Show this help"
       echo ""
       echo "Processes: build_loop, uat_session, phase3_validation, phase4_release, phase2_init"
@@ -111,6 +314,7 @@ ensure_state_file() {
 {
   "build_loop": {"feature": null, "step": 0, "steps_completed": [], "started_at": null},
   "uat_session": {"session_id": null, "step": 0, "steps_completed": [], "started_at": null},
+  "phase1_architecture": {"steps_completed": [], "started_at": null},
   "phase3_validation": {"steps_completed": [], "started_at": null},
   "phase4_release": {"steps_completed": [], "started_at": null},
   "phase2_init": {"steps_completed": [], "verified": false}
@@ -131,7 +335,7 @@ get_steps_for_process() {
     phase2_init)        echo "${PHASE2_INIT_STEPS[@]}" ;;
     *)
       print_fail "Unknown process: $process"
-      echo "Valid processes: build_loop, uat_session, phase3_validation, phase4_release, phase2_init" >&2
+      echo "Valid processes: build_loop, uat_session, phase1_architecture, phase3_validation, phase4_release, phase2_init" >&2
       exit 1
       ;;
   esac
@@ -144,28 +348,276 @@ step_is_completed() {
   jq -e --arg step "$step" ".${process}.steps_completed | index(\$step) != null" "$PROCESS_STATE" >/dev/null 2>&1
 }
 
+# WALK-ISSUE-010-SLUG: fold arbitrary prose (a feature name, a commit scope,
+# a commit description) to a lowercase `-`-separated slug so the two can be
+# compared without demanding that the operator retype a name verbatim.
+_build_loop_slug() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9' '-' \
+    | sed 's/--*/-/g; s/^-//; s/-$//'
+}
+
+# WALK-ISSUE-010-STOPLIST: tokens that name no feature. A shared token only
+# counts as an identity when it says WHICH feature — these say only that the
+# subject is software. Deliberately short and only ever consulted by the
+# single-shared-token arm below: the whole-slug arm is NOT stoplisted, so a
+# feature genuinely called "config" still matches `feat(config): …`.
+_BUILD_LOOP_GENERIC_TOKENS=" common component components config configuration feature features general handler helper helpers index initial manager module project service services setup shared support system update updates utility utilities utils version "
+
+# WALK-ISSUE-010-IDENTITY: does this commit subject NAME the given feature?
+# The identity bound is what keeps the UAT-2026-04-25 C2 grace window shut
+# while still letting a CLOSED loop authorize its own feature's commit
+# (see # WALK-ISSUE-010-CLOSED-LOOP-BEGIN).
+#   - The haystack is the SCOPE plus the DESCRIPTION, never the `feat` type
+#     token itself (otherwise every feat: subject would "name" any feature
+#     whose slug contains the word "feat" — e.g. UAT's own `uat-feat-1`).
+#   - MATCH 1: the whole feature slug as a contiguous TOKEN SEQUENCE. Token
+#     bounded at EVERY length. The first cut used a raw substring for slugs of
+#     four characters or more and the 2026-08-02 adversarial review walked
+#     straight through it in both directions: `auth2` and `authentication`
+#     both "named" the feature `auth`, and `performance` "named" `form`.
+#     Letters inside a word are not a name.
+#   - MATCH 2: ONE shared whole token, if that token is DISTINCTIVE — at
+#     least five characters AND not in the stoplist above. The same review
+#     blessed unrelated subjects through `with` and `user`; a generic
+#     engineering noun (`service`, `config`, `update`) is that defect one size
+#     up. Five is a pinned WIDTH, asserted from both sides by U32 in
+#     tests/test-check-commit-message.sh, because a reviewer mutant that
+#     loosened the old threshold by one character survived the whole suite.
+#   - REMAINING GENEROSITY, stated rather than hidden: two features that share
+#     one distinctive word ("export-pdf" / "export-csv") can still name each
+#     other. That is the price of not demanding the slug verbatim, and it is
+#     bounded by the second half of the binding — the closed loop's own files
+#     must also be staged (# WALK-ISSUE-010-PATHBIND).
+# Returns 0 on a match, 1 otherwise (including an empty subject — a caller
+# that cannot supply the subject gets no closed-loop credit, fail closed).
+_subject_names_feature() {
+  local subject="$1" feature="$2"
+  [ -n "$subject" ] && [ -n "$feature" ] || return 1
+  local scope="" desc hay feat_slug tok
+  case "$subject" in
+    *\(*\)*:*) scope=${subject#*\(}; scope=${scope%%\)*} ;;
+  esac
+  desc=${subject#*:}
+  hay=$(_build_loop_slug "$scope $desc")
+  feat_slug=$(_build_loop_slug "$feature")
+  [ -n "$feat_slug" ] && [ -n "$hay" ] || return 1
+  case "-$hay-" in
+    *"-$feat_slug-"*) return 0 ;;
+  esac
+  local IFS='-'
+  for tok in $feat_slug; do
+    [ "${#tok}" -ge 5 ] || continue
+    case "$_BUILD_LOOP_GENERIC_TOKENS" in
+      *" $tok "*) continue ;;
+    esac
+    case "-$hay-" in
+      *"-$tok-"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# WALK-ISSUE-010-PATHBIND: does the staged set intersect the paths the closed
+# loop was working on? $1 = the receipt's newline-separated paths, $2 = the
+# staged paths. Whole-path equality, never a substring: `src/find.ts` must not
+# be satisfied by `src/find.ts.bak`. Returns 0 (authorized) when either list is
+# EMPTY — the two documented fallbacks (a loop closed on a clean tree; a commit
+# with nothing staged, e.g. `git commit -a` before the index is written). Both
+# are stated on the caller and pinned by U27.
+# PATH SPELLING: both sides come from git plumbing (`diff --name-only`,
+# `ls-files --others`) under the same core.quotePath setting, so an
+# unusual path is quoted identically in the receipt and at commit time and
+# still compares equal. A future caller that fed one side an unquoted or
+# absolute path would simply fail to match — toward blocking, never toward
+# granting — but nothing in the repo does that today; do not read this as a
+# claim that quoted paths cannot match, which is what an earlier revision of
+# this comment said and got wrong.
+_closed_loop_touches_staged() {
+  local receipt_paths="$1" staged="$2" sp rp
+  [ -n "$receipt_paths" ] || return 0
+  [ -n "$staged" ] || return 0
+  while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    while IFS= read -r rp; do
+      [ -n "$rp" ] || continue
+      if [ "$sp" = "$rp" ]; then
+        return 0
+      fi
+    done <<CLOSEDLOOPPATHS
+$receipt_paths
+CLOSEDLOOPPATHS
+  done <<STAGEDPATHS
+$staged
+STAGEDPATHS
+  return 1
+}
+
+# --- Helper: P4-001 monitoring verification evidence (walk ISSUE-017) ---
+# TRUE when HANDOFF.md records a real error -> alert -> arrived cycle, dated.
+# Two accepted shapes, in order:
+#   1. the DOCUMENTED structured block (below, and in docs/builders-guide.md
+#      Step 4.3) — the contract this check advertises in its failure message;
+#   2. the legacy free-text prose the pre-ISSUE-017 detector matched, kept so
+#      every project that already satisfied this gate still does.
+# The SEMANTIC bar is unchanged in both: an event, an alert that fired, an
+# alert that ARRIVED, and a date. What changed is that the accepted shape is
+# now written down instead of discovered by trial and error.
+_p4_monitoring_verification_ok() {
+  [ -f "HANDOFF.md" ] || return 1
+  # WALK-ISSUE-017-STRUCTURED-BEGIN — the documented block:
+  #   - Error event: …        (a deliberately triggered test error OR a real failure)
+  #   - Alert fired: …
+  #   - Alert arrived: …      ("received" accepted)
+  #   - Date verified: YYYY-MM-DD
+  # Markup-tolerant (bold/list markers, any case, any indent) and each label
+  # must carry real content — an empty label line proves nothing. This arm
+  # exists because an honest ZERO-TELEMETRY write-up (no server error stream,
+  # so no "test error" and nothing "synthetic") could not express itself in
+  # the legacy arm's vocabulary and was rejected four times in the walk.
+  local _mv_dated=0
+  if grep -qiE '(test error triggered|error triggered|error event)[*[:space:]]*:[*[:space:]]*[^*[:space:]]' HANDOFF.md 2>/dev/null \
+     && grep -qiE 'alert fired[*[:space:]]*:[*[:space:]]*[^*[:space:]]' HANDOFF.md 2>/dev/null \
+     && grep -qiE 'alert (arrived|received)[*[:space:]]*:[*[:space:]]*[^*[:space:]]' HANDOFF.md 2>/dev/null; then
+    # The date must sit ON the "Date verified" line — a date anywhere else in
+    # a handoff (a release date, a cadence table) is not a verification date.
+    _mv_dated=$(grep -iE 'date verified' HANDOFF.md 2>/dev/null \
+      | grep -cE '[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])') || _mv_dated=0
+    case "$_mv_dated" in ''|*[!0-9]*) _mv_dated=0 ;; esac
+    if [ "$_mv_dated" -gt 0 ]; then
+      return 0
+    fi
+  fi
+  # WALK-ISSUE-017-STRUCTURED-END
+  if grep -qiE 'test (error|alert)|triggered|synthetic' HANDOFF.md 2>/dev/null \
+     && grep -qiE 'received|confirmed|observed|fired|arrived' HANDOFF.md 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 # --- Helper: require Build Loop state sufficient for a commit ---
 # Used by both the file-heuristic path (--check-commit-ready) and the
 # commit-message-triggered path (--check-commit-message). Prints the spec's
 # Case A / Case B remediation to stderr on failure. Returns 0 if state OK,
 # 1 otherwise. Reads $PROCESS_STATE and the BUILD_LOOP_STEPS array.
+# $1 (optional) = the commit SUBJECT, used only by the closed-loop arm below.
 require_build_loop_state_for_commit() {
+  local subject="${1:-}"
   local feature
   feature=$(jq -r '.build_loop.feature // "null"' "$PROCESS_STATE")
   if [ "$feature" = "null" ]; then
-    print_fail "pre-commit gate: 'feat(...)' commit blocked — no Build Loop active."
-    echo "MVP Cutline work and all features require a Build Loop per" >&2
-    echo "docs/builders-guide.md \"MVP Cutline Work Requires the Build Loop\"." >&2
+    # WALK-ISSUE-010-CLOSED-LOOP-BEGIN — a COMPLETED loop authorizes ITS OWN
+    # feature's commit. The 2026-08-02 walk (ISSUE-010, Major) read CLAUDE.md's
+    # Build Loop the way it is written — mark the six steps in order, then
+    # commit the feature — and step 6 (feature_recorded) auto-resets
+    # .build_loop (the UAT-C2 fix), so the feature's own `feat:` commit was
+    # blocked PERMANENTLY: the only documented recovery was to re-register a
+    # loop for work that was already done, tested, audited and documented.
+    # Neither ordering is wrong, so the gate accepts both: an ACTIVE loop with
+    # steps 1-5 done (below), or the CLOSED-LOOP RECEIPT written at
+    # # WALK-ISSUE-010-RECEIPT when step 6 landed.
+    #   THE BOUND IS IDENTITY, NOT TIME. The receipt authorizes only commits
+    #   that NAME its feature (_subject_names_feature), so the C2 hole — one
+    #   completed loop unlocking ANY later feat: commit — stays shut; that is
+    #   pinned by U18/U20 in tests/test-check-commit-message.sh. What the
+    #   receipt DOES allow is more than one commit for the SAME closed
+    #   feature, deliberately: the Build Loop is per FEATURE, not per commit,
+    #   and re-blocking a split commit would rebuild the dead end this fixes.
+    #   All five work steps must be present in the receipt (U22) — a partial
+    #   record authorizes nothing.
+    #   SECOND HALF OF THE BINDING — THE LOOP'S OWN FILES (Karl, 2026-08-02).
+    #   The subject is operator-authored text: typing the closed feature's name
+    #   above unrelated work would otherwise let a stale receipt bless it. So
+    #   the receipt also records the paths the loop was working on when it
+    #   closed (# WALK-ISSUE-010-RECEIPT), and the staged set must intersect
+    #   them (_closed_loop_touches_staged, U25/U26). TWO DOCUMENTED FALLBACKS,
+    #   each pinned: a receipt with NO recorded paths (a loop closed on a clean
+    #   tree — the commit-FIRST ordering, U27) and a commit with NO staged
+    #   paths fall back to identity alone, because there is nothing to bind
+    #   against. Naming them is the honest alternative to pretending the bind
+    #   is total.
+    #   A THIRD BOUND WAS CONSIDERED AND DECLINED (R-GATEUX-6): the receipt
+    #   already carries `completed_at`, so a freshness window is one comparison
+    #   away. It is not here because expiring a receipt re-creates exactly the
+    #   dead end this fix exists to remove — a Friday loop, a Monday commit,
+    #   blocked — and because ISO-8601-to-epoch parsing is the GNU/BSD `date`
+    #   split this repo has been bitten by before. Recorded as a residual, not
+    #   an oversight: if the identity+files pair is ever judged too weak, the
+    #   timestamp is sitting in the receipt ready to be read.
+    local closed_feature="" closed_missing="" closed_paths="" staged_paths=""
+    closed_feature=$(jq -r '.build_loop.last_completed.feature // ""' "$PROCESS_STATE" 2>/dev/null) || closed_feature=""
+    if [ -n "$closed_feature" ]; then
+      for step in "${BUILD_LOOP_STEPS[@]:0:5}"; do
+        if ! jq -e --arg s "$step" '((.build_loop.last_completed.steps_completed // []) | index($s)) != null' "$PROCESS_STATE" >/dev/null 2>&1; then
+          closed_missing="$step"
+          break
+        fi
+      done
+      closed_paths=$(jq -r '(.build_loop.last_completed.paths // [])[]' "$PROCESS_STATE" 2>/dev/null) || closed_paths=""
+      staged_paths=$(git diff --cached --name-only 2>/dev/null) || staged_paths=""
+      if [ -z "$closed_missing" ] && _subject_names_feature "$subject" "$closed_feature"; then
+        if _closed_loop_touches_staged "$closed_paths" "$staged_paths"; then
+          return 0
+        fi
+        print_fail "pre-commit gate: 'feat(...)' commit blocked — the subject names the closed Build Loop \"$closed_feature\", but NONE of that loop's files are staged."
+        echo "A closed loop authorizes the commits of the work it actually did." >&2
+        echo "" >&2
+        echo "  That loop's files:  $(printf '%s' "$closed_paths" | tr '\n' ' ')" >&2
+        echo "  Staged now:         $(printf '%s' "$staged_paths" | tr '\n' ' ')" >&2
+        echo "" >&2
+        echo "This looks like DIFFERENT work. Give it its own loop:" >&2
+        echo "  scripts/process-checklist.sh --start-feature \"NAME\"" >&2
+        echo "then complete steps 1-5 and re-run your commit. (If this really is the" >&2
+        echo "same feature — e.g. a rename or a file created after the loop closed —" >&2
+        echo "start a loop for it; the gate cannot tell those apart from new work.)" >&2
+        echo "" >&2
+        echo "This commit did NOT happen. Confirm what landed with: git log -1 --oneline" >&2
+        echo "(never pipe git commit through | tail — it hides this message)." >&2
+        return 1
+      fi
+    fi
+    if [ -n "$closed_feature" ] && [ -z "$closed_missing" ]; then
+      print_fail "pre-commit gate: 'feat(...)' commit blocked — the only completed Build Loop is \"$closed_feature\", and this subject does not name it."
+      echo "A closed loop authorizes the commits of ITS OWN feature only." >&2
+      echo "" >&2
+      echo "To proceed, EITHER:" >&2
+      echo "  a. this IS \"$closed_feature\" — name it in the subject, e.g." >&2
+      echo "     feat($(_build_loop_slug "$closed_feature")): <what you built>" >&2
+      echo "     (the full name anywhere in the scope or description works, as does one" >&2
+      echo "      distinctive word of it — 5+ characters, not a generic term like 'service')" >&2
+      echo "  b. this is a DIFFERENT feature — give it its own loop:" >&2
+      echo "     scripts/process-checklist.sh --start-feature \"NAME\"" >&2
+      echo "     then complete steps 1-5 and re-run your commit." >&2
+    elif [ -n "$closed_feature" ]; then
+      print_fail "pre-commit gate: 'feat(...)' commit blocked — the closed Build Loop for \"$closed_feature\" is missing a required step: $closed_missing."
+      echo "A closed loop authorizes a commit only when all five work steps were completed." >&2
+      echo "" >&2
+      echo "To proceed: scripts/process-checklist.sh --start-feature \"$closed_feature\"" >&2
+      echo "then complete each step (scripts/process-checklist.sh --complete-step build_loop:STEP)" >&2
+      echo "and re-run your commit." >&2
+    else
+      print_fail "pre-commit gate: 'feat(...)' commit blocked — no Build Loop active."
+      echo "MVP Cutline work and all features require a Build Loop per" >&2
+      echo "docs/builders-guide.md \"MVP Cutline Work Requires the Build Loop\"." >&2
+      echo "" >&2
+      echo "To proceed:" >&2
+      echo "  1. scripts/process-checklist.sh --start-feature \"NAME\"" >&2
+      echo "  2. Write failing tests, implement, verify, update docs" >&2
+      echo "  3. Complete each step: scripts/process-checklist.sh --complete-step build_loop:STEP" >&2
+      echo "  4. Re-run your commit" >&2
+      echo "" >&2
+      echo "If this commit is NOT a feature (tooling, CI, scaffolding, docs)," >&2
+      echo "change the conventional-commit type: feat: -> chore:/build:/ci:/docs:." >&2
+    fi
+    # The walk lost FOUR commits to `git commit ... | tail`, which hid this
+    # very block: the operator saw no error and believed the work was saved.
     echo "" >&2
-    echo "To proceed:" >&2
-    echo "  1. scripts/process-checklist.sh --start-feature \"NAME\"" >&2
-    echo "  2. Write failing tests, implement, verify, update docs" >&2
-    echo "  3. Complete each step: scripts/process-checklist.sh --complete-step build_loop:STEP" >&2
-    echo "  4. Re-run your commit" >&2
-    echo "" >&2
-    echo "If this commit is NOT a feature (tooling, CI, scaffolding, docs)," >&2
-    echo "change the conventional-commit type: feat: -> chore:/build:/ci:/docs:." >&2
+    echo "This commit did NOT happen. Confirm what landed with: git log -1 --oneline" >&2
+    echo "(never pipe git commit through | tail — it hides this message)." >&2
     return 1
+    # WALK-ISSUE-010-CLOSED-LOOP-END
   fi
 
   # Check first 5 build_loop steps: tests_written, tests_verified_failing,
@@ -191,6 +643,24 @@ require_build_loop_state_for_commit() {
 
 start_phase1() {
   ensure_state_file
+  # BL-114-START1-GATE-CONSULT-BEGIN
+  # F3 / F-DF2-003: --start-phase1 used to advance current_phase 0→1 with NO
+  # gate consult — "[INFO] Advanced .current_phase: 0 → 1", exit 0, while
+  # gates.phase_0_to_1 was still null; from a zero state that chain reached a
+  # tagged release with nothing satisfied. The 0→1 gate is consulted HERE,
+  # before any state changes; a failing gate refuses the advance. Excision-
+  # safe fence (removing it restores the old unconsulted advance).
+  local _sp1_gate="$SCRIPT_DIR/check-phase-gate.sh"
+  if [ -x "$_sp1_gate" ]; then
+    if ! bash "$_sp1_gate" --gate phase_0_to_1; then
+      print_fail "Phase 0→1 gate is NOT clear — start-phase1 refused (see the gate output above). Satisfy the gate, then re-run."
+      exit 1
+    fi
+  else
+    print_fail "check-phase-gate.sh not found beside this script — cannot verify the 0→1 gate; refusing to advance blind."
+    exit 1
+  fi
+  # BL-114-START1-GATE-CONSULT-END
   local now
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -288,6 +758,35 @@ complete_step() {
     exit 1
   fi
 
+  # WALK-ISSUE-012-NULL-FEATURE-GUARD-BEGIN
+  # WALK ISSUE-012 (2026-08-02): `--complete-step build_loop:<step>` SUCCEEDED
+  # while `.build_loop.feature` was null — the walker's --start-feature had
+  # exited early, so two steps were recorded against NO feature and --status
+  # read "Feature: none / Progress: 2/6 steps". Every downstream consumer of
+  # the loop is feature-keyed (the security_audit artifact glob resolves the
+  # feature slug; --check-commit-message reports `feat($feature)`; the
+  # P2-007 previous-feature warning), so a featureless loop is not a loop —
+  # it is orphaned state that no gate can attribute. Steps are the evidence
+  # of work on a NAMED feature; refuse rather than record an unattributable
+  # one. The other processes carry their own identity (uat_session's
+  # session_id) or are singletons per phase, so this arm is build_loop-only.
+  #
+  # R-WALK-2: the predicate is a jq TYPE test, deliberately. `--start-feature
+  # "null"` is a legal name and stores the JSON STRING "null"; a shell-level
+  # `case "$feature" in null)` renders both that string and JSON null as the
+  # same four characters and refused a genuinely registered loop.
+  if [ "$process" = "build_loop" ]; then
+    if ! jq -e '(.build_loop.feature | type) == "string" and (.build_loop.feature | length) > 0' \
+           "$PROCESS_STATE" >/dev/null 2>&1; then
+      print_fail "No Build Loop is active — '$step_id' cannot be recorded against a null feature."
+      echo "  .build_loop.feature is null: either --start-feature was never run, or it exited before registering (e.g. an overdue Context Health Check), or the loop was closed by build_loop:feature_recorded." >&2
+      echo "  Start the loop first: scripts/process-checklist.sh --start-feature \"feature-name\"" >&2
+      echo "  Then verify:          scripts/process-checklist.sh --status" >&2
+      exit 1
+    fi
+  fi
+  # WALK-ISSUE-012-NULL-FEATURE-GUARD-END
+
   # Check if already completed
   if step_is_completed "$process" "$step_id"; then
     print_warn "Step '$step_id' already completed for $process"
@@ -326,6 +825,106 @@ complete_step() {
         echo "  Save as: docs/security-audits/${feature_slug}-security-audit.md" >&2
         artifact_check_failed=true
       fi
+      # BL-120-AUDIT-VERDICT-BEGIN
+      # F-DF2-008: this step was EXISTENCE-ONLY — the walk's audit read
+      # "CRITICAL — VULNERABLE. DO NOT SHIP." and satisfied the gate while a
+      # live stored XSS committed. The shipped template already promises the
+      # enforcement ("must … have no 'Open' findings before the
+      # security_audit process step can be marked complete"), so the verdict
+      # grammar is the TEMPLATE'S OWN Summary — zero new artifact surface.
+      # Per audit FILE (regular files only — a slug-named directory is not
+      # an audit), after stripping HTML comments and fenced code blocks (a
+      # quoted or commented-out verdict is an example, not a verdict —
+      # verifier A4/A10):
+      #   - the LAST `**All findings resolved:**` line governs (the walk's
+      #     own artifact appended rounds in ONE file; an earlier round's Yes
+      #     must not override the current round's No — verifier MUST A5b);
+      #     it must be an unqualified Yes (the unfilled `Yes / No`
+      #     placeholder and an explicit No both block); both colon-vs-bold
+      #     placements accepted (`resolved:** Yes` / `resolved**: Yes`);
+      #   - the LAST numeric `| Open | N |` row (indentation ≤3, case, bold,
+      #     and lazy trailing pipe all tolerated — GFM-equivalent
+      #     serializations are the same row) blocks on N > 0, dominating a
+      #     contradicting Yes;
+      #   - no parseable verdict blocks, FAIL-CLOSED: an audit the gate
+      #     cannot read is not a passed audit.
+      # ALL files sharing the newest mtime must pass — equal-mtime ties
+      # (zip extraction, cp -R, coarse filesystems) previously let ls -t's
+      # name-ascending tie-break prefer a stale clean round over the
+      # failing one (verifier C6; the BL-140 D-extra class). Forging a
+      # lying Yes stays possible — the operator authors the artifact; this
+      # gate closes the dishonest-by-OMISSION path, the same honesty
+      # boundary as BL-112/117.
+      if [ "$artifact_check_failed" = false ]; then
+        local bl120_f bl120_files="" bl120_mt bl120_max=0 bl120_seen=""
+        # BL-162-AUDIT-DEDUP: the two globs (*slug* and *name*) match the SAME
+        # file twice when feature_slug == feature_name (an already-slug-shaped
+        # feature like "find-in-document"), which made the verdict loop print
+        # its finding twice. Deduplicate by path so each distinct audit file is
+        # processed — and its verdict printed — exactly once. Print-count only:
+        # bl120_max is a max over identical mtimes (a duplicate cannot change
+        # it) and the verdict loop's any-open-blocks / newest-mtime semantics
+        # are unchanged (the BLOCK is idempotent — it sets
+        # artifact_check_failed=true regardless of how many times it fires).
+        local bl120_nl='
+'
+        for bl120_f in docs/security-audits/*"${feature_slug}"* \
+                       docs/security-audits/*"${feature_name}"*; do
+          [ -f "$bl120_f" ] || continue
+          case "${bl120_nl}${bl120_seen}" in
+            *"${bl120_nl}${bl120_f}${bl120_nl}"*) continue ;;
+          esac
+          bl120_seen="${bl120_seen}${bl120_f}${bl120_nl}"
+          bl120_mt=$(stat -c %Y "$bl120_f" 2>/dev/null || stat -f %m "$bl120_f" 2>/dev/null) || bl120_mt=0
+          case "$bl120_mt" in ''|*[!0-9]*) bl120_mt=0 ;; esac
+          if [ "$bl120_mt" -gt "$bl120_max" ]; then bl120_max="$bl120_mt"; fi
+          bl120_files="${bl120_files}${bl120_mt} ${bl120_f}
+"
+        done
+        if [ -z "$bl120_files" ]; then
+          # The existence arm matched something, but no candidate is a
+          # regular file (e.g. a slug-named directory) — fail closed, or a
+          # bare directory would complete the step with zero audit files.
+          print_warn "No regular audit FILE found for feature '$feature_name' (a matching directory is not an audit) — the step needs a readable findings file (BL-120)."
+          echo "  Save the audit as: docs/security-audits/${feature_slug}-security-audit.md" >&2
+          artifact_check_failed=true
+        fi
+        local bl120_entry bl120_body bl120_resolved bl120_open_row bl120_open_n
+        while IFS= read -r bl120_entry; do
+          [ -n "$bl120_entry" ] || continue
+          bl120_mt="${bl120_entry%% *}"
+          bl120_f="${bl120_entry#* }"
+          [ "$bl120_mt" -eq "$bl120_max" ] || continue
+          bl120_body=$(sed -e '/<!--/,/-->/d' -e '/^[[:space:]]*```/,/^[[:space:]]*```/d' "$bl120_f" 2>/dev/null) || bl120_body=""
+          bl120_resolved=$(printf '%s\n' "$bl120_body" \
+            | grep -iE '^[[:space:]]{0,3}\*\*all findings resolved(:\*\*|\*\*:)' | tail -1) || bl120_resolved=""
+          bl120_open_row=$(printf '%s\n' "$bl120_body" \
+            | grep -iE '^[[:space:]]{0,3}\|[[:space:]]*(\*\*)?open(\*\*)?[[:space:]]*\|[[:space:]]*[0-9]+[[:space:]]*(\||$)' | tail -1) || bl120_open_row=""
+          bl120_open_n=""
+          if [ -n "$bl120_open_row" ]; then
+            bl120_open_n=$(printf '%s\n' "$bl120_open_row" \
+              | sed -E 's/^[[:space:]]{0,3}\|[^|]*\|[[:space:]]*([0-9]+).*$/\1/') || bl120_open_n=""
+            case "$bl120_open_n" in ''|*[!0-9]*) bl120_open_n="" ;; esac
+          fi
+          if [ -n "$bl120_open_n" ] && [ "$bl120_open_n" -gt 0 ]; then
+            print_warn "Security audit '$bl120_f' records $bl120_open_n OPEN finding(s) in its latest Summary — a failing audit cannot complete this step (BL-120)."
+            echo "  Fix or formally accept every finding, set the Summary 'Open' count to 0 and '**All findings resolved:** Yes', then re-run." >&2
+            artifact_check_failed=true
+          elif [ -z "$bl120_resolved" ]; then
+            print_warn "Security audit '$bl120_f' carries NO machine-readable verdict — an audit the gate cannot read is not a passed audit (BL-120)."
+            echo "  Complete the template's Summary (templates/generated/security-audit-findings.tmpl): '| Open | 0 |' and '**All findings resolved:** Yes' — or resolve the findings it records first." >&2
+            artifact_check_failed=true
+          elif ! printf '%s\n' "$bl120_resolved" \
+                 | grep -qiE '(:\*\*|\*\*:)[[:space:]]*(\*\*)?yes(\*\*)?\.?[[:space:]]*$'; then
+            print_warn "Security audit '$bl120_f': the LATEST '**All findings resolved:**' line is not an unqualified Yes — an explicit No, or the unfilled 'Yes / No' placeholder, is not a passing verdict (BL-120)."
+            echo "  Resolve the findings the audit records, then set '**All findings resolved:** Yes' in its final Summary." >&2
+            artifact_check_failed=true
+          fi
+        done <<BL120EOF
+$bl120_files
+BL120EOF
+      fi
+      # BL-120-AUDIT-VERDICT-END
       ;;
     phase3_validation:security_hardening)
       # P3-008: Security hardening must produce scan results
@@ -342,11 +941,52 @@ complete_step() {
         artifact_check_failed=true
       fi
       ;;
+    phase4_release:production_build)
+      # BL-117-BUILD-SMOKE-BEGIN
+      # F19: the walk's release was marked built and DID NOT BOOT (tsc
+      # omitted the migration asset; `npm start` crashed ENOENT) — the step
+      # had no evidence arm at all. The checklist cannot execute every
+      # stack's runtime itself (no universal start contract, and this host
+      # discipline forbids unbounded child processes in a gate), so the
+      # enforceable unit is RECORDED SMOKE EVIDENCE: a dated record that the
+      # BUILT artifact was started with its documented command and responded
+      # — same substantive-evidence bar as the rollback/monitoring arms.
+      # Glob loop, not a two-pattern ls: an unmatched second glob makes ls
+      # exit non-zero and the || fallback would WIPE a found first match
+      # under pipefail (empirically bitten during this fix's own test run).
+      local bl117_smoke="" _bl117_cand
+      for _bl117_cand in docs/test-results/*build-smoke* docs/test-results/*production-smoke*; do
+        if [ -f "$_bl117_cand" ]; then bl117_smoke="$_bl117_cand"; break; fi
+      done
+      if [ -z "$bl117_smoke" ]; then
+        print_warn "No production-build smoke record found (docs/test-results/*build-smoke*)."
+        echo "  Build, START the built artifact with its documented command, verify it responds, and record it: docs/test-results/YYYY-MM-DD_build-smoke.md (what was started, when, the outcome). A build nobody started is not a production build." >&2
+        artifact_check_failed=true
+      elif [ ! -s "$bl117_smoke" ] \
+           || ! grep -qE '[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])' "$bl117_smoke" \
+           || ! grep -qiE 'start|boot|serv|respond|verif' "$bl117_smoke"; then
+        print_warn "Smoke record '$bl117_smoke' is not substantive (empty, undated, or no started/responded statement)."
+        artifact_check_failed=true
+      fi
+      # BL-117-BUILD-SMOKE-END
+      ;;
     phase4_release:rollback_tested)
-      # P4-001: Rollback test must produce evidence
-      if ! ls docs/test-results/*rollback* 2>/dev/null | head -1 >/dev/null 2>&1; then
+      # P4-001 + BL-105: the rollback test must produce SUBSTANTIVE evidence.
+      # Walk CM-H-15: an EMPTY file named *rollback* passed the "MANDATORY
+      # rollback test". Evidence = a non-empty record carrying a date and an
+      # outcome statement (verified/succeeded/passed/restored/failed — a
+      # recorded FAILURE is honest evidence too; an empty file is nothing).
+      local bl105_rb=""
+      bl105_rb=$(ls docs/test-results/*rollback* 2>/dev/null | head -1) || bl105_rb=""
+      if [ -z "$bl105_rb" ]; then
         print_warn "No rollback test results found in docs/test-results/."
         echo "  Record rollback test results: docs/test-results/YYYY-MM-DD_rollback-test.md" >&2
+        artifact_check_failed=true
+      elif [ ! -s "$bl105_rb" ] \
+           || ! grep -qE '[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])' "$bl105_rb" \
+           || ! grep -qiE 'verif|succeed|passed|restor|fail' "$bl105_rb"; then
+        print_warn "Rollback record '$bl105_rb' is not substantive evidence (empty, undated, or no outcome statement)."
+        echo "  The record must say WHAT was rolled back, WHEN (a date), and the OUTCOME (verified/restored/failed)." >&2
         artifact_check_failed=true
       fi
       ;;
@@ -358,18 +998,102 @@ complete_step() {
       fi
       ;;
     phase4_release:go_live_verified)
-      # P4-015: Go-live should be recorded
+      # P4-015 + BL-105: go-live verification is a DECISION GATE — the walk
+      # passed it on RELEASE_NOTES.md EXISTENCE alone while shipping a build
+      # that did not boot. The notes must be substantive: non-empty, naming a
+      # version, dated.
       if [ ! -f "RELEASE_NOTES.md" ]; then
         print_warn "RELEASE_NOTES.md not found — create release notes before marking go-live verified."
         artifact_check_failed=true
+      elif [ ! -s "RELEASE_NOTES.md" ] \
+           || ! grep -qE 'v?[0-9]+\.[0-9]+' "RELEASE_NOTES.md" \
+           || ! grep -qE '[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])' "RELEASE_NOTES.md"; then
+        print_warn "RELEASE_NOTES.md is not substantive go-live evidence (empty, no version, or no date)."
+        echo "  Record the released version, the date, and the go-live verification (smoke check) outcome." >&2
+        artifact_check_failed=true
       fi
+      # BL-106-GOLIVE-CHECKLIST-BEGIN
+      # The platform-module go-live checklist is MANDATORY *and machine-
+      # checked* (Karl's 2026-07-18 decision — before this, the guide said
+      # MANDATORY and NOTHING parsed the modules: the documented-but-
+      # unenforced BL-070..073 species at the highest-stakes step). Single
+      # source = the SHIPPED module file: every top-level `- [ ]` item under
+      # an H3 /Go-Live/ header (all four modules parse under this grammar,
+      # incl. desktop's "Go-Live Verification") must appear TICKED in a
+      # dated docs/test-results/*go-live-checklist* artifact, and no
+      # unticked box may remain in the artifact. Projects whose shipped
+      # modules carry no go-live checklist (init's "works standalone"
+      # branch) are exempt with a loud note — there is no MANDATORY list to
+      # enforce.
+      local bl106_artifact="" bl106_f bl106_mod bl106_items bl106_item bl106_any=0
+      for bl106_f in docs/test-results/*go-live-checklist*; do
+        if [ -f "$bl106_f" ]; then bl106_artifact="$bl106_f"; break; fi
+      done
+      for bl106_mod in docs/platform-modules/*.md; do
+        [ -f "$bl106_mod" ] || continue
+        bl106_items=$(awk '/^###[^#].*[Gg]o-[Ll]ive/{f=1; next} f && /^#/{exit} f' "$bl106_mod" | grep -E '^- \[ \]' | sed 's/^- \[ \][[:space:]]*//' || true)
+        [ -n "$bl106_items" ] || continue
+        bl106_any=1
+        if [ -z "$bl106_artifact" ]; then
+          print_warn "The platform go-live checklist ($(basename "$bl106_mod")) is MANDATORY but no docs/test-results/*go-live-checklist* artifact exists."
+          echo "  Walk the module's Go-Live section, tick every item in docs/test-results/go-live-checklist.md (scaffolded by init.sh; copy the module's items if absent), date it, then re-run." >&2
+          artifact_check_failed=true
+          continue
+        fi
+        while IFS= read -r bl106_item; do
+          [ -n "$bl106_item" ] || continue
+          if ! grep -F -- "$bl106_item" "$bl106_artifact" | grep -qE '^- \[[xX]\]'; then
+            print_warn "go-live checklist item from $(basename "$bl106_mod") is NOT ticked in $(basename "$bl106_artifact"): $bl106_item"
+            artifact_check_failed=true
+          fi
+        done < <(printf '%s\n' "$bl106_items")
+      done
+      if [ -n "$bl106_artifact" ]; then
+        if grep -qE '^- \[ \]' "$bl106_artifact"; then
+          print_warn "$(basename "$bl106_artifact") still contains UNTICKED go-live items — every box must be checked (or the item resolved and removed with a reason) before go-live."
+          artifact_check_failed=true
+        fi
+        if ! grep -qE '[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])' "$bl106_artifact"; then
+          print_warn "$(basename "$bl106_artifact") carries no real completion date — fill the Date field (placeholders do not count)."
+          artifact_check_failed=true
+        fi
+      elif [ "$bl106_any" -eq 0 ]; then
+        print_info "No platform module ships a go-live checklist (standalone platform) — the BL-106 checklist gate is not applicable here."
+      fi
+      # BL-106-GOLIVE-CHECKLIST-END
       ;;
     phase4_release:monitoring_configured)
-      # P4-001: Monitoring must be verified (trigger test error)
+      # P4-001 + BL-105: "'Configured' is not 'verified'" — the walk passed
+      # this with the single word "monitoring" in HANDOFF.md (CM-H-17). The
+      # handoff must document the tool AND record a VERIFICATION EVENT (a
+      # triggered test error/alert that was received) — the step's own P4-001
+      # instruction.
       if [ -f "HANDOFF.md" ]; then
         if ! grep -qi "monitoring\|error tracking\|sentry\|crashlytics\|uptimerobot" HANDOFF.md 2>/dev/null; then
           print_warn "HANDOFF.md does not document monitoring configuration."
           echo "  Document monitoring tool, dashboard URL, and alert channel in HANDOFF.md Section 8." >&2
+          artifact_check_failed=true
+        elif _p4_monitoring_verification_ok; then
+          : # evidence found — structured block or legacy free-text prose
+        else
+          print_warn "HANDOFF.md names monitoring but records NO verification event — 'configured' is not 'verified' (P4-001: a real error must have produced an alert that ARRIVED)."
+          # WALK-ISSUE-017-MESSAGE: print the accepted shape. The walk spent
+          # four attempts and 18 minutes guessing what this detector wanted
+          # from an honest write-up; a check that rejects prose owes the
+          # operator the exact block that passes.
+          echo "  Add this block to HANDOFF.md (Section 8 / Monitoring), filled in:" >&2
+          echo "" >&2
+          echo "    ### Monitoring verification" >&2
+          echo "    - Error event: <the error that occurred — a deliberately triggered test error, OR a real failure>" >&2
+          echo "    - Alert fired: <the rule / workflow / channel that fired>" >&2
+          echo "    - Alert arrived: <where it was RECEIVED, and who acted on it>" >&2
+          echo "    - Date verified: YYYY-MM-DD" >&2
+          echo "" >&2
+          echo "  All four lines are required, each with real content. A ZERO-TELEMETRY project" >&2
+          echo "  qualifies: deploy-failure alerts, uptime alerts and CI-failure notifications are" >&2
+          echo "  monitoring, and a REAL failure whose alert arrived is stronger evidence than a" >&2
+          echo "  simulated one. What is NOT accepted is a monitoring section with no verified" >&2
+          echo "  error -> alert -> arrived cycle. See docs/builders-guide.md Step 4.3." >&2
           artifact_check_failed=true
         fi
       else
@@ -394,21 +1118,116 @@ complete_step() {
       if [ -f "PRIVACY_POLICY.md" ] || [ -f "TERMS_OF_SERVICE.md" ] || [ -f "privacy-policy.md" ] || [ -f "terms-of-service.md" ]; then
         has_legal_docs=true
       fi
-      # Check for attorney review entry in APPROVAL_LOG.md
-      if [ -f "APPROVAL_LOG.md" ] && grep -qi "attorney\|legal review" APPROVAL_LOG.md 2>/dev/null; then
+      # Check for attorney review entry in APPROVAL_LOG.md.
+      # BL-115-ATTORNEY-ENTRY: the organizational APPROVAL_LOG template ships
+      # a literal '## Attorney / Legal Review' header, so a bare
+      # `grep -qi 'attorney|legal review'` was satisfied by the template's
+      # own scaffolding with ZERO real entry (walk F16 — the gate satisfied
+      # itself). A real entry is a DATED table row under the section — and
+      # the window is SECTION-BOUNDED at the next `## ` header (E1b Claim-C):
+      # an unbounded `grep -A 15` anchored on the template's own
+      # `[Attorney / firm name]` placeholder row reached the NEIGHBOURING
+      # Penetration Test section's Date row, so a filled pen-test date
+      # satisfied the attorney gate while the attorney Date stayed a
+      # placeholder. Same defect class verifier SF#1 killed in
+      # _cpg_gate_has_evidence — awk from the H2 header (exclusive) to the
+      # next `## ` header or +15 lines, whichever first.
+      if [ -f "APPROVAL_LOG.md" ] \
+         && awk 'tolower($0) ~ /^##[^#].*(attorney|legal review)/ {f=1; next} f && /^## / {exit} f' APPROVAL_LOG.md 2>/dev/null \
+            | head -15 \
+            | grep -E '^\|' \
+            | grep -qE '[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])'; then
         has_attorney_entry=true
       fi
+      # BL-115-PII-REQUIRED: legal review is required-WHEN-PII, never
+      # skipped-when-absent — "collect PII, write no policy, pass" was a
+      # complete bypass (the check was file-conditional). Fail closed when
+      # the recorded data classification says non-public data and no policy
+      # exists (BL-102's evidence doctrine).
+      local bl115_data_class=""
+      bl115_data_class=$(jq -r '.phase1_artifacts.data_classification // ""' "$PROCESS_STATE" 2>/dev/null || echo "")
       # Logic: if legal docs exist, attorney entry is required (AND, not OR)
       if [ "$has_legal_docs" = true ] && [ "$has_attorney_entry" = false ]; then
         print_warn "Legal documents found but no attorney review recorded in APPROVAL_LOG.md."
         echo "  Privacy Policy and/or Terms of Service MUST be reviewed by qualified legal counsel." >&2
-        echo "  Record the review in APPROVAL_LOG.md (Attorney / Legal Review section)." >&2
+        echo "  Record the review as a DATED row in APPROVAL_LOG.md (Attorney / Legal Review section) — the section header alone is template scaffolding, not evidence." >&2
         artifact_check_failed=true
-      elif [ "$has_legal_docs" = false ] && [ "$has_attorney_entry" = false ]; then
-        # No legal docs and no attorney entry — likely N/A (no data collection)
-        print_info "No legal documents found — attorney review may not be required."
-        echo "  If this project collects user data, create a Privacy Policy and get attorney review." >&2
-        echo "  If not applicable: proceed (use SOIF_FORCE_STEP=true if this check blocks incorrectly)." >&2
+      elif [ "$has_legal_docs" = false ]; then
+        if [ -n "$bl115_data_class" ] && [ "$bl115_data_class" != "public" ]; then
+          print_warn "data_classification='$bl115_data_class' (non-public / PII-bearing) but NO privacy policy or ToS exists — legal review cannot be skipped by not writing the documents (fail closed)."
+          echo "  Create PRIVACY_POLICY.md (and TERMS_OF_SERVICE.md if applicable), obtain attorney review, record the dated row in APPROVAL_LOG.md." >&2
+          # WALK-ISSUE-013-ZERO-COLLECTION-BEGIN
+          # WALK ISSUE-013 (2026-08-02): a local, zero-collection tool whose
+          # data_classification is honestly 'internal' (it handles the user's
+          # own documents IN MEMORY) reads this as "write a policy about data
+          # you don't collect" and looks like a gate to fight. It is not —
+          # the honest path the walker eventually found on their own is a
+          # policy that STATES zero collection, which is a real, useful
+          # artifact. Naming it here makes the exit discoverable instead of
+          # rediscovered. The gate is unchanged: an artifact is still
+          # required (this line adds no bypass and no `artifact_check_failed`
+          # exemption). Same sentence lives in docs/builders-guide.md
+          # Step 3.6 § Legal.
+          echo "  Collects and transmits NOTHING? That is still satisfied by a Privacy Policy that SAYS so — 'this product collects, stores and transmits no user data; all processing happens locally' is a valid, complete policy and the honest artifact for a zero-collection product. Classification describes the data you HANDLE, not a claim that you collect it." >&2
+          # WALK-ISSUE-013-ZERO-COLLECTION-END
+          artifact_check_failed=true
+        elif [ "$has_attorney_entry" = false ]; then
+          # No legal docs, public/unset classification — likely N/A.
+          print_info "No legal documents found and data_classification is ${bl115_data_class:-unset}/public — attorney review may not be required."
+          echo "  If this project collects user data, create a Privacy Policy and get attorney review." >&2
+          echo "  If not applicable: proceed (use SOIF_FORCE_STEP=true if this check blocks incorrectly)." >&2
+        fi
+      fi
+      ;;
+    uat_session:results_received)
+      # BL-127-UAT-EVIDENCE: the step whose entire meaning is "the testers'
+      # results are IN" used to complete with ZERO files in submissions/ —
+      # pure self-attestation (Dogfood-2 F-DF2-010). Evidence-bearing steps
+      # gate on real artifacts; the Light/solo escape is EXPLICIT and
+      # RECORDED (SOLO_UAT_SOLO_ATTESTED=1 + optional SOLO_UAT_REASON,
+      # written to uat_session.solo_attestations[] — attested, not silenced;
+      # the BL-032/071 lineage).
+      local uat_dir="" uat_n=0 uat_sid=""
+      # Verifier SF#3: resolve the session dir from the STATE's session_id —
+      # an mtime-newest heuristic passed on a STALE session's files while the
+      # current session sat empty. Fall back to newest only when the state
+      # carries no session_id (legacy).
+      uat_sid=$(jq -r '.uat_session.session_id // ""' "$PROCESS_STATE" 2>/dev/null || echo "")
+      if [ -n "$uat_sid" ] && [ -d "tests/uat/sessions/$uat_sid" ]; then
+        uat_dir="tests/uat/sessions/$uat_sid/"
+      else
+        uat_dir=$(ls -dt tests/uat/sessions/*/ 2>/dev/null | head -1) || uat_dir=""
+      fi
+      if [ "${SOLO_UAT_SOLO_ATTESTED:-0}" = "1" ]; then
+        local uat_reason uat_now uat_track
+        uat_reason="${SOLO_UAT_REASON:-unspecified - attested via SOLO_UAT_SOLO_ATTESTED}"
+        uat_now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        jq --arg r "$uat_reason" --arg at "$uat_now" \
+           '.uat_session.solo_attestations = ((.uat_session.solo_attestations // []) + [{reason: $r, at: $at, step: "results_received"}])' \
+           "$PROCESS_STATE" > "$PROCESS_STATE.tmp" && mv "$PROCESS_STATE.tmp" "$PROCESS_STATE"
+        print_ok "results_received: SOLO-MODE attested and RECORDED (reason: $uat_reason) — no external submissions required."
+        # Verifier SF#4: the escape is FOR the Light/solo track. It stays
+        # usable elsewhere (recorded, never silent) but says so loudly —
+        # reviewers of an organizational/standard project should expect to
+        # ask why UAT ran with no external testers.
+        uat_track=$(jq -r '.track // ""' "$PHASE_STATE" 2>/dev/null || echo "")
+        if [ -n "$uat_track" ] && [ "$uat_track" != "light" ]; then
+          print_warn "solo-mode UAT attestation used OUTSIDE the Light track (track: $uat_track) — recorded to process-state; reviewers should expect a justification."
+        fi
+      else
+        if [ -n "$uat_dir" ] && [ -d "${uat_dir}submissions" ]; then
+          # Verifier SF#2: exclude dotfiles — a lone .gitkeep (the standard
+          # keep-empty-dir convention) must not launder the evidence gate.
+          uat_n=$(find "${uat_dir}submissions" -type f ! -name '.*' 2>/dev/null | grep -c . ) || uat_n=0
+          case "$uat_n" in ''|*[!0-9]*) uat_n=0 ;; esac
+        fi
+        if [ "$uat_n" -ge 1 ]; then
+          print_ok "results_received: $uat_n submission file(s) present in ${uat_dir}submissions/"
+        else
+          print_warn "results_received means the testers' results are IN — but ${uat_dir:-tests/uat/sessions/<session>/}submissions/ has no files."
+          echo "  Place the tester submissions there, or — solo operator with no external testers — re-run with SOLO_UAT_SOLO_ATTESTED=1 [SOLO_UAT_REASON=\"...\"] (recorded to process-state, not silenced)." >&2
+          artifact_check_failed=true
+        fi
       fi
       ;;
     phase3_validation:integration_testing)
@@ -442,8 +1261,10 @@ complete_step() {
         echo "  Run in your terminal: SOIF_FORCE_STEP=true scripts/process-checklist.sh --complete-step ${process}:${step_id}" >&2
         exit 1
       fi
-      read -rp "Force-complete '${step_id}' without artifact? This is logged. [y/N]: " force_confirm
-      if [[ ! "$force_confirm" =~ ^[Yy]$ ]]; then
+      # Wave-3 raw-read sweep: prompt_yes_no centralizes the !-t 0 / CI
+      # default-N policy. The TTY guard above already returns 1 in
+      # non-interactive contexts; this is defense-in-depth.
+      if ! prompt_yes_no "Force-complete '${step_id}' without artifact? This is logged. [y/N]" "N"; then
         print_info "Force cancelled."
         exit 0
       fi
@@ -454,7 +1275,16 @@ complete_step() {
       print_warn "Step forced without artifact — logged to .claude/process-audit.log"
     else
       print_fail "Artifact check failed. Produce the required artifact first."
-      echo "  To force-override (Orchestrator only, logged):" >&2
+      # WALK-ISSUE-017-HATCH: advertise the override WITH its precondition.
+      # The walk's agent read this text as an available escape, spent time on
+      # it, and only then learned the override refuses without a TTY. The
+      # override stays HUMAN-ONLY by decision (Karl, 2026-08-02) — this text
+      # exists so an agent ESCALATES instead of retrying a hatch that will
+      # always refuse it.
+      echo "  To force-override: HUMAN ONLY. The override requires an INTERACTIVE" >&2
+      echo "  terminal and refuses agent/CI/non-interactive sessions by design — if you" >&2
+      echo "  are an agent, do NOT retry it: either produce the artifact, or ESCALATE to" >&2
+      echo "  the human Orchestrator and have them run, in their own terminal:" >&2
       echo "  SOIF_FORCE_STEP=true scripts/process-checklist.sh --complete-step ${process}:${step_id}" >&2
       exit 1
     fi
@@ -482,8 +1312,61 @@ complete_step() {
   # treats subsequent `feat(...)` commits as if a fresh loop is satisfied.
   # UAT 2026-04-25 bug C2 (agents 12, 43, 46): "between-features grace window."
   if [ "$process" = "build_loop" ] && [ "$step_id" = "feature_recorded" ]; then
-    jq '.build_loop = {"feature": null, "step": 0, "steps_completed": [], "started_at": null}' "$PROCESS_STATE" > "$PROCESS_STATE.tmp" && mv "$PROCESS_STATE.tmp" "$PROCESS_STATE"
-    print_ok "Build loop reset — start the next feature with: scripts/process-checklist.sh --start-feature \"NAME\""
+    # WALK-ISSUE-010-RECEIPT — the reset keeps a RECEIPT of the loop it just
+    # consumed. Without it the closing of a loop erased every trace that the
+    # feature's work was tested/implemented/audited/documented, so the
+    # feature's own `feat:` commit was blocked with no way back (ISSUE-010).
+    # The receipt is what # WALK-ISSUE-010-CLOSED-LOOP-BEGIN reads; it lives
+    # INSIDE .build_loop so `--reset build_loop` and `--reset-all` clear it
+    # with everything else, and it is overwritten by the next closed loop.
+    local bl_done_feature bl_done_steps bl_done_at bl_done_paths bl_done_paths_json
+    bl_done_feature=$(jq -r '.build_loop.feature // ""' "$PROCESS_STATE")
+    bl_done_steps=$(jq -c '.build_loop.steps_completed // []' "$PROCESS_STATE")
+    bl_done_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    # The loop's OWN FILES — the half of the binding the operator does not
+    # author (see # WALK-ISSUE-010-PATHBIND). Everything uncommitted at the
+    # moment the loop closes: staged, modified, and untracked-but-not-ignored.
+    #   THIS IS AN APPROXIMATION AND IS RECORDED AS ONE. It is "what was dirty
+    #   when the loop closed", not "the feature's files" — pre-existing dirt an
+    #   operator happened to be carrying lands in the receipt too and would
+    #   satisfy the path half later. It is a floor under the identity bound,
+    #   not an identity of its own.
+    #   THE WIDEST REMAINING OVERLAP, named rather than left to be found:
+    #   FEATURES.md and CHANGELOG.md are dirty at nearly every loop close
+    #   (`test-gate.sh --record-feature` writes them just before step 6), so
+    #   they sit in most receipts and EVERY feature touches them. They are
+    #   deliberately NOT filtered — they are the documentation_updated step's
+    #   real output, and dropping them would block the honest docs-follow-up
+    #   commit — but that means a subject naming a stale feature while staging
+    #   FEATURES.md clears the path half on shared bookkeeping. The identity
+    #   half is what refuses it. Unlike `.claude/`, these are the operator's
+    #   own work product, which is why the line is drawn here.
+    #   `.claude/` IS EXCLUDED, and that exclusion is load-bearing (R-GATEUX-1,
+    #   2026-08-02 adversarial review). Generated projects TRACK
+    #   .claude/process-state.json and CLOSING THE LOOP WRITES IT — so it was
+    #   dirty at capture time and landed in every receipt. A naive `git add -A`
+    #   then staged it, which satisfied the path binding by itself: the
+    #   reviewer committed an unrelated file under a stale feature name, rc=0.
+    #   Framework bookkeeping is never evidence of a feature's work. Pinned by
+    #   U29; without the filter the receipt is also never empty, which made the
+    #   documented empty-paths fallback dead code in real projects.
+    # An empty result stays legitimate (a loop closed on a clean tree — the
+    # commit-FIRST ordering) and falls back to identity alone rather than
+    # blocking.
+    bl_done_paths=$( { git diff --cached --name-only; git diff --name-only; \
+                       git ls-files --others --exclude-standard; } 2>/dev/null \
+                     | grep -v '^\.claude/' \
+                     | sort -u ) || bl_done_paths=""
+    bl_done_paths_json=$(printf '%s' "$bl_done_paths" \
+      | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null) || bl_done_paths_json="[]"
+    [ -n "$bl_done_paths_json" ] || bl_done_paths_json="[]"
+    jq --arg f "$bl_done_feature" --arg at "$bl_done_at" --argjson s "$bl_done_steps" \
+       --argjson p "$bl_done_paths_json" \
+       '.build_loop = {"feature": null, "step": 0, "steps_completed": [], "started_at": null,
+                       "last_completed": {"feature": $f, "completed_at": $at, "steps_completed": $s,
+                                          "paths": $p}}' \
+       "$PROCESS_STATE" > "$PROCESS_STATE.tmp" && mv "$PROCESS_STATE.tmp" "$PROCESS_STATE"
+    print_ok "Build loop closed for \"$bl_done_feature\" — its own feat: commit is still authorized; the NEXT feature needs: scripts/process-checklist.sh --start-feature \"NAME\""
   fi
 
   # Show next step if any
@@ -551,10 +1434,19 @@ start_phase3() {
 start_phase4() {
   ensure_state_file
 
+  # R-WALK-3: clear any recovery scratch file left by an EARLIER run that was
+  # killed between the recovery write and the gate consult (the undo below
+  # never got to run, and a later invocation that does not enter recovery has
+  # no variable pointing at it — it would sit in .claude/ forever). It is
+  # scratch, never a journal: nothing reads it across invocations, so an
+  # unconditional sweep at entry is the whole repair.
+  rm -f "$PROCESS_STATE.start4-recovery.bak" 2>/dev/null || true
+
   # Check POC mode — Phase 4 is blocked for POC projects
   if [ -f "$PHASE_STATE" ]; then
     local poc_mode
-    poc_mode=$(grep -o '"poc_mode"[[:space:]]*:[[:space:]]*"[^"]*"' "$PHASE_STATE" 2>/dev/null | sed 's/.*: *"//' | sed 's/"//' || echo "")
+    # BL-095: parse via the # BL-095-STATE-READERS fence (lib/helpers-core.sh).
+    poc_mode=$(soif_read_poc_mode "$PHASE_STATE")
     if [ -n "$poc_mode" ] && [ "$poc_mode" != "null" ]; then
       print_fail "Phase 4 (production release) is blocked — project is in ${poc_mode//_/ } mode."
       echo "  POC projects complete at Phase 3. To unlock Phase 4:" >&2
@@ -565,6 +1457,80 @@ start_phase4() {
 
   local now
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # BL-105-START4-DEADLOCK-RECOVERY-BEGIN
+  # WALK ISSUE-015 (2026-08-02). The generated CLAUDE.md used to tell the
+  # operator to set .current_phase by hand at EVERY gate. Do that for 3→4 and
+  # the two halves of BL-105 lock: the gate's own BL-105 arm FAILs
+  # ("current_phase is 4 but the Phase-4 release checklist was NEVER STARTED
+  # — run --start-phase4") while --start-phase4 consults that same gate first
+  # and refuses. The only command that can clear BL-105 will not run while
+  # BL-105 is failing; the escape (revert current_phase to 3, re-run) was
+  # documented nowhere. The template text is fixed too — where a
+  # --start-phaseN exists, IT owns the bump — but a project already in the
+  # bumped state needs a way OUT, so recover here.
+  #
+  # Recovery, NOT bypass: the BL-105 arm demands that the phase-4 checklist
+  # EXIST at current_phase >= 4. We SATISFY it — initialize the checklist
+  # first, then let the gate below judge the project on its real merits. If
+  # the gate still fails (a genuinely unfinished Phase 3, missing approvals,
+  # …) the initialization is ROLLED BACK and start-phase4 refuses exactly as
+  # before, so a refused command still changes no state — and the deadlock is
+  # gone either way, because the next run re-initializes before consulting.
+  # Nothing here weakens the 3→4 gate: every other check runs unchanged.
+  #
+  # Phase-scoped on purpose. --start-phase1 consults the 0→1 gate but no arm
+  # of that gate demands a started phase1_architecture checklist, and
+  # --start-phase3 consults the bug gate (test-gate.sh) rather than
+  # check-phase-gate.sh at all — both were probed at a manually-bumped
+  # current_phase and neither deadlocks. Phase 4 is the only circular pair.
+  local _sp4_recovery=0 _sp4_backup=""
+  if [ -f "$PHASE_STATE" ] && command -v jq >/dev/null 2>&1; then
+    local _sp4_cur
+    _sp4_cur=$(jq -r '.current_phase // 0' "$PHASE_STATE" 2>/dev/null) || _sp4_cur=0
+    case "$_sp4_cur" in ''|*[!0-9]*) _sp4_cur=0 ;; esac
+    if [ "$_sp4_cur" -ge 4 ] \
+       && ! jq -e '.phase4_release.started_at // empty' "$PROCESS_STATE" >/dev/null 2>&1; then
+      _sp4_recovery=1
+      print_info "current_phase is already $_sp4_cur but the Phase-4 release checklist was never started — the BL-105 deadlock state. Initializing the checklist FIRST so the 3→4 gate below is evaluated on its real merits (a manual current_phase bump is not needed for this transition: --start-phase4 owns it)."
+      _sp4_backup="$PROCESS_STATE.start4-recovery.bak"
+      cp "$PROCESS_STATE" "$_sp4_backup"
+      # The recovery itself. Deleting this ONE line restores the deadlock
+      # (the gate below still FAILs on a never-started checklist) — it is the
+      # mutation target tests/test-walk-phase-lifecycle.sh flips.
+      jq --arg now "$now" '.phase4_release = {"steps_completed": [], "started_at": $now}' "$PROCESS_STATE" > "$PROCESS_STATE.tmp" && mv "$PROCESS_STATE.tmp" "$PROCESS_STATE"  # BL-105-START4-RECOVERY-INIT
+    fi
+  fi
+  # _sp4_recovery_undo — restore the pre-recovery process-state so a REFUSED
+  # start-phase4 leaves no trace. No-op when recovery did not trigger.
+  _sp4_recovery_undo() {
+    if [ "$_sp4_recovery" -eq 1 ] && [ -n "$_sp4_backup" ] && [ -f "$_sp4_backup" ]; then
+      mv "$_sp4_backup" "$PROCESS_STATE"
+    fi
+  }
+  # BL-105-START4-DEADLOCK-RECOVERY-END
+
+  # BL-105-START4-GATE-CONSULT-BEGIN
+  # Walk-confirmed: --start-phase4 consulted ONLY poc_mode and advanced past
+  # a FAILING 3→4 gate — from current_phase=0 it jumped straight to 4 and
+  # `git tag` cut a release with nothing satisfied. The 3→4 gate (the
+  # framework's strongest — and previously forced by nothing) is consulted
+  # HERE, before any state change. Excision-safe fence.
+  local _sp4_gate="$SCRIPT_DIR/check-phase-gate.sh"
+  if [ -x "$_sp4_gate" ]; then
+    if ! bash "$_sp4_gate" --gate phase_3_to_4; then
+      _sp4_recovery_undo
+      print_fail "Phase 3→4 gate is NOT clear — start-phase4 refused (see the gate output above). Satisfy the gate, then re-run."
+      exit 1
+    fi
+  else
+    _sp4_recovery_undo
+    print_fail "check-phase-gate.sh not found beside this script — cannot verify the 3→4 gate; refusing to advance blind."
+    exit 1
+  fi
+  # BL-105-START4-GATE-CONSULT-END
+
+  rm -f "$_sp4_backup" 2>/dev/null || true
 
   jq --arg now "$now" '
     .phase4_release = {
@@ -598,10 +1564,33 @@ verify_init() {
 
   # branch_protection_configured: REAL API verification via host dispatcher
   # (spec 2026-04-21 — replaces the previous "CI yaml exists" proxy check).
-  local host_dispatcher="$SCRIPT_DIR/lib/host.sh"
-  if [ -f "$host_dispatcher" ] && [ -f ".claude/manifest.json" ]; then
+  local bp_attest_reason="" bp_attested=0
+  # BL-126-ATTEST-CONSULT-BEGIN
+  # BL-126: consult the recorded tier-limited attestation BEFORE any host API
+  # probe — exactly as check-gate.sh --preflight and --repair, and the
+  # check-phase-gate.sh backstop, already do (the attestation IS the gate on
+  # tier-limited hosts). verify_init was the ONE consumer of three that
+  # ignored it, so --verify-init FAILed an honestly-attested free-tier
+  # scaffold (Dogfood-2 F-DF2-005). SYNC: keep the honored reason set aligned
+  # with check-gate.sh's short-circuits (github_free_tier,
+  # gitlab_free_tier_approvals); BL-095/WP-F4 is the future shared-helper
+  # home for this read. The fence is excision-safe: removing it leaves
+  # bp_attested=0 and the API chain below runs unchanged.
+  bp_attest_reason=$(jq -r '.phase2_init.attestations.branch_protection.reason // ""' "$PROCESS_STATE" 2>/dev/null || echo "")
+  if [ "$bp_attest_reason" = "github_free_tier" ] || [ "$bp_attest_reason" = "gitlab_free_tier_approvals" ]; then
+    if ! step_is_completed "phase2_init" "branch_protection_configured"; then
+      jq '.phase2_init.steps_completed += ["branch_protection_configured"]' "$PROCESS_STATE" > "$PROCESS_STATE.tmp" && mv "$PROCESS_STATE.tmp" "$PROCESS_STATE"
+      auto_marked=$((auto_marked + 1))
+    fi
+    print_ok "branch_protection_configured — attested (reason: $bp_attest_reason); API enforcement not available on this tier, the recorded attestation is the gate"
+    bp_attested=1
+  fi
+  # BL-126-ATTEST-CONSULT-END
+  if [ "$bp_attested" -eq 1 ]; then
+    :  # handled by the attestation consult above
+  elif [ -f "$SCRIPT_DIR/lib/host.sh" ] && [ -f ".claude/manifest.json" ]; then
     # shellcheck disable=SC1090
-    source "$host_dispatcher"
+    source "$SCRIPT_DIR/lib/host.sh"
     local mode
     mode=$(jq -r '.mode // "personal"' .claude/manifest.json 2>/dev/null || echo "personal")
     if host_load_driver 2>/dev/null && host_verify_protection "main" "$mode" 2>/dev/null; then
@@ -730,6 +1719,17 @@ show_status() {
   local bl_total=${#BUILD_LOOP_STEPS[@]}
   echo "  Feature: $feature"
   echo "  Progress: $bl_completed/$bl_total steps"
+  # WALK-ISSUE-010-STATUS: with no active loop, "Feature: none" used to be the
+  # WHOLE story — an operator who had just closed a loop could not tell whether
+  # their finished feature could still be committed. Name the receipt.
+  if [ "$feature" = "none" ]; then
+    local bl_last
+    bl_last=$(jq -r '.build_loop.last_completed.feature // ""' "$PROCESS_STATE" 2>/dev/null) || bl_last=""
+    if [ -n "$bl_last" ]; then
+      echo "  Last completed: \"$bl_last\" — its own feat: commits are still authorized;"
+      echo "                  a DIFFERENT feature needs --start-feature first."
+    fi
+  fi
   if [ "$bl_completed" -lt "$bl_total" ]; then
     echo "  Remaining:"
     for step in "${BUILD_LOOP_STEPS[@]}"; do
@@ -799,13 +1799,46 @@ show_status() {
   # Phase 2 Init
   echo ""
   echo -e "${BOLD}Phase 2 Initialization${NC}"
-  local p2_completed
-  p2_completed=$(jq '.phase2_init.steps_completed | length' "$PROCESS_STATE")
+  # WALK-ISSUE-007-PHASE2-PROGRESS-BEGIN
+  # WALK ISSUE-007 (2026-08-02): this printed "Progress: 9/7 steps". Unlike
+  # every other process, phase2_init.steps_completed has writers OUTSIDE the
+  # PHASE2_INIT_STEPS vocabulary — init.sh and check-gate.sh record
+  # `pushed_initial` and `branch_protection_verified` through
+  # lib/phase2-state.sh::_record_phase2_step — so a raw `| length` counts
+  # names the denominator does not contain. Count the TEMPLATE steps actually
+  # present instead; the extras are still reported, on their own line, so
+  # nothing is hidden.
+  #
+  # Not merely cosmetic: the `Remaining:` block below is gated on
+  # completed < total, so an inflated numerator SUPPRESSED the list of
+  # genuinely missing steps (6 template steps + 3 extras = 9 >= 7 hid a
+  # missing initialization_verified). An honest numerator restores it.
   local p2_total=${#PHASE2_INIT_STEPS[@]}
+  local p2_completed=0 step
+  for step in "${PHASE2_INIT_STEPS[@]}"; do
+    if step_is_completed "phase2_init" "$step"; then
+      p2_completed=$((p2_completed + 1))
+    fi
+  done
+  local p2_extras="" p2_name
+  while IFS= read -r p2_name; do
+    [ -n "$p2_name" ] || continue
+    case " ${PHASE2_INIT_STEPS[*]} " in
+      *" $p2_name "*) continue ;;
+    esac
+    p2_extras="${p2_extras}    - ${p2_name}
+"
+  done <<P2EXTRA
+$(jq -r '.phase2_init.steps_completed[]? // empty' "$PROCESS_STATE" 2>/dev/null)
+P2EXTRA
   local p2_verified
   p2_verified=$(jq -r '.phase2_init.verified' "$PROCESS_STATE")
   echo "  Verified: $p2_verified"
   echo "  Progress: $p2_completed/$p2_total steps"
+  if [ -n "$p2_extras" ]; then
+    echo "  Also recorded (init-time steps, not part of the $p2_total-step checklist):"
+    printf '%s' "$p2_extras"
+  fi
   if [ "$p2_completed" -lt "$p2_total" ]; then
     echo "  Remaining:"
     for step in "${PHASE2_INIT_STEPS[@]}"; do
@@ -814,6 +1847,7 @@ show_status() {
       fi
     done
   fi
+  # WALK-ISSUE-007-PHASE2-PROGRESS-END
   echo ""
 }
 
@@ -843,22 +1877,66 @@ check_commit_ready() {
   if [ -f "$PHASE_STATE" ]; then
     current_phase=$(jq -r '.current_phase // 0' "$PHASE_STATE" 2>/dev/null || echo "0")
   fi
+  # Counter-sanitizer (2026-07-18, full-lane run 29649055577): jq's `// 0`
+  # only catches null/absent — a STRING value ("abc", "") passes through and
+  # `[ ... -lt 2 ]` leaked `integer expression expected` to stderr instead of
+  # sanitizing (test-init-schema-phase-gate T3a/T3c, failing since before the
+  # Dogfood-2 remediation — the one current_phase read the counter-sanitizer
+  # wave missed). Garbage → 0 → no enforcement, same contract as every other
+  # sanitized counter in the repo.
+  case "$current_phase" in ''|*[!0-9]*) current_phase=0 ;; esac
 
   # If phase < 2, no enforcement
   if [ "$current_phase" -lt 2 ]; then
     exit 0
   fi
 
-  # Phase 2: check init verification
-  if [ "$current_phase" -eq 2 ]; then
-    local init_verified
-    init_verified=$(jq -r '.phase2_init.verified' "$PROCESS_STATE")
-    if [ "$init_verified" != "true" ]; then
-      print_fail "Phase 2 initialization not verified."
-      echo "Run: scripts/process-checklist.sh --verify-init" >&2
-      exit 1
+  # Phase 2 init verification: the block used to live HERE, above the
+  # staged-file classification — see # BL-155-INIT-AFTER-CLASSIFY below
+  # for why it moved and what it still enforces.
+
+  # code-process-checklist-5: subject-aware short-circuit decision. When
+  # the caller passes a commit subject (--subject) AND it is NOT a
+  # feat-prefixed Conventional Commit, the Phase 2 *Build-Loop-required*
+  # block (require_build_loop_state_for_commit) is bypassed below. This
+  # unblocks chore/fix/refactor/docs/test/perf/style/build/ci/revert
+  # source commits during Phase 2, matching the BL-006 commit-message
+  # classifier semantics. Feat commits — with or without scope, with or
+  # without `!` breaking marker — continue to require a complete Build
+  # Loop. The flag is optional: callers that omit --subject fall back to
+  # the original file-heuristic enforcement.
+  #
+  # NOTE: the UAT-in-progress block below and the Phase 2 init-verified
+  # block (# BL-155-INIT-AFTER-CLASSIFY, after the docs exemption) are
+  # NOT bypassed by --subject. The init block IS file-conditional —
+  # docs/dep-manifest-only commits are exempt — but never
+  # subject-conditional. Only the Build-Loop-state requirement is
+  # subject-conditional.
+  local subject_is_feat=true
+  if [ -n "$COMMIT_SUBJECT" ]; then
+    # Same feat regex as check_commit_message at line ~1126.
+    if ! [[ "$COMMIT_SUBJECT" =~ ^feat(\([^\)]*\))?!?:[[:space:]] ]]; then
+      subject_is_feat=false
     fi
   fi
+  # BL-139-SUBJECTLESS-DEFAULT-BEGIN
+  # Dogfood-3 F-DF3-004: framework-gate.sh invokes this WITHOUT --subject
+  # (pre-commit CANNOT know the current subject — git writes COMMIT_EDITMSG
+  # after pre-commit, the BL-119 lesson), and the presumed-feat default
+  # blocked every legitimate test:/chore:/refactor: source commit at
+  # Phase 2 on the user-terminal path. A subject-less caller cannot claim
+  # the commit is a feat, so the default flips to NOT-feat here. NO
+  # enforcement is lost: the COMMIT-MSG surface (--terminal-mode
+  # --tdd-only → BL-006) enforces feat-requires-Build-Loop with the
+  # CURRENT subject one stage later — proven end-to-end by
+  # tests/test-bl139-subjectless-default.sh T4 (a loop-less `feat:` commit
+  # still dies at commit-msg; a `test:` commit lands). Excising this fence
+  # restores the presumed-feat default exactly (the override sits AFTER
+  # the original classify block by design).
+  if [ -z "$COMMIT_SUBJECT" ]; then
+    subject_is_feat=false
+  fi
+  # BL-139-SUBJECTLESS-DEFAULT-END
 
   # Read staged files
   local staged_files
@@ -906,11 +1984,51 @@ check_commit_ready() {
     fi
   fi
 
+  # BL-155-INIT-AFTER-CLASSIFY-BEGIN
+  # Dogfood-4 S0 F1: this block used to sit ABOVE the staged-file
+  # classification, so at Phase 2 with init unverified it blocked EVERY
+  # commit — including the docs/state-only Phase 1→2 transition commit
+  # the generated CLAUDE.md step 3 instructs ("Commit both files
+  # together"). Chicken-and-egg: recording entry into Phase 2 required
+  # Phase-2 construction setup first, forcing planning-only sessions
+  # into scaffolding work. Sitting AFTER the docs/dep-manifest
+  # exemption, docs/state-only commits land while ANY commit staging
+  # non-exempt files (source or otherwise) still requires
+  # phase2_init.verified=true — the T-strict-gate-blocks-unverified
+  # surface (tests/test-bl112-commit-enforcement.sh) is unchanged.
+  # Never subject-conditional: --subject does not bypass this block.
+  if [ "$current_phase" -eq 2 ]; then
+    local init_verified
+    init_verified=$(jq -r '.phase2_init.verified' "$PROCESS_STATE")
+    if [ "$init_verified" != "true" ]; then
+      print_fail "Phase 2 initialization not verified."
+      echo "Run: scripts/process-checklist.sh --verify-init" >&2
+      exit 1
+    fi
+  fi
+  # BL-155-INIT-AFTER-CLASSIFY-END
+
   # Phase 2 source commit checks
   if [ "$current_phase" -eq 2 ]; then
-    require_build_loop_state_for_commit || exit 1
+    # Build-Loop-state gate: bypassed when the caller indicates this is
+    # a non-feat commit via --subject. See code-process-checklist-5
+    # comment above for rationale.
+    if [ "$subject_is_feat" = true ]; then
+      # WALK-ISSUE-010: pass the subject through — the closed-loop arm needs it
+      # to tell "this feature's own commit" from "some other feature's". A
+      # subject-less caller reaches this line only with subject_is_feat=true,
+      # which the BL-139 subject-less default above makes unreachable — and it
+      # would get no closed-loop credit anyway: the arm fails closed on an
+      # empty subject. (Do NOT spell that fence's BEGIN token here: its
+      # excision mutant is an unanchored sed range, and a second occurrence
+      # would delete this file from here to EOF.)
+      require_build_loop_state_for_commit "$COMMIT_SUBJECT" || exit 1
+    fi
 
-    # If UAT session is in progress, all 9 steps must be complete
+    # If UAT session is in progress, all 9 steps must be complete. This
+    # block is NOT bypassed by a non-feat subject: a chore/fix/refactor
+    # commit mid-UAT-session would muddy the test-results-vs-source
+    # correlation that gate exists to protect. Keep enforcing.
     local uat_started
     uat_started=$(jq -r '.uat_session.started_at // "null"' "$PROCESS_STATE")
     if [ "$uat_started" != "null" ]; then
@@ -930,40 +2048,60 @@ check_commit_ready() {
     fi
   fi
 
-  # Phase 3 source commit checks
-  if [ "$current_phase" -eq 3 ]; then
-    local p3_completed
-    p3_completed=$(jq '.phase3_validation.steps_completed | length' "$PROCESS_STATE")
-    local p3_total=${#PHASE3_STEPS[@]}
-    if [ "$p3_completed" -lt "$p3_total" ]; then
-      for step in "${PHASE3_STEPS[@]}"; do
-        if ! step_is_completed "phase3_validation" "$step"; then
-          print_fail "Phase 3 validation step '$step' not completed."
-          echo "Run: scripts/process-checklist.sh --complete-step phase3_validation:$step" >&2
-          exit 1
-        fi
-      done
-    fi
-  fi
-
-  # Phase 4 source commit checks
-  if [ "$current_phase" -eq 4 ]; then
-    local p4_completed
-    p4_completed=$(jq '.phase4_release.steps_completed | length' "$PROCESS_STATE")
-    local p4_total=${#PHASE4_STEPS[@]}
-    if [ "$p4_completed" -lt "$p4_total" ]; then
-      for step in "${PHASE4_STEPS[@]}"; do
-        if ! step_is_completed "phase4_release" "$step"; then
-          print_fail "Phase 4 release step '$step' not completed."
-          echo "Run: scripts/process-checklist.sh --complete-step phase4_release:$step" >&2
-          exit 1
-        fi
-      done
-    fi
-  fi
+  # Audit code-process-checklist-1 + -2 + specs-plans-process-enforcement-1
+  # (2026-06): the prior Phase 3 and Phase 4 per-commit blocks required
+  # every step complete on EVERY source commit during those phases,
+  # blocking the iterative fix-commit pattern entirely. Phase enforcement
+  # now lives in two places per baseline §3.4:
+  #   - scripts/check-phase-gate.sh enforces phase transitions
+  #     (3→4, and 4→released).
+  #   - --finalize-phase {3|4} below is a one-shot strict check operators
+  #     run before tagging the release; CI may invoke it on tag push.
+  # Source commits inside Phase 3 and Phase 4 are now allowed without
+  # all-steps-complete; per-step artifact gates inside --complete-step
+  # still apply.
 
   # All checks passed
   exit 0
+}
+
+# Audit code-process-checklist-2 (Option B): strict closeout check moved
+# out of the per-commit path. Operators / CI invoke this explicitly
+# before tagging a release.
+finalize_phase() {
+  local target_phase="$1"
+  ensure_state_file
+  local current_phase=0
+  [ -f "$PHASE_STATE" ] && current_phase=$(jq -r '.current_phase // 0' "$PHASE_STATE" 2>/dev/null || echo "0")
+  if [ "$current_phase" != "$target_phase" ]; then
+    print_fail "--finalize-phase $target_phase requested but current phase is $current_phase."
+    exit 1
+  fi
+  local steps_arr_name process_key step_arr
+  case "$target_phase" in
+    # gitleaks:allow — these are process-state JSON keys, not credentials
+    3) steps_arr_name="PHASE3_STEPS"; process_key="phase3_validation" ;; # gitleaks:allow
+    4) steps_arr_name="PHASE4_STEPS"; process_key="phase4_release" ;;    # gitleaks:allow
+    *)
+      print_fail "--finalize-phase requires 3 or 4 (got '$target_phase')."
+      exit 1
+      ;;
+  esac
+  # shellcheck disable=SC2207
+  step_arr=( $(eval "echo \${$steps_arr_name[@]}") )
+  local missing=0
+  for step in "${step_arr[@]}"; do
+    if ! step_is_completed "$process_key" "$step"; then
+      print_fail "Phase $target_phase step '$step' not completed."
+      echo "Run: scripts/process-checklist.sh --complete-step $process_key:$step" >&2
+      missing=$((missing + 1))
+    fi
+  done
+  if [ "$missing" -gt 0 ]; then
+    print_fail "$missing step(s) missing. Phase $target_phase cannot be finalized."
+    exit 1
+  fi
+  print_ok "Phase $target_phase: all $(echo "${#step_arr[@]}") steps complete. Safe to tag/release."
 }
 
 reset_process() {
@@ -980,9 +2118,10 @@ reset_process() {
     exit 1
   fi
 
-  # Interactive confirmation
-  read -rp "Reset process '$process'? This clears all progress. [y/N]: " confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  # Interactive confirmation. Wave-3 raw-read sweep: prompt_yes_no
+  # also returns N in non-interactive contexts (defense-in-depth on
+  # top of the TTY guard above).
+  if ! prompt_yes_no "Reset process '$process'? This clears all progress. [y/N]" "N"; then
     print_info "Reset cancelled."
     exit 0
   fi
@@ -996,6 +2135,11 @@ reset_process() {
     uat_session)
       jq '
         .uat_session = {"session_id": null, "step": 0, "steps_completed": [], "started_at": null}
+      ' "$PROCESS_STATE" > "$PROCESS_STATE.tmp" && mv "$PROCESS_STATE.tmp" "$PROCESS_STATE"
+      ;;
+    phase1_architecture)
+      jq '
+        .phase1_architecture = {"steps_completed": [], "started_at": null}
       ' "$PROCESS_STATE" > "$PROCESS_STATE.tmp" && mv "$PROCESS_STATE.tmp" "$PROCESS_STATE"
       ;;
     phase3_validation)
@@ -1015,7 +2159,7 @@ reset_process() {
       ;;
     *)
       print_fail "Unknown process: $process"
-      echo "Valid processes: build_loop, uat_session, phase3_validation, phase4_release, phase2_init" >&2
+      echo "Valid processes: build_loop, uat_session, phase1_architecture, phase3_validation, phase4_release, phase2_init" >&2
       exit 1
       ;;
   esac
@@ -1041,9 +2185,10 @@ reset_all() {
     exit 1
   fi
 
-  # Interactive confirmation
-  read -rp "Reset ALL processes? This clears all progress across all phases. [y/N]: " confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  # Interactive confirmation. Wave-3 raw-read sweep: prompt_yes_no
+  # also returns N in non-interactive contexts (defense-in-depth on
+  # top of the TTY guard above).
+  if ! prompt_yes_no "Reset ALL processes? This clears all progress across all phases. [y/N]" "N"; then
     print_info "Reset cancelled."
     exit 0
   fi
@@ -1052,6 +2197,7 @@ reset_all() {
 {
   "build_loop": {"feature": null, "step": 0, "steps_completed": [], "started_at": null},
   "uat_session": {"session_id": null, "step": 0, "steps_completed": [], "started_at": null},
+  "phase1_architecture": {"steps_completed": [], "started_at": null},
   "phase3_validation": {"steps_completed": [], "started_at": null},
   "phase4_release": {"steps_completed": [], "started_at": null},
   "phase2_init": {"steps_completed": [], "verified": false}
@@ -1103,9 +2249,77 @@ check_commit_message() {
   fi
 
   # Feat-prefixed: require Build Loop state sufficient for a commit.
-  require_build_loop_state_for_commit || exit 1
+  # WALK-ISSUE-010: the SUBJECT is the closed-loop arm's identity input.
+  require_build_loop_state_for_commit "$subject" || exit 1
 
   exit 0
+}
+
+# --- code-process-checklist-3: invariant self-test ---
+# For each process key accepted by get_steps_for_process, assert that:
+#   1. reset_process has a case arm for it (so --reset <name> works).
+#   2. ensure_state_file's initial template seeds the key (so a fresh
+#      project starts with every process tracked).
+#   3. reset_all's heredoc template seeds the key (so --reset-all
+#      doesn't silently drop the process).
+#
+# This catches the class of bug where someone adds a new phase to
+# PHASE*_STEPS + a case in get_steps_for_process but forgets to wire
+# the matching reset/template entries — exactly the gap that produced
+# code-process-checklist-3 (Phase 1 architecture progress couldn't be
+# reset). Source-of-truth is get_steps_for_process; everything else
+# must follow.
+invariant_check() {
+  local script_path="${BASH_SOURCE[0]}"
+  local gaps=()
+
+  # Extract every case arm name from get_steps_for_process. Pattern is
+  # leading-whitespace + name + ")" + " echo ..." — we strip the ")".
+  # We deliberately limit to the function body via awk's range pattern.
+  local processes
+  processes=$(awk '/^get_steps_for_process\(\) \{/,/^\}/' "$script_path" \
+    | grep -oE '^[[:space:]]+[a-z][a-z0-9_]+\)' \
+    | tr -d ' )' \
+    | grep -v '^$' || true)
+
+  if [ -z "$processes" ]; then
+    print_fail "invariant-check: could not extract process list from get_steps_for_process"
+    exit 1
+  fi
+
+  # Extract bodies for the three sinks once.
+  local reset_body ensure_body resetall_body
+  reset_body=$(awk '/^reset_process\(\) \{/,/^\}/' "$script_path")
+  ensure_body=$(awk '/^ensure_state_file\(\) \{/,/^\}/' "$script_path")
+  resetall_body=$(awk '/^reset_all\(\) \{/,/^\}/' "$script_path")
+
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    # 1. reset_process case arm
+    if ! echo "$reset_body" | grep -qE "^[[:space:]]+${p}\)"; then
+      gaps+=("$p: missing reset_process case arm")
+    fi
+    # 2. ensure_state_file template entry
+    if ! echo "$ensure_body" | grep -q "\"${p}\""; then
+      gaps+=("$p: missing ensure_state_file template entry")
+    fi
+    # 3. reset_all template entry
+    if ! echo "$resetall_body" | grep -q "\"${p}\""; then
+      gaps+=("$p: missing reset_all template entry")
+    fi
+  done <<< "$processes"
+
+  if [ "${#gaps[@]}" -gt 0 ]; then
+    print_fail "invariant-check: $(echo "$processes" | wc -l | tr -d ' ') processes inspected, ${#gaps[@]} gap(s) found:"
+    for g in "${gaps[@]}"; do
+      echo "  - $g" >&2
+    done
+    exit 1
+  fi
+
+  local pcount
+  pcount=$(echo "$processes" | wc -l | tr -d ' ')
+  print_ok "invariant-check: all processes wired ($pcount inspected: $(echo "$processes" | tr '\n' ' '))"
 }
 
 # --- Dispatch ---
@@ -1116,10 +2330,12 @@ case "$ACTION" in
   start-phase1)       start_phase1 ;;
   start-phase3)       start_phase3 ;;
   start-phase4)       start_phase4 ;;
+  finalize-phase)     finalize_phase "$ARG_VALUE" ;;
   verify-init)        verify_init ;;
   status)             show_status ;;
   check-commit-ready) check_commit_ready ;;
   check-commit-message) check_commit_message "$COMMIT_MSG" ;;
   reset)              reset_process "$ARG_VALUE" ;;
   reset-all)          reset_all ;;
+  invariant-check)    invariant_check ;;
 esac

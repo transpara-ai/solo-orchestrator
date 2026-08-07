@@ -55,7 +55,9 @@ You can fill this out using the **intake wizard** (`bash scripts/intake-wizard.s
 > bash scripts/reconfigure-project.sh --field <field> --old <old_value> --new <new_value>
 > ```
 >
-> Supported fields: `name`, `platform`, `language`, `track`, `deployment`. The intake wizard handles this automatically — manual editing does not.
+> Supported fields: `name`, `platform`, `language`. The intake wizard handles this automatically — manual editing does not.
+>
+> For `track` or `deployment` changes use `scripts/upgrade-project.sh` instead (it enforces the governance pre-conditions; reconfigure-project does not).
 
 ---
 
@@ -205,6 +207,18 @@ _What data does the user provide or the system ingest?_
 | | | | | |
 
 **Sensitivity classifications:** Public, Internal, Confidential, PII, Financial, Health/Medical, Regulated
+
+#### 5.1.1 Project-Level Data Classification (Phase 1 Gate — tier-crosscheck-6)
+
+The **highest** classification across all rows in §5.1 is the project-level `data_classification`. It is recorded in `.claude/process-state.json::phase1_artifacts` and enforced as a Phase 1→2 hard gate by `scripts/check-phase-gate.sh`. Per docs/governance-framework.md § VII (Mandatory ZDR gate, line 299), projects classified **Internal or higher** must use a ZDR or self-hosted LLM deployment path — `phase1_artifacts.zdr_attested` (or a documented `phase1_artifacts.zdr_attestation_reason` exception) is required before Phase 1→2.
+
+| Field | Value (one of) |
+|---|---|
+| **Project-level data_classification** | `public` / `internal` / `confidential` / `pii` / `financial` / `health` / `regulated` |
+| **ZDR attested (Zero Data Retention or self-hosted LLM)** | `true` / `false` |
+| **ZDR attestation reason** _(required when `zdr_attested=false` AND classification > public)_ | _Free text: written exception (e.g. "Customer SOW requires retention, risk accepted by CISO Email TKT-42")_ |
+
+These three fields are captured by `scripts/intake-wizard.sh` Section 5.5, and can be corrected after-the-fact with `scripts/reconfigure-project.sh --field data_classification --new <value>` / `--field zdr_attested --new true|false`.
 
 ### 5.2 Data Outputs
 
@@ -380,8 +394,8 @@ _Skip this section for personal projects. For organizational deployments, every 
 | **Project sponsor assigned** | Not Started / In Progress / Complete | _Name:_ | Yes |
 | **Backup maintainer designated** | Not Started / In Progress / Complete | _Name:_ | Yes |
 | **ITSM ticket filed / portfolio registered** | Not Started / In Progress / Complete | _Ticket #:_ | Yes |
-| **Exit criteria defined** | Not Started / In Progress / Complete | | Yes |
-| **Orchestrator time allocation approved** | Not Started / In Progress / Complete | _Hours/week, blocked or interleaved_ | Yes |
+| **Exit criteria defined** | Not Started / In Progress / Complete | _See Section 8.5 below_ | Required (not blocking — pilot prep, see Governance Framework §XIV) |
+| **Orchestrator time allocation approved** | Not Started / In Progress / Complete | _Hours/week, blocked or interleaved_ | Required (not blocking — pilot prep, see Governance Framework §XIV) |
 
 ### 8.2 Approval Authorities
 

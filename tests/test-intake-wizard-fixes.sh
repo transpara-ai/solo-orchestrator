@@ -1,0 +1,1038 @@
+#!/usr/bin/env bash
+# tests/test-intake-wizard-fixes.sh
+#
+# Tests for the three S3 fixes in scripts/intake-wizard.sh:
+#   - code-intake-wizard-3: wizard section numbering aligns with template
+#   - code-intake-wizard-5: pause is immediate (no further save_answer writes)
+#   - code-intake-wizard-6: Competency Matrix captures the
+#       "Automated Tooling Required?" third column
+#
+# Plus a regression guard for the wizard's print_step / Claude-mode prompt
+# section count drift (bonus catch: "All 8 pre-conditions", "Sections 1-13").
+#
+# Style mirrors tests/test-lint-counter-antipattern.sh: set -uo pipefail,
+# isolated fixtures, per-case pass/fail counters, RED-before-GREEN
+# verification by inspection (no shared state between cases).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WIZARD="$REPO_ROOT/scripts/intake-wizard.sh"
+TEMPLATE="$REPO_ROOT/templates/project-intake.md"
+
+if [ ! -f "$WIZARD" ]; then
+  echo "FATAL: intake-wizard.sh not found at $WIZARD" >&2
+  exit 2
+fi
+if [ ! -f "$TEMPLATE" ]; then
+  echo "FATAL: project-intake.md template not found at $TEMPLATE" >&2
+  exit 2
+fi
+
+PASSED=0
+FAILED=0
+pass()  { echo "  [PASS] $1"; PASSED=$((PASSED + 1)); }
+fail_() { echo "  [FAIL] $1 — $2"; FAILED=$((FAILED + 1)); }
+
+# ----------------------------------------------------------------
+# T1 (code-intake-wizard-3): wizard print_step labels must match
+# the template's `## N. Title` headings for every numbered section.
+# ----------------------------------------------------------------
+echo ""
+echo "T1: wizard section labels match template headings"
+
+# Extract template section number → title map (skip 11.5 — printed
+# separately by run_section_11_5 in the wizard).
+template_pairs=$(awk -F': ' '
+  /^##[[:space:]]+[0-9]+\.[[:space:]]/ {
+    sub(/^##[[:space:]]+/, "")
+    # Trim trailing parenthetical qualifiers like "(Standard+ Track ...)"
+    sub(/[[:space:]]+\(.*\)$/, "")
+    print
+  }
+' "$TEMPLATE")
+
+# Pull every print_step "Section N: Title" line from the wizard.
+wizard_pairs=$(grep -oE 'print_step "Section [0-9]+(\.[0-9]+)?: [^"]+"' "$WIZARD" \
+  | sed -e 's/^print_step "Section //' -e 's/"$//')
+
+drift_found=0
+while IFS= read -r tpl_line; do
+  tpl_num="${tpl_line%%.*}"
+  tpl_title=$(echo "$tpl_line" | sed -E 's/^[0-9]+\.[[:space:]]*//')
+  # Find wizard line for this section.
+  wiz_line=$(echo "$wizard_pairs" | awk -v n="$tpl_num" -F': ' '
+    $1 == n { print; exit }
+  ')
+  if [ -z "$wiz_line" ]; then
+    # 11 has no template heading qualifier; the only sections without a
+    # matching print_step in the wizard are §12 (auto-populated, no prompt).
+    # Don't flag this as drift — it's wired in run_section_12 by design.
+    if [ "$tpl_num" = "12" ]; then
+      continue
+    fi
+    fail_ "T1" "wizard missing print_step for template Section $tpl_num ($tpl_title)"
+    drift_found=1
+    continue
+  fi
+  wiz_title=$(echo "$wiz_line" | sed -E 's/^[0-9]+:[[:space:]]*//')
+  # BL-037 closure: the pre-fix oracle compared `${wiz_line%%:*}` (i.e.
+  # the number prefix) to `$tpl_num` — but `wiz_line` was selected by
+  # awk's `$1 == n` filter, so by construction the number prefix is
+  # `$tpl_num`. The comparison was a tautology and the `wiz_title`
+  # variable computed on the line above was never consumed. A wizard
+  # entry like `print_step "Section 4: Compliance Audit"` against
+  # template `## 4. Features & Requirements` (number preserved, title
+  # corrupted) silently passed.
+  #
+  # New assertion: pin BOTH halves of the pair.
+  #   (a) Number prefix matches (preserves the pre-fix sanity check
+  #       — even though it was structurally redundant, future refactors
+  #       might change the awk filter).
+  #   (b) Title alignment: template title is canonical, wizard may
+  #       shorten the trailing qualifier (e.g. tpl "Distribution &
+  #       Operations Preferences" vs wiz "Distribution & Operations").
+  #       Accept iff (case-insensitive) the wizard title is a non-empty
+  #       prefix of the template title OR vice-versa. Any unrelated
+  #       drift (different leading words, swapped section bodies) fails.
+  if [ "${wiz_line%%:*}" != "$tpl_num" ]; then
+    fail_ "T1" "wizard section number drift at template §$tpl_num: wizard shows '$wiz_line'"
+    drift_found=1
+  fi
+  if [ -z "$wiz_title" ]; then
+    fail_ "T1" "wizard §$tpl_num has empty title (template title: '$tpl_title')"
+    drift_found=1
+  else
+    wiz_title_lc=$(printf '%s' "$wiz_title" | tr '[:upper:]' '[:lower:]')
+    tpl_title_lc=$(printf '%s' "$tpl_title" | tr '[:upper:]' '[:lower:]')
+    # Case-insensitive bidirectional prefix match handles the wizard's
+    # documented shortening (e.g. drop trailing "Preferences"). Pure
+    # substring would over-match; require prefix.
+    if [ "${tpl_title_lc#"$wiz_title_lc"}" = "$tpl_title_lc" ] && \
+       [ "${wiz_title_lc#"$tpl_title_lc"}" = "$wiz_title_lc" ]; then
+      fail_ "T1" "wizard §$tpl_num title drift: wizard='$wiz_title' template='$tpl_title' (neither is a case-insensitive prefix of the other)"
+      drift_found=1
+    fi
+  fi
+done <<<"$template_pairs"
+
+# Also: the wizard's section-12 label must match template §12
+# (Tooling Configuration), not "Agent Initialization Prompt".
+if grep -qE 'print_step "Section 12: Agent Initialization Prompt"' "$WIZARD"; then
+  fail_ "T1" "wizard §12 still labelled 'Agent Initialization Prompt' (should be Tooling Configuration; that label belongs to §13)"
+  drift_found=1
+fi
+
+# And: a §13 label for Agent Initialization Prompt must exist.
+if ! grep -qE 'print_step "Section 13: Agent Initialization Prompt"' "$WIZARD"; then
+  fail_ "T1" "wizard missing 'Section 13: Agent Initialization Prompt' label (template §13)"
+  drift_found=1
+fi
+
+if [ "$drift_found" -eq 0 ]; then
+  pass "T1: wizard print_step labels align with template Section numbers"
+fi
+
+# ----------------------------------------------------------------
+# T2 (code-intake-wizard-3, ancillary): the Claude-mode generated
+# prompt must reference the correct section range (1-13, not 1-12).
+# ----------------------------------------------------------------
+echo ""
+echo "T2: Claude-mode prompt section range matches template"
+if grep -qE 'Walk through PROJECT_INTAKE.md section by section \(Sections 1-12\)' "$WIZARD"; then
+  fail_ "T2" "Claude-mode prompt still says 'Sections 1-12' (should be 1-13)"
+elif grep -qE 'Walk through PROJECT_INTAKE.md section by section \(Sections 1-13\)' "$WIZARD"; then
+  pass "T2: Claude-mode prompt covers Sections 1-13"
+else
+  fail_ "T2" "Claude-mode 'Walk through ... Sections N-M' line not found in wizard"
+fi
+
+# ----------------------------------------------------------------
+# T3 (bonus): "All 6 pre-conditions required" — the preconditions
+# array has 8 items; the count must match.
+# ----------------------------------------------------------------
+echo ""
+echo "T3: Production-Build pre-condition count matches preconditions array"
+precond_count=$(awk '
+  /^  local preconditions=\(/ { inside=1; next }
+  inside && /^  \)/ { inside=0 }
+  inside && /^[[:space:]]+"/ { count++ }
+  END { print count+0 }
+' "$WIZARD")
+if [ "${precond_count:-0}" -ne 8 ]; then
+  fail_ "T3" "expected 8 preconditions in run_section_8 array, found ${precond_count:-0}"
+elif grep -qE '\*\*Production Build:\*\* All 6 pre-conditions required' "$WIZARD"; then
+  fail_ "T3" "wizard Claude-mode says 'All 6 pre-conditions' but the array has 8 entries"
+elif grep -qE '\*\*Production Build:\*\* All 8 pre-conditions required' "$WIZARD"; then
+  pass "T3: Production-Build prompt correctly references all 8 pre-conditions"
+else
+  fail_ "T3" "Claude-mode 'Production Build' pre-condition count line not found"
+fi
+
+# ----------------------------------------------------------------
+# T4 (code-intake-wizard-5): pause is immediate — once "pause" is
+# typed at a prompt, no further save_answer writes happen in that
+# section. We exercise prompt_input + save_answer in a sourced
+# subshell with stdin pre-loaded with "pause".
+# ----------------------------------------------------------------
+echo ""
+echo "T4: pause short-circuits prompt_input and skips save_answer writes"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  [SKIP] T4 — python3 unavailable"
+else
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+  PROG="$TMP/intake-progress.json"
+  python3 -c "
+import json
+data = {
+  'version': 1, 'started_at': '2026-01-01T00:00:00Z',
+  'last_section': 0, 'completed_sections': [],
+  'project_name': 'TestProject', 'platform': 'web', 'track': 'standard',
+  'deployment': 'personal', 'language': 'typescript',
+  'description': 'A test', 'poc_mode': None,
+  'answers': {'preexisting': 'kept'}
+}
+with open('$PROG', 'w') as f:
+    json.dump(data, f)
+"
+
+  # Source the wizard's helper functions only (avoid running main).
+  # We extract prompt_input, save_answer, _request_pause,
+  # check_pause_requested into a runnable script with overridden
+  # PROGRESS_FILE and stubbed print_* helpers.
+  TEST_SCRIPT="$TMP/test.sh"
+  cat > "$TEST_SCRIPT" << EOF
+#!/usr/bin/env bash
+set -uo pipefail
+PROGRESS_FILE="$PROG"
+_PAUSE_FILE="$TMP/.pause-sentinel"
+BOLD=''; NC=''; CYAN=''; GREEN=''; BLUE=''; YELLOW=''; RED=''
+print_info() { :; }
+print_ok()   { :; }
+print_warn() { :; }
+print_fail() { :; }
+print_step() { :; }
+log_line()   { :; }
+
+EOF
+  # Extract the wizard functions we need. Use awk to grab each
+  # function block by name (BSD-awk compatible).
+  for fn in prompt_input prompt_choice prompt_with_suggestions _request_pause check_pause_requested save_answer; do
+    awk -v fn="$fn" '
+      $0 ~ ("^" fn "\\(\\) \\{") { inside=1 }
+      inside { print; if ($0 == "}") { inside=0; print ""; exit } }
+    ' "$WIZARD" >> "$TEST_SCRIPT"
+  done
+
+  cat >> "$TEST_SCRIPT" << 'EOF'
+
+# Simulate run_section_2 sequence: ask for two real answers, then "pause",
+# then attempt three more prompts/saves. After fix, "pause" must cause
+# every subsequent save_answer to be a no-op (sentinel guards it).
+answer1=$(prompt_input "Q1" "")
+save_answer "q1" "$answer1"
+
+answer2=$(prompt_input "Q2" "")
+save_answer "q2" "$answer2"
+
+answer3=$(prompt_input "Q3" "")
+save_answer "q3" "$answer3"
+
+# These should also not write — sentinel is set after Q3's "pause".
+answer4=$(prompt_input "Q4" "")
+save_answer "q4" "$answer4"
+
+answer5=$(prompt_input "Q5" "")
+save_answer "q5" "$answer5"
+
+# Verify what got written.
+python3 -c "
+import json, sys
+with open('$PROGRESS_FILE') as f:
+    data = json.load(f)
+ans = data.get('answers', {})
+# Pre-existing key must be preserved.
+assert ans.get('preexisting') == 'kept', f'preexisting was clobbered: {ans}'
+# q1 + q2 are real, q3 was 'pause' and q4/q5 came after pause.
+# After fix: q3, q4, q5 keys must NOT exist (or must be empty/unchanged).
+assert ans.get('q1') == 'first',  f'q1 mismatch: {ans.get(\"q1\")}'
+assert ans.get('q2') == 'second', f'q2 mismatch: {ans.get(\"q2\")}'
+assert 'q3' not in ans, f'q3 was written after pause: {ans.get(\"q3\")!r}'
+assert 'q4' not in ans, f'q4 was written after pause: {ans.get(\"q4\")!r}'
+assert 'q5' not in ans, f'q5 was written after pause: {ans.get(\"q5\")!r}'
+print('PAUSE_OK')
+"
+EOF
+  chmod +x "$TEST_SCRIPT"
+
+  # Feed answers: first, second, pause, then anything (should not be read).
+  out=$(printf 'first\nsecond\npause\nignored1\nignored2\n' | bash "$TEST_SCRIPT" 2>&1) || true
+  if echo "$out" | grep -q "PAUSE_OK"; then
+    pass "T4: pause prevents save_answer writes for q3/q4/q5"
+  else
+    fail_ "T4" "pause should short-circuit save_answer: $out"
+  fi
+
+  rm -rf "$TMP"
+  trap - EXIT
+fi
+
+# ----------------------------------------------------------------
+# T5 (code-intake-wizard-6): Competency Matrix saves a tooling
+# answer for each domain — competency_${key}_tooling.
+# ----------------------------------------------------------------
+echo ""
+echo "T5: Competency Matrix captures 'Automated Tooling Required?' column"
+
+# Static-source check: run_section_6 must save competency_${key}_tooling
+# (one per domain). We verify the source has the save call.
+if ! grep -qE 'save_answer "competency_\$\{?key\}?_tooling"' "$WIZARD"; then
+  fail_ "T5" "run_section_6 does not save 'competency_\${key}_tooling' for any domain"
+else
+  pass "T5a: run_section_6 saves competency_\${key}_tooling"
+fi
+
+# Domains list must be unchanged length (9).
+domains_count=$(awk '
+  /local domains=\(/ {
+    line=$0
+    sub(/.*domains=\(/, "", line)
+    sub(/\).*/, "", line)
+    # Count quoted strings.
+    n=gsub(/"[^"]*"/, "&", line)
+    print n; exit
+  }
+' "$WIZARD")
+if [ "${domains_count:-0}" -ne 9 ]; then
+  fail_ "T5" "expected 9 competency domains, found ${domains_count:-0}"
+else
+  pass "T5b: 9 competency domains still defined"
+fi
+
+# Functional test: drive run_section_6's matrix loop with scripted
+# answers and assert the JSON has competency_security_tooling populated
+# when Security == "No".
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  [SKIP] T5c — python3 unavailable"
+else
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+  PROG="$TMP/intake-progress.json"
+  python3 -c "
+import json
+data = {
+  'version': 1, 'started_at': '2026-01-01T00:00:00Z',
+  'last_section': 0, 'completed_sections': [],
+  'project_name': 'TestProject', 'platform': 'web', 'track': 'standard',
+  'deployment': 'personal', 'language': 'typescript',
+  'description': 'A test', 'poc_mode': None, 'answers': {}
+}
+with open('$PROG', 'w') as f:
+    json.dump(data, f)
+"
+
+  TEST_SCRIPT="$TMP/test.sh"
+  cat > "$TEST_SCRIPT" << EOF
+#!/usr/bin/env bash
+set -uo pipefail
+PROGRESS_FILE="$PROG"
+_PAUSE_FILE="$TMP/.pause-sentinel"
+BOLD=''; NC=''; CYAN=''; GREEN=''; BLUE=''; YELLOW=''; RED=''
+print_info() { :; }
+print_ok()   { :; }
+print_warn() { :; }
+print_fail() { :; }
+print_step() { :; }
+log_line()   { :; }
+
+EOF
+  for fn in prompt_input prompt_choice prompt_with_suggestions _request_pause check_pause_requested save_answer show_suggestions parse_suggestions; do
+    awk -v fn="$fn" '
+      $0 ~ ("^" fn "\\(\\) \\{") { inside=1 }
+      inside { print; if ($0 == "}") { inside=0; print ""; exit } }
+    ' "$WIZARD" >> "$TEST_SCRIPT"
+  done
+
+  # Emit only the matrix loop from run_section_6, wrapped in a
+  # function so `local` keywords inside the loop stay valid.
+  echo 'run_matrix() {' >> "$TEST_SCRIPT"
+  awk '
+    /local domains=\("Product\/UX Logic"/ { capture=1 }
+    capture { print }
+    capture && /^  done$/ { exit }
+  ' "$WIZARD" >> "$TEST_SCRIPT"
+  echo '}' >> "$TEST_SCRIPT"
+  echo 'run_matrix' >> "$TEST_SCRIPT"
+
+  cat >> "$TEST_SCRIPT" << 'EOF'
+
+python3 -c "
+import json
+with open('$PROGRESS_FILE') as f:
+    data = json.load(f)
+ans = data.get('answers', {})
+# Assert: every domain has a corresponding _tooling key.
+domains = ['product_ux_logic', 'frontend_code', 'backend_api_design',
+           'database_design', 'security', 'devops_infrastructure',
+           'accessibility', 'performance', 'mobile']
+missing = [d for d in domains if f'competency_{d}_tooling' not in ans]
+assert not missing, f'missing tooling keys for: {missing}'
+# Security was 'No' — tooling answer must be non-empty (the default or
+# user-supplied value).
+sec_tool = ans.get('competency_security_tooling', '')
+assert sec_tool and sec_tool != 'N/A', \
+  f'competency_security_tooling must be non-empty for a \"No\" answer, got {sec_tool!r}'
+print('MATRIX_OK')
+"
+EOF
+  chmod +x "$TEST_SCRIPT"
+
+  # Feed: 9 prompt_choice answers (1=Yes, 2=Partially, 3=No), and for
+  # any Partially/No, accept the default tooling by pressing Enter.
+  # Order: Product/UX=1, Frontend=1, Backend=1, Database=1, Security=3,
+  # DevOps=2, Accessibility=3, Performance=2, Mobile=1.
+  # Defaults accepted for the 4 non-Yes answers (Security, DevOps,
+  # Accessibility, Performance).
+  out=$(printf '1\n1\n1\n1\n3\n\n2\n\n3\n\n2\n\n1\n' | bash "$TEST_SCRIPT" 2>&1) || true
+  if echo "$out" | grep -q "MATRIX_OK"; then
+    pass "T5c: Competency Matrix saves _tooling answer for each domain (Security has framework default)"
+  else
+    fail_ "T5c" "Competency Matrix tooling capture missing: $out"
+  fi
+
+  rm -rf "$TMP"
+  trap - EXIT
+fi
+
+# ----------------------------------------------------------------
+# T-CLI-DRIFT (specs-plans-init-intake-noninteractive-3):
+# the intake-wizard plan + spec must not reference a never-shipped
+# `cli.json` / `cli` platform; the actually-shipped suggestion file
+# is `mcp_server.json` (matches the 2026-04-25 non-interactive spec).
+# ----------------------------------------------------------------
+echo ""
+echo "T-CLI-DRIFT: plan/spec/wizard reference mcp_server (not cli)"
+
+PLAN_MD="$REPO_ROOT/docs/superpowers/plans/archive/2026-04-02-intake-wizard.md"
+SPEC_MD="$REPO_ROOT/docs/superpowers/specs/archive/2026-04-02-intake-wizard-design.md"
+
+drift=0
+# 1. The shipped suggestion-file set must NOT include cli.json.
+if [ -f "$REPO_ROOT/templates/intake-suggestions/cli.json" ]; then
+  fail_ "T-CLI-DRIFT-1" "templates/intake-suggestions/cli.json exists (should not — newer spec uses mcp_server.json)"
+  drift=1
+fi
+# 2. The shipped suggestion-file set MUST include mcp_server.json.
+if [ ! -f "$REPO_ROOT/templates/intake-suggestions/mcp_server.json" ]; then
+  fail_ "T-CLI-DRIFT-2" "templates/intake-suggestions/mcp_server.json missing"
+  drift=1
+fi
+# 3. Plan must not reference cli.json or the bare `cli` platform value
+#    in a directive context. The plan IS allowed to mention `cli.json` in a
+#    block-quoted "drift note" (lines starting with `> `) that explains the
+#    rename — those lines are documentation, not directives.
+plan_hits=$(grep -nE 'cli\.json|"cli"' "$PLAN_MD" | grep -vE '^[0-9]+:>' | grep -vE 'supersedes the earlier `cli\.json`' || true)
+if [ -n "$plan_hits" ]; then
+  fail_ "T-CLI-DRIFT-3" "plan still references cli.json or 'cli' platform outside drift-note context: $(echo "$plan_hits" | head -3)"
+  drift=1
+fi
+# 4. Spec must not reference cli.json or the bare `cli` platform value.
+if grep -nE 'cli\.json|"cli"' "$SPEC_MD" >/dev/null 2>&1; then
+  fail_ "T-CLI-DRIFT-4" "spec still references cli.json or 'cli' platform: $(grep -nE 'cli\.json|"cli"' "$SPEC_MD" | head -3)"
+  drift=1
+fi
+# 5. Wizard prompt + case branch must use mcp_server (not cli).
+if grep -nE 'prompt_choice "Platform:".*"cli"' "$WIZARD" >/dev/null 2>&1; then
+  fail_ "T-CLI-DRIFT-5" "wizard prompt_choice still lists 'cli' as a platform"
+  drift=1
+fi
+# Require the wizard to handle the `mcp_server` platform branch explicitly.
+if ! grep -nE '^[[:space:]]+mcp_server\)' "$WIZARD" >/dev/null 2>&1; then
+  fail_ "T-CLI-DRIFT-6" "wizard case statement missing a 'mcp_server)' branch"
+  drift=1
+fi
+if [ "$drift" -eq 0 ]; then
+  pass "T-CLI-DRIFT: plan, spec, wizard, and templates all aligned on mcp_server"
+fi
+
+# ----------------------------------------------------------------
+# T-SUGGEST-LANGUAGES (specs-plans-init-intake-noninteractive-5):
+# each platform suggestion JSON must expose a top-level `languages`
+# array enumerating allowed languages — used by init.sh Pass-2 and
+# any other consumer that needs the per-platform language set.
+# ----------------------------------------------------------------
+echo ""
+echo "T-SUGGEST-LANGUAGES: each platform suggestion JSON has a top-level languages[]"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "  [SKIP] T-SUGGEST-LANGUAGES — jq unavailable"
+else
+  langs_drift=0
+  for plat in web desktop mobile mcp_server; do
+    f="$REPO_ROOT/templates/intake-suggestions/${plat}.json"
+    if [ ! -f "$f" ]; then
+      fail_ "T-SUGGEST-LANGUAGES-${plat}" "missing $f"
+      langs_drift=1
+      continue
+    fi
+    arr_type=$(jq -r '.languages | type' "$f" 2>/dev/null || echo "null")
+    if [ "$arr_type" != "array" ]; then
+      fail_ "T-SUGGEST-LANGUAGES-${plat}" "$plat.json missing top-level 'languages' array (got type=$arr_type)"
+      langs_drift=1
+      continue
+    fi
+    arr_len=$(jq -r '.languages | length' "$f")
+    if [ "$arr_len" -lt 1 ]; then
+      fail_ "T-SUGGEST-LANGUAGES-${plat}" "$plat.json languages[] is empty"
+      langs_drift=1
+    fi
+  done
+  if [ "$langs_drift" -eq 0 ]; then
+    pass "T-SUGGEST-LANGUAGES: web, desktop, mobile, mcp_server all expose top-level languages[]"
+  fi
+fi
+
+# ----------------------------------------------------------------
+# Summary
+# ----------------------------------------------------------------
+# ----------------------------------------------------------------
+# BL-203 — the intake's testing-interval answer must reach the ENFORCED
+# field. Single writer: `test-gate.sh --set-interval N` (marker
+# # BL-203-INTERVAL-PLUMB), called from the wizard's script path and
+# instructed on the AI path; ensure_progress_file() (the SECOND writer)
+# must honor the recorded answer when recreating; the session hook's
+# reads must not fail open on missing keys. Fixtures are hand-rolled —
+# NO scaffolding — so these stay unit-lane eligible.
+# ----------------------------------------------------------------
+TESTGATE="$REPO_ROOT/scripts/test-gate.sh"
+SESSCHECK="$REPO_ROOT/scripts/session-test-gate-check.sh"
+
+_bl203_fixture() {  # <dir> — minimal project state for test-gate.sh
+  mkdir -p "$1/.claude"
+  printf '{\n  "features_completed": ["a","b","c","d"],\n  "features_since_last_test": 4,\n  "test_interval": 2,\n  "last_test_session": null,\n  "testing_required": true,\n  "tester_count": 1,\n  "bug_tracker": "github_issues",\n  "sessions_completed": 0\n}\n' > "$1/.claude/build-progress.json"
+  printf -- '- **Testing interval:** Every 2 features (configured in Intake Section 11.5)\n' > "$1/CLAUDE.md"
+}
+
+echo ""
+echo "T-bl203-set-interval: the single-writer action exists and is atomic+complete"
+D=$(mktemp -d)
+_bl203_fixture "$D"
+if ( cd "$D" && bash "$TESTGATE" --set-interval 5 ) >/dev/null 2>&1 \
+   && [ "$(jq -r '.test_interval' "$D/.claude/build-progress.json")" = "5" ] \
+   && jq -e '.test_interval | type == "number"' "$D/.claude/build-progress.json" >/dev/null \
+   && [ "$(jq -r '.testing_required' "$D/.claude/build-progress.json")" = "false" ] \
+   && grep -qF 'Every 5 features (configured in Intake Section 11.5)' "$D/CLAUDE.md" \
+   && ( cd "$D" && bash "$TESTGATE" --set-interval 4 ) >/dev/null 2>&1 \
+   && [ "$(jq -r '.testing_required' "$D/.claude/build-progress.json")" = "true" ]; then
+  pass "T-bl203-set-interval (numeric-typed field, testing_required false at 4<5 and TRUE at the 4>=4 boundary, CLAUDE.md prose in step)"
+else
+  fail_ "T-bl203-set-interval" "test-gate.sh --set-interval 5 did not land in all three places: field=$(jq -r '.test_interval' "$D/.claude/build-progress.json" 2>/dev/null) required=$(jq -r '.testing_required' "$D/.claude/build-progress.json" 2>/dev/null) claude_md=$(grep -c 'Every 5 features' "$D/CLAUDE.md" 2>/dev/null)"
+fi
+rm -rf "$D"
+
+echo ""
+echo "T-bl203-set-interval-rejects: non-numeric and zero are refused, file untouched"
+D=$(mktemp -d)
+_bl203_fixture "$D"
+BAD=0
+( cd "$D" && bash "$TESTGATE" --set-interval abc ) >/dev/null 2>&1 && BAD=1
+( cd "$D" && bash "$TESTGATE" --set-interval 0 ) >/dev/null 2>&1 && BAD=1
+if [ "$BAD" -eq 0 ] && [ "$(jq -r '.test_interval' "$D/.claude/build-progress.json")" = "2" ]; then
+  pass "T-bl203-set-interval-rejects (abc and 0 exit non-zero and change nothing)"
+else
+  fail_ "T-bl203-set-interval-rejects" "invalid input accepted or file mutated (bad=$BAD interval=$(jq -r '.test_interval' "$D/.claude/build-progress.json"))"
+fi
+rm -rf "$D"
+
+echo ""
+echo "T-bl203-set-interval-hardened: oversized input and corrupt JSON fail LOUDLY, doc never advances past the gate"
+D=$(mktemp -d)
+_bl203_fixture "$D"
+HARD_OK=1
+( cd "$D" && bash "$TESTGATE" --set-interval 99999999999999999999 ) >/dev/null 2>&1 && HARD_OK=0
+[ "$(jq -r '.test_interval' "$D/.claude/build-progress.json")" = "2" ] || HARD_OK=0
+printf 'THIS IS NOT JSON {{{\n' > "$D/.claude/build-progress.json"
+( cd "$D" && bash "$TESTGATE" --set-interval 5 ) >/dev/null 2>&1 && HARD_OK=0
+grep -qF 'Every 2 features' "$D/CLAUDE.md" || HARD_OK=0
+if [ "$HARD_OK" -eq 1 ]; then
+  pass "T-bl203-set-interval-hardened (a 20-digit interval is refused before it can park the gate open; corrupt JSON exits non-zero and CLAUDE.md is NOT advanced — R-BL203-2/-4)"
+else
+  fail_ "T-bl203-set-interval-hardened" "an invalid write path returned success or advanced the doc past the gate (interval=$(jq -r '.test_interval' "$D/.claude/build-progress.json" 2>/dev/null) md=$(grep -o 'Every [0-9]* features' "$D/CLAUDE.md" 2>/dev/null))"
+fi
+rm -rf "$D"
+
+echo ""
+echo "T-bl203-wizard-calls-set-interval: the script path plumbs the answer"
+if awk '/^run_section_11_5\(\)/,/^}/' "$WIZARD" | grep -qF -- '--set-interval "$interval"'; then
+  pass "T-bl203-wizard-calls-set-interval (run_section_11_5 invokes the single writer)"
+else
+  fail_ "T-bl203-wizard-calls-set-interval" "run_section_11_5 saves testing_interval but never calls test-gate.sh --set-interval — the answer is a silent no-op (BL-203)"
+fi
+
+echo ""
+echo "T-bl203-guided-prompt-instructs: the AI path plumbs it too"
+# RENDERED, not source-grepped: the PROMPTEOF heredoc is UNQUOTED, so an
+# unescaped backtick EXECUTES at prompt-generation time and ships the
+# command's error text instead of the command (review R-BL203-1 — a source
+# grep passed green over exactly that). Render every PROMPTEOF body in an
+# empty fixture dir and assert the literal commands survive.
+D=$(mktemp -d)
+awk '/<< PROMPTEOF/{f=1;next} /^PROMPTEOF$/{f=0} f' "$WIZARD" > "$D/body.txt"
+{ echo 'cat << PROMPTEOF'; cat "$D/body.txt"; echo 'PROMPTEOF'; } > "$D/render.sh"
+RENDERED=$( cd "$D" && bash --noprofile --norc render.sh </dev/null 2>/dev/null )
+# NEEDLE split keeps the literal init-script token off executed lines — the
+# BL-181 unit-lane predicate reads names-on-executed-lines, and the token
+# here would silently exempt this file from the tests.yml membership lint.
+NEEDLE='init'; NEEDLE="${NEEDLE}.sh"
+if printf '%s' "$RENDERED" | grep -qF -- '`bash scripts/test-gate.sh --set-interval N`' \
+   && printf '%s' "$RENDERED" | grep -qF -- "\`$NEEDLE\`" \
+   && ! printf '%s' "$RENDERED" | grep -qF '[FAIL]'; then
+  pass "T-bl203-guided-prompt-instructs (the RENDERED prompt carries the literal --set-interval command and instruction 9's init reference — no backtick executed)"
+else
+  fail_ "T-bl203-guided-prompt-instructs" "the rendered guided prompt lost a backticked command to heredoc expansion (R-BL203-1): $(printf '%s' "$RENDERED" | grep -n 'set-interval\|Tooling Configuration' | head -2 | tr '\n' '|')"
+fi
+rm -rf "$D"
+
+echo ""
+echo "T-bl203-ensure-recreate-consistent: the SECOND writer honors the recorded answer"
+D=$(mktemp -d)
+mkdir -p "$D/.claude"
+printf '{"answers": {"testing_interval": "7"}}\n' > "$D/.claude/intake-progress.json"
+printf -- '- **Testing interval:** Every 2 features (configured in Intake Section 11.5)\n' > "$D/CLAUDE.md"
+( cd "$D" && bash "$TESTGATE" --check-batch ) >/dev/null 2>&1 || true
+GOT=$(jq -r '.test_interval' "$D/.claude/build-progress.json" 2>/dev/null)
+if [ "$GOT" = "7" ] && grep -qF 'Every 2 features' "$D/CLAUDE.md"; then
+  pass "T-bl203-ensure-recreate-consistent (a recreated file carries the recorded 7 — and the read-only query did NOT touch CLAUDE.md, R-BL203-6)"
+else
+  fail_ "T-bl203-ensure-recreate-consistent" "ensure_progress_file recreated with test_interval=$GOT — the second writer silently reverts the answer (review R-203-1)"
+fi
+rm -rf "$D"
+
+echo ""
+echo "T-bl203-session-check-null-safe: missing keys must not error or fail open"
+D=$(mktemp -d)
+mkdir -p "$D/.claude"
+printf '{"current_phase": "2"}\n' > "$D/.claude/phase-state.json"
+printf '{"features_since_last_test": 4}\n' > "$D/.claude/build-progress.json"
+OUT=$( cd "$D" && bash "$SESSCHECK" 2>&1 ); RC=$?
+if [ "$RC" -eq 0 ] && ! printf '%s' "$OUT" | grep -q 'integer expression' \
+   && printf '%s' "$OUT" | grep -q 'TEST GATE BLOCKED'; then
+  pass "T-bl203-session-check-null-safe (missing test_interval defaults to 2; 4>=2 correctly reports the gate, no bash error)"
+else
+  fail_ "T-bl203-session-check-null-safe" "rc=$RC — a missing test_interval key must default to 2 and still report (got: $(printf '%s' "$OUT" | head -2 | tr '\n' '|'))"
+fi
+rm -rf "$D"
+
+echo ""
+echo "T-bl203-verify-install-default: the repair renderer must not fabricate a 5"
+if grep -qF ':-5}' "$REPO_ROOT/scripts/verify-install.sh"; then
+  fail_ "T-bl203-verify-install-default" "verify-install.sh still defaults TEST_INTERVAL to 5 under a false comment — a repair re-render writes an interval nobody enforces"
+else
+  pass "T-bl203-verify-install-default (the repair default matches the enforced default)"
+fi
+
+echo ""
+echo "T-bl202-prints-and-registration: every dead-air surface names the same next step"
+# The split keeps the init-script token off executed lines — the BL-181/BL-154
+# unit-lane predicate reads names-on-executed-lines and would silently exempt
+# this file from the tests.yml membership lint. Do not "simplify" this back.
+INITF="$REPO_ROOT/init"; INITF="${INITF}.sh"
+BL202_OK=1
+grep -qF "Paste the first message printed by:  bash scripts/resume.sh" "$WIZARD" || BL202_OK=0
+grep -rqF "start-here" "$REPO_ROOT/scripts" && BL202_OK=0   # R-BL202-9: the undiscoverable alias stays dropped
+grep -qF "a blank Claude Code screen means it is ready and waiting, not stuck" "$WIZARD" || BL202_OK=0
+grep -qF "https://claude.com/claude-code" "$WIZARD" || BL202_OK=0
+grep -qF "When you've filled it in, run: bash scripts/resume.sh" "$WIZARD" || BL202_OK=0
+grep -qF "# BL-202-INTAKE-HOOK-BEGIN" "$INITF" || BL202_OK=0
+grep -qF 'session-intake-check.sh"))' "$INITF" || BL202_OK=0
+grep -qF "Then paste the first message printed by:  bash scripts/resume.sh" "$INITF" || BL202_OK=0
+grep -qF "│ Read the following files in order" "$INITF" && BL202_OK=0   # only the PASTE block must be unboxed — other init boxes are out of BL-202 scope
+if [ "$BL202_OK" -eq 1 ]; then
+  pass "T-bl202-prints-and-registration (mode-1/2/3 prints converge on resume.sh, the hook is registered under its fence, and the box art is gone)"
+else
+  fail_ "T-bl202-prints-and-registration" "a BL-202 surface regressed: wizard prints, the SessionStart registration fence, or the copy-delimiter block"
+fi
+
+echo ""
+echo "T-bl203-mutation: excising the marked write line makes the answer a no-op again"
+D=$(mktemp -d)
+_bl203_fixture "$D"
+MUT="$D/test-gate.mut.sh"
+# R-BL203-13: the mutant must be RUNNABLE or the case is vacuous — it sources
+# lib/helpers-core.sh relative to its own location, so give it the real libs
+# and require an empty stderr as proof it reached the BL-203 code at all (an
+# unloadable copy dies at source-time and looks identical by field value).
+mkdir -p "$D/lib" && cp "$REPO_ROOT/scripts/lib/"*.sh "$D/lib/"
+MARKS=$(grep -c 'BL-203-INTERVAL-PLUMB' "$TESTGATE" 2>/dev/null) || MARKS=0
+sed '/# BL-203-INTERVAL-PLUMB$/d' "$TESTGATE" > "$MUT"
+LEFT=$(grep -c 'BL-203-INTERVAL-PLUMB' "$MUT" 2>/dev/null) || LEFT=0
+if [ "${MARKS:-0}" -lt 1 ]; then
+  fail_ "T-bl203-mutation" "no # BL-203-INTERVAL-PLUMB marker in test-gate.sh — nothing to excise (mis-targeted)"
+elif [ "${LEFT:-0}" -ne 0 ]; then
+  fail_ "T-bl203-mutation" "excision left $LEFT marker(s) — vacuous mutant"
+elif ! bash -n "$MUT" 2>/dev/null; then
+  fail_ "T-bl203-mutation" "mutant has a syntax error — a broken mutant proves nothing (the marked line needs its : guard)"
+else
+  ( cd "$D" && bash "$MUT" --set-interval 5 ) >/dev/null 2>"$D/mut.stderr" || true
+  MUT_GOT=$(jq -r '.test_interval' "$D/.claude/build-progress.json" 2>/dev/null)
+  if [ -s "$D/mut.stderr" ]; then
+    fail_ "T-bl203-mutation" "the mutant errored before reaching the BL-203 code ($(head -1 "$D/mut.stderr")) — a mutant that cannot run proves nothing (R-BL203-13)"
+  elif [ "$MUT_GOT" = "2" ]; then
+    pass "T-bl203-mutation (excised writer -> the answer no-ops again, field stays 2 — the marked line is load-bearing and the mutant is non-vacuous)"
+  else
+    fail_ "T-bl203-mutation" "mutant still wrote test_interval=$MUT_GOT — the mutation is not cutting the write path"
+  fi
+fi
+rm -rf "$D"
+
+# ----------------------------------------------------------------
+# BL-204 — happy-path remote-setup UX (findings 5, 6, 7, 8).
+#
+# Findings 1-4 (repair/auth/collision/org-namespace FAILURE paths) are
+# deliberately NOT covered here — they are a separate wave.
+#
+#   5  probe at the SELECTION moment (`# BL-204-PROBE-AT-SELECT`)
+#   6  visibility explained, incl. the free-tier cost (`# BL-204-VISIBILITY-EXPLAIN`)
+#   7  ask once — prefill/confirm instead of a blind re-ask (`# BL-204-PREFILL`)
+#   8  say WHY a remote matters, upstream of the choice (`# BL-204-REMOTE-WHY`)
+#
+# The init-script token is assembled from parts on every executed line below,
+# exactly as the BL-202 case above does: the BL-181/BL-154 unit-lane predicate
+# reads names-on-executed-lines and a literal token here would silently exempt
+# this whole file from the tests.yml membership lint. Do not "simplify" it.
+# ----------------------------------------------------------------
+INITSH="$REPO_ROOT/init"; INITSH="${INITSH}.sh"
+INITTOK="init"; INITTOK="${INITTOK}.sh"
+
+# _bl204_fnbody <file> <function-name> — echo one shell function's body.
+#
+# NEVER `awk … | grep -q` here. This file runs under `set -o pipefail`, and
+# `grep -q` exits at the first match: whether the producer finishes first or
+# takes SIGPIPE (exit 141, which pipefail promotes to the pipeline's status)
+# is a RACE. That race made two of the cases below flap PASS/FAIL on identical
+# trees before this helper existed. Capture, then match with a here-string.
+_bl204_fnbody() {
+  awk -v fn="$2" '
+    $0 ~ ("^" fn "\\(\\) \\{") { inside=1 }
+    inside { print; if ($0 == "}") { exit } }
+  ' "$1"
+}
+
+# The two cross-surface anchors. Both the wizard and the init script must
+# carry them VERBATIM, so a fix applied to only one surface fails.
+BL204_FREETIER_ANCHOR='On a free personal GitHub account, a PRIVATE repo cannot have branch protection'
+BL204_BACKUP_ANCHOR='your remote is your backup'
+
+echo ""
+echo "T-bl204-remote-why: the backup framing is stated upstream of the host choice, and in Next Steps"
+BL204_WHY_OK=1
+grep -qiF "$BL204_BACKUP_ANCHOR" "$WIZARD" || BL204_WHY_OK=0
+grep -qiF "$BL204_BACKUP_ANCHOR" "$INITSH" || BL204_WHY_OK=0
+grep -qF '# BL-204-REMOTE-WHY' "$WIZARD" || BL204_WHY_OK=0
+grep -qF '# BL-204-REMOTE-WHY' "$INITSH" || BL204_WHY_OK=0
+# The sentence must name the data-loss consequence, not just say "backup".
+grep -qiE 'lost .*(disk|drive|laptop|machine)|(disk|drive|laptop|machine) (dies|fails|is lost)' "$WIZARD" || BL204_WHY_OK=0
+grep -qiE 'lost .*(disk|drive|laptop|machine)|(disk|drive|laptop|machine) (dies|fails|is lost)' "$INITSH" || BL204_WHY_OK=0
+# And it must reach print_next_steps, not only the create path (finding 8).
+grep -qF '# BL-204-REMOTE-WHY' <<<"$(_bl204_fnbody "$INITSH" print_next_steps)" || BL204_WHY_OK=0
+if [ "$BL204_WHY_OK" -eq 1 ]; then
+  pass "T-bl204-remote-why (both surfaces say the remote IS the backup and name the data-loss consequence; the Next Steps copy is inside print_next_steps)"
+else
+  fail_ "T-bl204-remote-why" "BL-204 finding 8: the 'why a remote' sentence is missing from the wizard, the init script, or print_next_steps"
+fi
+
+echo ""
+echo "T-bl204-visibility-explain: private/public is explained, with the free-tier branch-protection cost"
+BL204_VIS_OK=1
+for _f in "$WIZARD" "$INITSH"; do
+  grep -qF '# BL-204-VISIBILITY-EXPLAIN' "$_f" || BL204_VIS_OK=0
+  grep -qF "$BL204_FREETIER_ANCHOR" "$_f" || BL204_VIS_OK=0
+  # Plain-language private/public, not a bare `private|public` menu.
+  # `.*` not `[^\n]*`: grep is line-based so they mean the same thing here,
+  # but BSD ERE reads `\n` inside a bracket as the literal chars n and \,
+  # which would silently stop matching if the copy ever gained an "n".
+  grep -qiE 'private.*only you' "$_f" || BL204_VIS_OK=0
+  grep -qiE 'public.*anyone' "$_f" || BL204_VIS_OK=0
+  # Name the later cost by the name the user will actually see (BL-032/BL-002
+  # surface it as an attestation prompt much later in the run).
+  grep -qiF 'attest' "$_f" || BL204_VIS_OK=0
+done
+if [ "$BL204_VIS_OK" -eq 1 ]; then
+  pass "T-bl204-visibility-explain (both prompts explain private vs public AND the free-tier branch-protection cost, naming the attestation it turns into)"
+else
+  fail_ "T-bl204-visibility-explain" "BL-204 finding 6: a visibility prompt is still bare, or one surface lacks the free-tier note"
+fi
+
+echo ""
+echo "T-bl204-probe-at-select: the CLI/credential probe fires when the host is chosen, and the pre-create backstop survives"
+BL204_PROBE_OK=1
+grep -qF '# BL-204-PROBE-AT-SELECT' "$INITSH" || BL204_PROBE_OK=0
+# The probe must be reached from the host-resolution function, not only from
+# the pre-create block (finding 5).
+grep -qF '_bl204_probe_host_at_selection' \
+  <<<"$(_bl204_fnbody "$INITSH" _resolve_host_visibility_mode)" || BL204_PROBE_OK=0
+# BACKSTOP: create_and_protect_remote must still probe immediately before create.
+grep -qF 'host_require_cli' \
+  <<<"$(_bl204_fnbody "$INITSH" create_and_protect_remote)" || BL204_PROBE_OK=0
+if [ "$BL204_PROBE_OK" -eq 1 ]; then
+  pass "T-bl204-probe-at-select (the probe is wired into _resolve_host_visibility_mode AND the pre-create host_require_cli backstop is intact)"
+else
+  fail_ "T-bl204-probe-at-select" "BL-204 finding 5: the probe is not at the selection point, or the pre-create backstop was removed"
+fi
+
+echo ""
+echo "T-bl204-probe-functional: an unauthenticated CLI is reported AT selection, without aborting init"
+D=$(mktemp -d)
+mkdir -p "$D/bin"
+cat > "$D/bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"auth status"*)
+    echo 'error: The token in keyring is invalid or has expired. Try: gh auth login' >&2
+    exit 1 ;;
+  *) exit 0 ;;
+esac
+GHSTUB
+chmod +x "$D/bin/gh"
+cat > "$D/probe.sh" <<PROBEEOF
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$REPO_ROOT"
+NON_INTERACTIVE=true
+BOLD=''; NC=''; CYAN=''; GREEN=''; BLUE=''; YELLOW=''; RED=''
+log_line()   { :; }
+print_step() { echo "[STEP] \$1"; }
+print_ok()   { echo "[OK] \$1"; }
+print_warn() { echo "[WARN] \$1"; }
+print_fail() { echo "[FAIL] \$1"; }
+print_info() { echo "[INFO] \$1"; }
+PROBEEOF
+awk '/^_bl204_probe_host_at_selection\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$INITSH" >> "$D/probe.sh"
+echo '_bl204_probe_host_at_selection "github"; echo "RC=$?"' >> "$D/probe.sh"
+PROBE_OUT=$( cd "$D" && PATH="$D/bin:$PATH" bash "$D/probe.sh" 2>&1 </dev/null )
+if grep -qF 'RC=0' <<<"$PROBE_OUT" \
+   && grep -qiE 'github' <<<"$PROBE_OUT" \
+   && grep -qiE 'auth|log in|sign in|credential' <<<"$PROBE_OUT"; then
+  pass "T-bl204-probe-functional (a failing probe warns at selection time, names the host and the auth fix, and returns 0 so init continues to the backstop)"
+else
+  fail_ "T-bl204-probe-functional" "the selection-time probe did not report an unauthenticated CLI (or aborted init): $(printf '%s' "$PROBE_OUT" | tr '\n' '|' | cut -c1-300)"
+fi
+rm -rf "$D"
+
+echo ""
+echo "T-bl204-wizard-sentence: the backwards 'verified again' sentence is gone and replaced with the truth"
+# Assembled from parts: a literal init-script token on an executed line would
+# exempt this file from the unit lane (see the header note above).
+BL204_BACKWARDS="CLI will be verified again at $INITTOK"
+if grep -qF "$BL204_BACKWARDS" "$WIZARD"; then
+  fail_ "T-bl204-wizard-sentence" "the wizard still claims the CLI will be verified again later — it runs AFTER the init script, so nothing re-verifies (BL-204 finding 5)"
+elif grep -qF 'check-gate.sh --repair' \
+       <<<"$(_bl204_fnbody "$WIZARD" run_section_1_repo_setup)"; then
+  pass "T-bl204-wizard-sentence (the continue arm now points at the real remediation, check-gate.sh --repair)"
+else
+  fail_ "T-bl204-wizard-sentence" "the backwards sentence is gone but the continue arm names no real next step"
+fi
+
+echo ""
+echo "T-bl204-prefill: remembered host/visibility are shown and CONFIRMED, never re-asked blind"
+if ! command -v jq >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+  echo "  [SKIP] T-bl204-prefill — jq or python3 unavailable"
+else
+  # Build a harness that runs the wizard's repo-setup block against a
+  # controlled MANIFEST_FILE + PROGRESS_FILE. SCRIPT_DIR points at an EMPTY
+  # dir so the host-driver probe block is inert — this test is about the
+  # prefill, and the probe has its own case above. Hermetic: no network.
+  _bl204_harness() {  # <dir>
+    local d="$1"
+    mkdir -p "$d/emptyscripts"
+    cat > "$d/harness.sh" <<HEOF
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$d/emptyscripts"
+PROGRESS_FILE="$d/intake-progress.json"
+MANIFEST_FILE="$d/manifest.json"
+_PAUSE_FILE="$d/.pause-sentinel"
+BOLD=''; NC=''; CYAN=''; GREEN=''; BLUE=''; YELLOW=''; RED=''
+print_info() { echo "\$1" >&2; }
+print_ok()   { echo "\$1" >&2; }
+print_warn() { echo "\$1" >&2; }
+print_fail() { echo "\$1" >&2; }
+print_step() { echo "\$1" >&2; }
+log_line()   { :; }
+save_section() { :; }
+HEOF
+    local fn
+    for fn in prompt_input prompt_choice _request_pause check_pause_requested save_answer _bl204_explain_visibility run_section_1_repo_setup; do
+      awk -v fn="$fn" '
+        $0 ~ ("^" fn "\\(\\) \\{") { inside=1 }
+        inside { print; if ($0 == "}") { inside=0; print ""; exit } }
+      ' "$WIZARD" >> "$d/harness.sh"
+    done
+    echo 'run_section_1_repo_setup' >> "$d/harness.sh"
+  }
+
+  # ── Case A: BOTH remembered → confirm, keep, no blind re-ask ──
+  D=$(mktemp -d)
+  _bl204_harness "$D"
+  printf '{"host":"gitlab","mode":"personal"}\n' > "$D/manifest.json"
+  printf '{"answers":{"repo_visibility":"public"}}\n' > "$D/intake-progress.json"
+  A_ERR=$(printf '1\n1\n' | bash "$D/harness.sh" 2>&1 >/dev/null)
+  A_HOST=$(jq -r '.answers.git_host // "MISSING"' "$D/intake-progress.json")
+  A_VIS=$(jq -r '.answers.repo_visibility // "MISSING"' "$D/intake-progress.json")
+  A_OK=1
+  [ "$A_HOST" = "gitlab" ] || A_OK=0
+  [ "$A_VIS" = "public" ] || A_OK=0
+  grep -qi 'remember' <<<"$A_ERR" || A_OK=0
+  # A blind re-ask would list all four hosts; a confirm must not.
+  grep -qE '^[[:space:]]*3\.[[:space:]]*bitbucket' <<<"$A_ERR" && A_OK=0
+
+  # ── Case B: NEITHER source → the original blind prompts, unchanged ──
+  D2=$(mktemp -d)
+  _bl204_harness "$D2"
+  printf '{"answers":{}}\n' > "$D2/intake-progress.json"
+  B_ERR=$(printf '1\n1\n' | bash "$D2/harness.sh" 2>&1 >/dev/null)
+  B_HOST=$(jq -r '.answers.git_host // "MISSING"' "$D2/intake-progress.json")
+  B_VIS=$(jq -r '.answers.repo_visibility // "MISSING"' "$D2/intake-progress.json")
+  B_OK=1
+  [ "$B_HOST" = "github" ] || B_OK=0
+  [ "$B_VIS" = "private" ] || B_OK=0
+  grep -qE '^[[:space:]]*3\.[[:space:]]*bitbucket' <<<"$B_ERR" || B_OK=0
+  grep -qF "$BL204_FREETIER_ANCHOR" <<<"$B_ERR" || B_OK=0
+
+  # ── Case C: host remembered, visibility NOT → mixed, each half independent ──
+  D3=$(mktemp -d)
+  _bl204_harness "$D3"
+  printf '{"host":"bitbucket"}\n' > "$D3/manifest.json"
+  printf '{"answers":{}}\n' > "$D3/intake-progress.json"
+  C_ERR=$(printf '1\n2\n' | bash "$D3/harness.sh" 2>&1 >/dev/null)
+  C_HOST=$(jq -r '.answers.git_host // "MISSING"' "$D3/intake-progress.json")
+  C_VIS=$(jq -r '.answers.repo_visibility // "MISSING"' "$D3/intake-progress.json")
+  C_OK=1
+  [ "$C_HOST" = "bitbucket" ] || C_OK=0
+  [ "$C_VIS" = "public" ] || C_OK=0
+
+  # ── Case D: visibility remembered but the user says CHANGE IT → the
+  # explanation must run on THAT path too. Added after a mutation run showed
+  # the "change it" arm's _bl204_explain_visibility call could be deleted
+  # with every case still green: A/C never reach it and B reaches the OTHER
+  # call site, so a user who actively wants to reconsider — precisely the one
+  # who needs the free-tier note — was unprotected.
+  D4=$(mktemp -d)
+  _bl204_harness "$D4"
+  printf '{"answers":{"repo_visibility":"private"}}\n' > "$D4/intake-progress.json"
+  D_ERR=$(printf '1\n2\n2\n' | bash "$D4/harness.sh" 2>&1 >/dev/null)
+  D_VIS=$(jq -r '.answers.repo_visibility // "MISSING"' "$D4/intake-progress.json")
+  D_OK=1
+  [ "$D_VIS" = "public" ] || D_OK=0
+  grep -qF "$BL204_FREETIER_ANCHOR" <<<"$D_ERR" || D_OK=0
+
+  # ── Case E (R-BL204-2): the PRIMARY flow — a project fresh out of init,
+  # seeded with ONLY what init itself writes.
+  #
+  # THE GAP THIS CLOSES. Cases A/C/D hand-seed answers.repo_visibility, and
+  # the only writer of that key in the whole repo was the wizard. init
+  # resolved _RESOLVED_VISIBILITY (from --visibility, or a prompt) and threw
+  # it away, so on every real first run the wizard found nothing and
+  # blind-asked — the visibility half of "ask once" was a no-op everywhere
+  # except in this file's own fixtures. That is the fixture-masks-gap class:
+  # the test seeded the very state whose absence was the defect.
+  #
+  # So this case does NOT hand-write the key. It runs init's own persistence
+  # function to produce the file, then feeds THAT file to the wizard. The only
+  # test plumbing is the copy from .claude/ (where init writes) to the flat
+  # path the harness reads; the CONTENT is exactly what init produced.
+  D5=$(mktemp -d)
+  mkdir -p "$D5/run"
+  cat > "$D5/persist.sh" <<PEOF
+#!/usr/bin/env bash
+set -uo pipefail
+PEOF
+  awk '/^_bl204_persist_visibility_answer\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$INITSH" >> "$D5/persist.sh"
+  echo '_bl204_persist_visibility_answer "public"' >> "$D5/persist.sh"
+  ( cd "$D5/run" && bash "$D5/persist.sh" ) >/dev/null 2>&1
+  E_OK=1
+  E_WROTE=$(jq -r '.answers.repo_visibility // "MISSING"' "$D5/run/.claude/intake-progress.json" 2>/dev/null) || E_WROTE="NOFILE"
+  [ "$E_WROTE" = "public" ] || E_OK=0
+  # Now the wizard, against init's real output plus the manifest init writes.
+  _bl204_harness "$D5"
+  printf '{"host":"github","mode":"personal"}\n' > "$D5/manifest.json"
+  cp "$D5/run/.claude/intake-progress.json" "$D5/intake-progress.json" 2>/dev/null || printf '{"answers":{}}\n' > "$D5/intake-progress.json"
+  E_ERR=$(printf '1\n1\n' | bash "$D5/harness.sh" 2>&1 >/dev/null)
+  E_VIS=$(jq -r '.answers.repo_visibility // "MISSING"' "$D5/intake-progress.json")
+  [ "$E_VIS" = "public" ] || E_OK=0
+  # The decisive assertion: a CONFIRM, not a blind private|public menu.
+  grep -qE '^[[:space:]]*2\.[[:space:]]*public$' <<<"$E_ERR" && E_OK=0
+  grep -qi 'remembered from your setup answers — repository visibility' <<<"$E_ERR" || E_OK=0
+  # And init must actually CALL the persistence function — a function nobody
+  # invokes is the same no-op wearing a different hat.
+  grep -qF '_bl204_persist_visibility_answer' \
+    <<<"$(_bl204_fnbody "$INITSH" prepare_initial_state_for_commit)" || E_OK=0
+
+  if [ "$A_OK" -eq 1 ] && [ "$B_OK" -eq 1 ] && [ "$C_OK" -eq 1 ] && [ "$D_OK" -eq 1 ] && [ "$E_OK" -eq 1 ]; then
+    pass "T-bl204-prefill (remembered values are confirmed not re-asked; with neither source the original prompts + the free-tier note still run; the two halves prefill independently; 'change it' also gets the explanation; and the PRIMARY flow works off what init itself persists)"
+  else
+    fail_ "T-bl204-prefill" "A(ok=$A_OK host=$A_HOST vis=$A_VIS) B(ok=$B_OK host=$B_HOST vis=$B_VIS) C(ok=$C_OK host=$C_HOST vis=$C_VIS) D(ok=$D_OK vis=$D_VIS) E(ok=$E_OK wrote=$E_WROTE vis=$E_VIS) — BL-204 finding 7 / R-BL204-2"
+  fi
+  rm -rf "$D" "$D2" "$D3" "$D4" "$D5"
+fi
+
+echo ""
+echo "T-bl204-mutation: excising the marked prefill reads restores the blind double-ask"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "  [SKIP] T-bl204-mutation — jq unavailable"
+else
+  D=$(mktemp -d)
+  MARKS=$(grep -c '# BL-204-PREFILL-READ$' "$WIZARD" 2>/dev/null) || MARKS=0
+  sed '/# BL-204-PREFILL-READ$/d' "$WIZARD" > "$D/wizard.mut.sh"
+  LEFT=$(grep -c '# BL-204-PREFILL-READ$' "$D/wizard.mut.sh" 2>/dev/null) || LEFT=0
+  if [ "${MARKS:-0}" -lt 2 ]; then
+    fail_ "T-bl204-mutation" "expected a '# BL-204-PREFILL-READ' marker on BOTH prefill reads (host + visibility); found ${MARKS:-0}"
+  elif [ "${LEFT:-0}" -ne 0 ]; then
+    fail_ "T-bl204-mutation" "excision left $LEFT marker(s) — vacuous mutant"
+  elif ! bash -n "$D/wizard.mut.sh" 2>/dev/null; then
+    fail_ "T-bl204-mutation" "mutant has a syntax error — a broken mutant proves nothing (the marked lines need their : guard)"
+  else
+    mkdir -p "$D/emptyscripts"
+    cat > "$D/harness.sh" <<MHEOF
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$D/emptyscripts"
+PROGRESS_FILE="$D/intake-progress.json"
+MANIFEST_FILE="$D/manifest.json"
+_PAUSE_FILE="$D/.pause-sentinel"
+BOLD=''; NC=''; CYAN=''; GREEN=''; BLUE=''; YELLOW=''; RED=''
+print_info() { echo "\$1" >&2; }
+print_ok()   { echo "\$1" >&2; }
+print_warn() { echo "\$1" >&2; }
+print_fail() { echo "\$1" >&2; }
+print_step() { echo "\$1" >&2; }
+log_line()   { :; }
+save_section() { :; }
+MHEOF
+    for fn in prompt_input prompt_choice _request_pause check_pause_requested save_answer _bl204_explain_visibility run_section_1_repo_setup; do
+      awk -v fn="$fn" '
+        $0 ~ ("^" fn "\\(\\) \\{") { inside=1 }
+        inside { print; if ($0 == "}") { inside=0; print ""; exit } }
+      ' "$D/wizard.mut.sh" >> "$D/harness.sh"
+    done
+    echo 'run_section_1_repo_setup' >> "$D/harness.sh"
+    printf '{"host":"gitlab"}\n' > "$D/manifest.json"
+    printf '{"answers":{"repo_visibility":"public"}}\n' > "$D/intake-progress.json"
+    MUT_ERR=$(printf '1\n1\n' | bash "$D/harness.sh" 2>&1 >/dev/null)
+    MUT_HOST=$(jq -r '.answers.git_host // "MISSING"' "$D/intake-progress.json")
+    MUT_VIS=$(jq -r '.answers.repo_visibility // "MISSING"' "$D/intake-progress.json")
+    if [ "$MUT_HOST" = "github" ] && [ "$MUT_VIS" = "private" ]; then
+      pass "T-bl204-mutation (without the marked reads the wizard blind-asks again and overwrites gitlab/public with the menu's first option — the reads are load-bearing)"
+    else
+      fail_ "T-bl204-mutation" "mutant still honored the remembered values (host=$MUT_HOST vis=$MUT_VIS) — the mutation is not cutting the prefill path"
+    fi
+  fi
+  rm -rf "$D"
+fi
+
+echo ""
+echo "==============================="
+echo "Passed: $PASSED   Failed: $FAILED"
+echo "==============================="
+[ "$FAILED" -eq 0 ]

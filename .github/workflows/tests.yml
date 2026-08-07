@@ -1,0 +1,849 @@
+# .github/workflows/tests.yml — BL-077: run the test suite in CI on Linux.
+#
+# The suite has only ever run on macOS (bash 3.2). GitHub's ubuntu-latest
+# runners ship bash 5; the suite is written to the bash-3.2 subset, which
+# runs unchanged on bash 5. This workflow gives the repo its first
+# automated *test* coverage (the sibling lint.yml only runs lint scripts).
+#
+# Two lanes, because the full suite (tests/full-project-test-suite.sh)
+# scaffolds dozens of real init.sh projects and delegates to the big
+# aggregators — it takes ~1 hour and is far too slow for every push:
+#
+#   * unit (fast lane)  — push + pull_request. Runs only the quick unit
+#                         tests: the individual tests/test-*.sh files that
+#                         do NOT invoke init.sh and are NOT aggregators.
+#                         The list is explicit and reviewable below so a new
+#                         orphan test cannot silently join CI — add new
+#                         entries deliberately.
+#                         BL-190: the lane is SHARDED. The list below is
+#                         still one canonical array; a matrix job
+#                         (`unit-shard`) partitions it across five parallel
+#                         runners, and a zero-work `unit` job aggregates
+#                         them so the branch-protection check name survives.
+#                         Nothing was demoted to the full lane: the set of
+#                         tests that gate a PR is byte-identical before and
+#                         after, only the wall clock changed (~19 min serial
+#                         -> ~5.5 min FOR THIS LANE). That is NOT the
+#                         PR-blocking number — see the critical-path note on
+#                         the unit-shard job below.
+#                         BL-181: membership is enforced by
+#                         scripts/lint-tests-registered.sh, whose exemption
+#                         predicate looks at EXECUTED lines only. The older
+#                         `grep -L 'init\.sh' tests/test-*.sh` recipe is
+#                         WRONG as a membership rule — it exempts any file
+#                         that merely MENTIONS init.sh, including a comment
+#                         saying it does not invoke it. Seven such files
+#                         were exempted by a comment until BL-181 landed.
+#
+#   * full (slow lane)  — MANUAL dispatch only (workflow_dispatch); no nightly. Runs the
+#                         complete tests/full-project-test-suite.sh, which
+#                         honors the SKIP_KNOWN_FAILING env (left at its
+#                         default of 0 so known-RED guards still run).
+#
+# The tests are hermetic (BL-076 lint enforces no live-remote init.sh runs),
+# so CI does NOT authenticate gh and creates no real remotes. Keep it that
+# way.
+#
+# (The "do not modify lint.yml" line that used to sit here was a scope guard
+# for the sharding change, not a standing rule. Karl lifted it so the BL-191
+# `if: always()` -> `if: failure()` fix to lint.yml's nine inventory steps
+# could land alongside this — that fix is what actually moves the PR-blocking
+# floor, and it is documented in lint.yml's own header.)
+
+name: tests
+
+on:
+  push:
+    branches: [main]   # fast lane on main pushes; PRs covered by pull_request
+  pull_request:
+  workflow_dispatch:   # the full lane is manual-only (no scheduled nightly)
+
+jobs:
+  # ── Fast lane (sharded) ────────────────────────────────────────────────
+  # BL-190: the fast lane was SERIAL and had reached its own 20-minute cap —
+  # 18m51s on main (run 30297887329) and CANCELLED at 20m15s on PR #278,
+  # "The operation was canceled", not an assertion failure. A lane that
+  # blocks any PR merely for ADDING a test has stopped being a fast lane, so
+  # this splits the SAME test list across parallel shards instead of raising
+  # the cap (raising it would only hide the next doubling).
+  #
+  # Where the 18m51s went (measured, run 30297887329, ::group:: spans):
+  #     318s tests/test-run-lints.sh
+  #     243s tests/test-lint-counter-antipattern.sh
+  #     122s tests/test-pre-commit-gate-lints.sh
+  #      77s tests/test-bl132-sast-index-scan.sh   (213s on PR #278)
+  #      54s tests/test-bl131-domsink-rules.sh
+  #      41s tests/test-lint-raw-read-prompt.sh
+  #      37s tests/test-upgrade-sync-framework.sh
+  #      34s tests/test-plan-staging.sh
+  #      16s tests/test-lint-doc-anchors.sh
+  #     170s the other 127 files, TOGETHER (avg 1.34s)
+  # i.e. 85% of the lane is nine files, and the other 127 are noise. Sharding
+  # is therefore the whole fix; nothing needs to be deleted, skipped or
+  # demoted, and every test below still runs on every PR.
+  #
+  # WHY THOSE NINE ARE SLOW (verified, not assumed). The two biggest are
+  # lint work the PR ALREADY does elsewhere:
+  #   • tests/test-run-lints.sh — its T-all-pass arm runs `scripts/run-lints.sh`
+  #     over the REAL repo, i.e. all 11 lints end-to-end.
+  #   • tests/test-lint-counter-antipattern.sh — 12 tiny fixture cases, plus
+  #     "T9: MERGE GATE" which runs the linter over the REAL repo. Same for
+  #     test-lint-raw-read-prompt.sh and test-lint-doc-anchors.sh.
+  # lint.yml already runs each of those lints over the repo in its own
+  # PARALLEL job (counter-antipattern-lint, raw-read-prompt-lint,
+  # doc-anchors-lint — all three are required checks), so on a PR the
+  # full-tree counter-antipattern scan executed FOUR times per PR, not the
+  # three originally claimed:
+  #   1. lint.yml counter-antipattern-lint, step "Lint counter-capture
+  #      antipattern"                                       207s on main
+  #   2. lint.yml counter-antipattern-lint, step "Show PASS/FAIL
+  #      inventory" — the `--list` re-scan, then gated `if: always()`,
+  #      so it re-ran on SUCCESS too                        204s on main
+  #   3. tests/test-lint-counter-antipattern.sh `T9: MERGE GATE`
+  #   4. tests/test-run-lints.sh `T-all-pass`, via scripts/run-lints.sh
+  # (1) and (2) are measured from run 30297887996 job 90083310253 (main
+  # @ 9d71824); (3) and (4) are the 243s attributed above.
+  #
+  # (2) IS NOW GONE ON GREEN RUNS. This change also flips lint.yml's nine
+  # inventory steps from `if: always()` to `if: failure()` (BL-191), so on a
+  # passing PR the scan runs THREE times and on a failing one it still runs
+  # four — the inventory prints exactly when someone needs it. The remaining
+  # duplication is genuine merge gates the suites own, so nothing is
+  # removed; (3) and (4) are merely moved off each other's critical path.
+  # The root cost WAS scripts/lint-counter-antipattern.sh's `scan_file`,
+  # which forked `echo "$line" | grep -Eq` PER LINE of every file it walks.
+  # That half of BL-191 has since SHIPPED: `scan_file` now runs one
+  # `grep -naE` pass per RULE per FILE, verified byte-identical (stdout,
+  # stderr and exit code) on the clean tree, on a seeded full-tree copy
+  # carrying 32 FAIL rows and 10 sed-alternation rows, and on five seeded
+  # fixtures. Measured on the macOS host, 3 runs each: 407.6/425.6/468.7s
+  # before, 3.84/4.05/3.93s after. The CI seconds recorded in this file
+  # PRE-DATE that change — re-measure before trusting any of them for
+  # rebalancing.
+  #
+  # SHARDS. Only the measured long poles are pinned; `rest` is the
+  # COMPLEMENT of the pins, so a newly added test needs no edit here — it
+  # lands in `rest` automatically and the partition assertion still holds.
+  # Expected wall clock per shard. The per-file seconds are MEASURED; the
+  # per-shard totals are DERIVED from them (measured seconds + ~20s job
+  # overhead, itself measured from the old serial job's non-test steps).
+  # No run has yet executed the five-leg topology, so nothing in this table
+  # is an observation:
+  #     lint-sweep  318s ->  ~5.5 min   (  1 file)
+  #     lint-scan   299s ->  ~5.2 min   (  3 files)
+  #     sast        281s ->  ~4.9 min   (  3 files; PR #278 worst case for bl132)
+  #     slow-misc   193s ->  ~3.5 min   (  3 files)
+  #     rest        157s ->  ~2.9 min   (126 files; the shard that grows)
+  #                 ----                ----
+  #                1248s                 136 files — same 136 as the serial lane
+  # THIS LANE's long pole is ~5.5 min against a 12-minute cap. The cap is
+  # LOWERED from 20 on purpose: it has to stay a tripwire, not a ceiling to
+  # grow into.
+  #
+  # THE PR-BLOCKING CRITICAL PATH IS NOT THIS LANE'S NUMBER — check both.
+  # Sharding alone would have left the PR floored at ~7-9 min by lint.yml's
+  # REQUIRED `counter-antipattern-lint` job: MEASURED 6m59s on main (run
+  # 30297887996, job 90083310253, @ 9d71824) and 9m03s on PR #278 (run
+  # 30380689795, job 90347515417, @ 8ea8c6c). Sharding takes THIS lane off
+  # the critical path; it cannot lower that floor.
+  #
+  # So this change also lowers the floor, in lint.yml (BL-191): its nine
+  # `--list` inventory steps go `if: always()` -> `if: failure()`, dropping
+  # a full duplicate scan from every green lint job. DERIVED, not observed —
+  # no run has executed either topology yet:
+  #     counter-antipattern-lint  419s -> ~215s  (~3.6 min)  main
+  #                               543s -> ~277s  (~4.6 min)  PR #278
+  #     unit lane long pole       lint-sweep ~5.5 min, plus the `unit`
+  #                               aggregator that gates on it     ~6 min
+  # The lint floor drops below the unit lane, so the expected new
+  # PR-blocking critical path is ~6 min, SET BY THIS LANE's lint-sweep
+  # shard — the first time it has been the unit lane's number to own.
+  # Lowering it further meant making the scan itself cheap, and BL-191's
+  # per-line-fork rewrite has now landed (~110x on the macOS host). Every
+  # second figure above therefore pre-dates it and is an UPPER bound; the
+  # lane's new long pole has not been measured on CI. Re-measure before
+  # repinning shards — do not derive from this table.
+  unit-shard:
+    name: unit-shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Deliberately LOWER than the old 20. Slowest measured shard is ~5.5 min,
+    # so this is ~2x headroom; if a shard ever approaches it, that is the
+    # signal to re-pin, exactly as it was here.
+    timeout-minutes: 12
+    # Only the fast lane on push / PR. The full suite runs on schedule /
+    # dispatch (see the `full` job's guard below).
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    strategy:
+      # Report every shard. A red shard must not cancel the others, or the
+      # PR author sees one failure and cannot tell what else is broken.
+      fail-fast: false
+      matrix:
+        shard: [lint-sweep, lint-scan, sast, slow-misc, rest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+        with:
+          # tests/test-lint-backlog-references.sh runs the linter against the
+          # REAL repo with `--base origin/main` (needs the origin/main ref and
+          # reachable history). The default shallow clone (fetch-depth: 1)
+          # leaves that ref unresolvable. Mirror lint.yml's backlog job.
+          fetch-depth: 0
+
+      - name: Verify required tools are available
+        # ubuntu-latest ships both, but fail loudly and early if a future
+        # runner image ever drops one rather than mid-suite with a cryptic
+        # error.
+        run: jq --version && git --version
+
+      - name: Install semgrep (live SAST cases)
+        # BL-118 follow-up (Karl's 2026-07-18 decision on the WP-A1 open
+        # question): the LIVE DOM-XSS blocking cases run on EVERY PR, not
+        # only in the manual full lane. The hermetic exact-token pins catch
+        # registry-token drift without semgrep, but only a real run proves
+        # the emitted hook still BLOCKS — a renamed/retired registry rule
+        # would otherwise re-blind every generated hook while CI stayed
+        # green between manual full-lane dispatches. An install failure fails
+        # the lane LOUDLY rather than silently skipping the blocking arm.
+        #
+        # BL-190: installed in EVERY shard, not only `sast`. The semgrep
+        # suites are pinned to `sast` today, but `rest` is the complement —
+        # a future semgrep-requiring test lands there with no edit here, and
+        # those suites SKIP LOUDLY (not fail) without semgrep, which is
+        # precisely the silent-blinding this step exists to prevent. Uniform
+        # install keeps the pin map free to move. Cost: the "one registry
+        # fetch per PR" of the old serial lane becomes one per shard, ~12s
+        # each and fully parallel, so it is not on the critical path.
+        # semgrep is deliberately UNPINNED — Karl's 2026-07-29 decision, recorded with
+        # its reasoning on solo-orchestrator-backlog.md § BL-192 (DECISION block): a
+        # stale scanner stops catching new vulnerabilities. Do not pin. The generated-
+        # project templates float too, sequenced behind BL-198 — see BL-201.
+        run: pip install semgrep
+
+      - name: Install gitleaks (pinned + checksum-verified)
+        # R-WP2-1. WITHOUT THIS STEP THE BROWNFIELD LEAK PROOF GATES NOTHING.
+        # The ubuntu runner image does NOT ship gitleaks, and
+        # tests/test-brownfield-wp2-scout-sections.sh degrades its twelve
+        # gitleaks-gated cases — the §6.5 planted-secret byte-absence proof AND
+        # all four mutation proofs — to a loud SKIP. Loud in the log, and still
+        # exit 0: a green required check credited with a proof that never ran.
+        # That is the silent-success class one level up, sitting on the highest-
+        # stakes property in the brownfield design, whose failure mode is a
+        # leaked credential in a committed file. The suite's own CI arm now
+        # FAILS when gitleaks is missing and CI is set, so this step is not
+        # optional — remove it and the lane goes red rather than quietly blind.
+        #
+        # PINNED, unlike semgrep two steps up, and the difference is deliberate.
+        # BL-192's reasoning for floating semgrep is that a stale SCANNER stops
+        # catching new vulnerabilities — it is used there as a live detector.
+        # gitleaks is used here as a FIXTURE ORACLE: the suite asserts exact
+        # finding counts, an exact 18-field report shape, and the precise
+        # BASE32 rule behaviour that makes the plants valid. A floating version
+        # that changed its report schema or its aws-access-token rule would not
+        # find new secrets in this repository — it would silently invalidate
+        # the proof's fixtures. 8.30.1 is the version every fixture fact in
+        # §13-V3 and in the WP2 suite was verified against.
+        #
+        # The checksum is the release's own published value for this asset,
+        # confirmed by downloading the tarball and hashing it (2026-08-03).
+        # Verifying it means a replaced release asset breaks the lane instead
+        # of silently changing what the proof runs against.
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --retry 3 -o /tmp/gitleaks.tar.gz "$url"
+          # NOT `sha256sum -c` (R-WP2-6): a malformed pin makes that spelling
+          # warn and exit 0, silently verifying nothing. The script computes and
+          # compares in the shell, rejects a badly-formed value on EITHER side,
+          # and — being a script — has its failure modes executed by the K cases
+          # in tests/test-brownfield-wp2-scout-sections.sh.
+          bash scripts/ci-verify-sha256.sh /tmp/gitleaks.tar.gz "${GITLEAKS_SHA256}"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run fast unit tests — shard ${{ matrix.shard }}
+        env:
+          SHARD: ${{ matrix.shard }}
+          # strategy.job-total is the number of legs in the matrix above.
+          # See the roster-drift guard at the top of the script.
+          SHARD_TOTAL: ${{ strategy.job-total }}
+        run: |
+          set -uo pipefail
+
+          # ── Shard roster: the SINGLE SOURCE for the shard set ──────────
+          # THE HAZARD. `rest` is the complement of the PINNED paths, not of
+          # the paths some shard actually ran. So if a shard stops existing
+          # but its pins keep contributing to `pinned`, its tests are
+          # excluded from `rest` and then run NOWHERE — while the partition
+          # arithmetic still balances and every remaining shard still goes
+          # green. A hand-maintained leg COUNT does not close that: you
+          # delete the leg, you update the count because the error message
+          # told you to, and the tests vanish anyway.
+          #
+          # THE CLOSURE. This roster is the only place a shard is named in
+          # this script. The leg-count guard counts it; `pins_for` cases on
+          # exactly these names; the pinned set is built by walking this
+          # roster THROUGH `pins_for`; and the dispatch validates against
+          # it. Delete a name here and its `pin_*` array is ORPHANED — it
+          # no longer enters `pinned`, so those paths fall back into `rest`
+          # and STILL RUN. Fail-safe, not silently dropped.
+          shard_names="lint-sweep lint-scan sast slow-misc rest"
+
+          roster="|"
+          shard_arms=0
+          for s in $shard_names; do
+            roster="${roster}${s}|"
+            shard_arms=$((shard_arms + 1))
+          done
+
+          # The matrix leg count is the one thing this script cannot read —
+          # it lives in the YAML above. `strategy.job-total` carries it down
+          # so a matrix edited apart from the roster fails loudly. This is
+          # now the ONLY hand-kept correspondence, and getting it wrong is
+          # non-silent in both directions: too few legs fails here, and an
+          # extra leg fails the roster-membership check below.
+          if [ "${SHARD_TOTAL}" != "${shard_arms}" ]; then
+            echo "shard roster drift: the matrix declares ${SHARD_TOTAL} leg(s) but the roster names ${shard_arms} (${shard_names}). Edit the matrix list and the roster TOGETHER." >&2
+            exit 1
+          fi
+
+          case "$roster" in
+            *"|${SHARD}|"*) ;;
+            *) echo "unknown shard: '${SHARD}' is not in the roster (${shard_names})" >&2
+               exit 1 ;;
+          esac
+          # Explicit, reviewable list. A test belongs here iff it does not
+          # invoke init.sh (no project scaffolding) and is not an aggregator
+          # or helper. Membership is machine-checked in the OMISSION direction
+          # — a fast test missing from this array fails the lint — with:
+          #   bash scripts/lint-tests-registered.sh
+          # It is NOT tamper-proof in the other direction: `_build_unit_list_set`
+          # scopes with awk between `tests=(` and `)` and does not strip
+          # comments, so an entry COMMENTED OUT inside this array still counts
+          # as membership while bash drops it from the array. A green lint is
+          # therefore not proof that a listed test actually runs here. See the
+          # residual recorded on `## BL-181:`.
+          # See which files the exemption actually fired on with:
+          #   bash scripts/lint-tests-registered.sh --list \
+          #     | grep unit-lane-exempt
+          # Each such row is a CLAIM ("this file invokes init.sh"), not a
+          # verdict — the predicate reads executed lines, so a file that only
+          # names init.sh inside a string/heredoc (grep/awk target, or a stub
+          # it writes) is exempted too. Read the rows, do not just count them:
+          # a 2026-07-26 grep-based audit of 33 rows moved 5 such files here
+          # (BL-181 R-B-5), and a second pass over the remaining 28 — this
+          # time an EXECUTION trace, not a grep — found one MORE
+          # (tests/test-lint-no-live-remote.sh, R-B-11). Audit by execution:
+          # instrument init.sh with an env-gated marker append and run each
+          # exempt row; a marker line is proof of invocation, a grep is not.
+          # As of that 2026-07-26 execution-trace pass, all 27 rows THEN
+          # PRESENT invoked init.sh; that is a measurement of one tree at one
+          # commit, not a standing guarantee — the tree has since grown to 29
+          # via the BL-180 suites. Re-run it; do not cite the number.
+          # Do NOT regenerate from `grep -L 'init\.sh' tests/test-*.sh`: that
+          # matches comments too, so it silently drops any file that merely
+          # mentions init.sh (BL-181).
+          tests=(
+            tests/test-bl010-commitmsg-bl006.sh
+            tests/test-bl032-gitlab-free-approvals-attestation.sh
+            tests/test-bl033-install-cmds-shape.sh
+            tests/test-bl046-helpers-split.sh
+            tests/test-bl069-install-cmds-consumers.sh
+            tests/test-bl070-license-scanner.sh
+            tests/test-bl070-snyk-zap-scanners.sh
+            tests/test-bl070-threat-model-scanner.sh
+            tests/test-bl072-tdd-warn-detector.sh
+            tests/test-bl073-review-manifest-gate.sh
+            tests/test-bl103-eval-generator.sh
+            tests/test-bl102-market-signal-warn.sh
+            tests/test-bl104-gate-scoring.sh
+            tests/test-bl105-phase4-wave.sh
+            tests/test-bl107-tdd-all-languages.sh
+            tests/test-bl108-bl117-ship-closure.sh
+            tests/test-bl118-sast-dom-xss.sh
+            tests/test-bl132-sast-index-scan.sh
+            tests/test-bl131-domsink-rules.sh
+            tests/test-bl200-syntax-detector.sh
+            tests/test-bl200-syntax-canary.sh
+            tests/test-bl119-stale-editmsg.sh
+            tests/test-bl121-cutline-bsd-sed.sh
+            tests/test-bl114-bl115-bl127-gate-integrity.sh
+            tests/test-bl116-push-gate-scope.sh
+            tests/test-bl123-bp-attestation-recovery.sh
+            tests/test-bl157-remote-marker-record.sh
+            tests/test-bl124-pending-ratchet.sh
+            tests/test-bl130-attest-fail-guard.sh
+            tests/test-bl096-cold-start.sh
+            tests/test-bl095-state-readers.sh
+            tests/test-bl106-golive-checklist.sh
+            tests/test-bl120-audit-verdict.sh
+            tests/test-bl162-audit-dedup.sh
+            tests/test-bl167-claude-classifier.sh
+            tests/test-bl125-commit-test-exec.sh
+            tests/test-bl163-blocked-ledger.sh
+            tests/test-bl171-commitmsg-ledger.sh
+            tests/test-bl172-resume-sentinels.sh
+            tests/test-bl176-worktree-sentinels.sh
+            tests/test-bl161-ledger-real-events-only.sh
+            tests/test-bl174-gitignore-backfill.sh
+            tests/test-bl184-child-suite-evidence.sh
+            tests/test-bl141-commitmsg-repair.sh
+            tests/test-bl145-hook-symlink-hookspath.sh
+            tests/test-bl143-pastcap-selfapproval.sh
+            tests/test-bl144-selfapproval-silent-arms.sh
+            tests/test-bl155-phase2-init-transition-commit.sh
+            tests/test-bl168-tm-table-sigpipe.sh
+            tests/test-bl165-dast-hardened-serve.sh
+            tests/test-bl169-gitignore-anchor.sh
+            tests/test-bl147-ci-template-integrity.sh
+            tests/test-bl089-doc-foundations.sh
+            tests/test-bl137-ci-tools-scope.sh
+            tests/test-walk006-ci-protection-scope.sh
+            tests/test-bl138-approval-window.sh
+            tests/test-bl170-approval-append-design.sh
+            tests/test-bl166-gate-scope.sh
+            tests/test-bl139-subjectless-default.sh
+            tests/test-bl128-review-generator-headless.sh
+            tests/test-bypass-audit-integrity.sh
+            tests/test-bypass-audit-lib.sh
+            tests/test-bypass-audit-tmp-hardening.sh
+            tests/test-bypass-audit-trap-isolation.sh
+            tests/test-bypass-detector-session-id.sh
+            tests/test-bypass-detector.sh
+            tests/test-bypass-patterns.sh
+            tests/test-bypass-sentinel.sh
+            tests/test-check-changelog-filter.sh
+            tests/test-check-commit-message.sh
+            tests/test-check-gate.sh
+            tests/test-walk016-release-env-policy.sh
+            tests/test-check-phase-gate-argv-parser.sh
+            tests/test-check-phase-gate-backstop-attestation.sh
+            tests/test-check-phase-gate-blame-walker.sh
+            tests/test-check-phase-gate-counter-sanitizer.sh
+            tests/test-check-phase-gate-date-writeback.sh
+            tests/test-check-phase-gate-noninteractive.sh
+            tests/test-check-phase-gate-poc-block-contract.sh
+            tests/test-check-phase-gate-retroactive-approval.sh
+            tests/test-check-phase-gate-self-approval.sh
+            tests/test-check-phase-gate.sh
+            tests/test-currency-manifest.sh
+            tests/test-delta-wp0-inherited-predicates.sh
+            tests/test-delta-wp2-state-policy.sh
+            tests/test-delta-wp3-era-classify.sh
+            tests/test-delta-wp4-close-rubric.sh
+            tests/test-delta-wp5-hotfix-retro.sh
+            tests/test-delta-wp6-cadence.sh
+            tests/test-delta-wp7-cut-release.sh
+            tests/test-delta-severability.sh
+            tests/test-docs-cluster-six-pack.sh
+            tests/test-enforcement-level-lib.sh
+            tests/test-escalate-to-user.sh
+            tests/test-filesystem-gate-install.sh
+            tests/test-freshness-check.sh
+            tests/test-gate-principles.sh
+            tests/test-gitlab-ci-status-stderr-approvals.sh
+            tests/test-host-verify-protection-date-parse.sh
+            tests/test-bl202-readme-kickoff-consolidation.sh
+            tests/test-bl202-session-intake-check.sh
+            tests/test-bl214-gate-snapshot-staleness.sh
+            tests/test-intake-wizard-fixes.sh
+            tests/test-lint-backlog-references.sh
+            tests/test-lint-bl-markers.sh
+            tests/test-lint-counter-antipattern.sh
+            tests/test-lint-delta-boundary.sh
+            tests/test-lint-diagnostic-destruction.sh
+            tests/test-lint-doc-anchors.sh
+            tests/test-lint-fix-functions-stderr.sh
+            tests/test-lint-module-dependencies.sh
+            tests/test-brownfield-wp1-scout.sh
+            tests/test-lint-no-live-remote.sh
+            tests/test-lint-raw-read-prompt.sh
+            tests/test-lint-tests-registered.sh
+            tests/test-lint-uat-scenarios.sh
+            tests/test-out-of-band-detector.sh
+            tests/test-pending-approval-resolve-decision.sh
+            tests/test-pending-approval.sh
+            tests/test-phase-finalize.sh
+            tests/test-phase3-validation-gate.sh
+            tests/test-plan-staging.sh
+            tests/test-platform-mobile-mcp-docs.sh
+            tests/test-platform-security-bugs-closer.sh
+            tests/test-pre-commit-gate-classifier.sh
+            tests/test-pre-commit-gate-lints.sh
+            tests/test-pre-commit-gate-terminal-mode.sh
+            tests/test-process-checklist-auto-advance.sh
+            tests/test-process-checklist-check-commit-ready-subject.sh
+            tests/test-process-checklist-classifier.sh
+            tests/test-process-checklist-reset-phase1.sh
+            tests/test-prompt-install-noninteractive.sh
+            tests/test-reconfigure-field-handlers.sh
+            tests/test-record-claude-commit.sh
+            tests/test-resolve-tools-memoization.sh
+            tests/test-run-lints.sh
+            tests/test-scaffold-source-closure.sh
+            tests/test-session-test-gate-check-merge.sh
+            tests/test-specs-plans-host-aware-quartet.sh
+            tests/test-specs-plans-remaining-quartet.sh
+            tests/test-walk003-update-command-render.sh
+            tests/test-test-gate-counter-sanitizer.sh
+            tests/test-test-gate-null-handling.sh
+            tests/test-tier-crosscheck-6-followup-atomicity-and-jq.sh
+            tests/test-tier-crosscheck-6-zdr-gate.sh
+            tests/test-unrecord-feature.sh
+            tests/test-upgrade-cdf-refresh.sh
+            tests/test-upgrade-interruption.sh
+            tests/test-upgrade-manifest-refresh.sh
+            tests/test-upgrade-non-interactive.sh
+            tests/test-upgrade-paths.sh
+            tests/test-upgrade-project-atomic.sh
+            tests/test-upgrade-project-retroactive-section.sh
+            tests/test-upgrade-sentinel-block.sh
+            tests/test-upgrade-sync-framework.sh
+            tests/test-upgrade-to-production-preconditions.sh
+            tests/test-upgrade-to-production-warn.sh
+            tests/test-validate-counter-sanitizer.sh
+            tests/test-validate-phase-2-3-gate.sh
+            tests/test-validate-phase-state-gates.sh
+            tests/test-walk-phase-lifecycle.sh
+            tests/test-brownfield-wp2-scout-sections.sh
+            tests/test-brownfield-wp3-adoption-arms.sh
+            tests/host-drivers/error-translate.test.sh
+          )
+
+          # ── BL-190 shard pins ──────────────────────────────────────────
+          # These arrays PARTITION the canonical list above; they do not add
+          # to it and they must never contain a path that is not in it (the
+          # assertion below enforces exactly that). Only the measured long
+          # poles are named — `rest` is the complement, so appending to the
+          # canonical array above is still the ONLY edit a new test needs.
+          #
+          # NOTHING BELOW THIS LINE MAY CONTAIN THE LITERAL ARRAY-OPENING
+          # TOKEN (the word `tests`, `=`, open-paren). Not in an array name,
+          # not in a comment, not inside an echo string.
+          # scripts/lint-tests-registered.sh scopes the unit list with
+          # `awk '/tests=\(/{f=1;next} f && /^[ ]*\)/{f=0}'` — an UNANCHORED
+          # substring match with no comment stripping — so any reappearance
+          # of that token re-opens the scope, and every `tests/test-*.sh`
+          # path between it and the next lone `)` line gets folded into the
+          # lint's membership set. That is a silent widening of an
+          # enforcement predicate: a new test file merely NAMED in a comment
+          # down here would satisfy the lint while never running in CI —
+          # verbatim the BL-181 defect class. `pin_*` names cannot match,
+          # and the prose/echo text below is worded to avoid the token.
+          # Comment-out is likewise not a move mechanism anywhere in the
+          # canonical array: the same awk does not strip comments, so a
+          # commented entry still counts as membership while bash drops it
+          # (BL-181 residual #2). Move a path BETWEEN pin arrays instead.
+          #
+          # Seconds are measured CI time from run 30297887329 (main @ 9d71824).
+          pin_lint_sweep=(
+            tests/test-run-lints.sh                    # 318s — runs the WHOLE lint sweep over the real repo
+          )
+          pin_lint_scan=(
+            tests/test-lint-counter-antipattern.sh     # 243s at pin time — T9 re-scans the real repo; BL-191 made that scan single-pass, so re-measure before repinning
+            tests/test-lint-raw-read-prompt.sh         #  41s — real-repo arm
+            tests/test-lint-doc-anchors.sh             #  16s — real-repo arm
+          )
+          pin_sast=(
+            tests/test-bl132-sast-index-scan.sh        #  77s on main, 213s on PR #278 — pinned at the worst case
+            tests/test-bl131-domsink-rules.sh          #  54s
+            tests/test-bl118-sast-dom-xss.sh           #  13s
+            tests/test-bl200-syntax-canary.sh          # THE canary (fast): keeps the exact-spelling pin beside the sast toolchain
+            # tests/test-bl200-syntax-detector.sh runs in `rest` (the complement), UNPINNED —
+            # deliberately. It first landed here and pushed this shard from ~4m46 typical to
+            # 6m31, and a slow-registry evening then busted the 12-minute cap mid-run (PR #294
+            # round 1, canceled during bl132 with pysemgrep still alive). Per the cap's own
+            # doctrine above the timeout-minutes line, approaching the cap is the RE-PIN
+            # signal — not a raise. semgrep is installed in EVERY shard (BL-190), so the
+            # suite loses nothing by living in `rest` (~3m typical there).
+          )
+          pin_slow_misc=(
+            tests/test-pre-commit-gate-lints.sh        # 122s — runs 4 lint copies inside fixture projects
+            tests/test-upgrade-sync-framework.sh       #  37s
+            tests/test-plan-staging.sh                 #  34s
+          )
+
+          # The ONLY thing that maps a roster name to a pin array. Both the
+          # pinned-set build and the dispatch go through this function, so
+          # they cannot disagree, and an array with no arm here is simply
+          # never claimed — its paths stay in `rest`. `rest` itself pins
+          # nothing: it is the computed complement. A roster name with no
+          # arm is a hard error, never a silently empty shard.
+          pins_for() {
+            case "$1" in
+              lint-sweep) printf '%s\n' "${pin_lint_sweep[@]}" ;;
+              lint-scan)  printf '%s\n' "${pin_lint_scan[@]}" ;;
+              sast)       printf '%s\n' "${pin_sast[@]}" ;;
+              slow-misc)  printf '%s\n' "${pin_slow_misc[@]}" ;;
+              rest)       : ;;
+              *) echo "shard roster: '$1' is in the roster but has no arm in pins_for" >&2
+                 return 1 ;;
+            esac
+          }
+
+          # Canonical set, with a duplicate guard (a path listed twice would
+          # make the partition arithmetic below lie).
+          canon="|"
+          for t in "${tests[@]}"; do
+            case "$canon" in
+              *"|${t}|"*)
+                echo "unit list: '${t}' appears twice in the canonical unit array" >&2
+                exit 1 ;;
+            esac
+            canon="${canon}${t}|"
+          done
+
+          # Pinned set — built by walking the ROSTER through `pins_for`,
+          # never by naming the pin arrays directly. That indirection is
+          # what makes an orphaned array fall into `rest` instead of
+          # vanishing from CI. Every pin must exist in the canonical list,
+          # exactly once, and be claimed by exactly one shard.
+          pinned="|"
+          n_pinned=0
+          for s in $shard_names; do
+            shard_pins=$(pins_for "$s") || exit 1
+            for t in $shard_pins; do
+              case "$canon" in
+                *"|${t}|"*) ;;
+                *) echo "shard pins: '${t}' is pinned to shard '${s}' but is absent from the canonical unit array" >&2
+                   exit 1 ;;
+              esac
+              case "$pinned" in
+                *"|${t}|"*) echo "shard pins: '${t}' is pinned to more than one shard" >&2
+                            exit 1 ;;
+              esac
+              pinned="${pinned}${t}|"
+              n_pinned=$((n_pinned + 1))
+            done
+          done
+
+          # `rest` = canonical minus pinned.
+          rest_list=()
+          for t in "${tests[@]}"; do
+            case "$pinned" in
+              *"|${t}|"*) ;;
+              *) rest_list+=("${t}") ;;
+            esac
+          done
+
+          # COVERAGE ASSERTION — the five shards are a partition of the
+          # canonical list: disjoint (guarded above) and complete (here).
+          # Every shard job re-runs this, so a mis-pin fails the PR loudly
+          # instead of silently dropping a test out of CI.
+          n_union=$((n_pinned + ${#rest_list[@]}))
+          if [ "$n_union" -ne "${#tests[@]}" ]; then
+            echo "shard partition is not a cover: shards total ${n_union}, canonical unit array has ${#tests[@]}" >&2
+            exit 1
+          fi
+
+          # Dispatch through the SAME source the pinned set was built from,
+          # so a leg can never run one set while `rest` excludes another.
+          # `rest` is the computed complement; membership of $SHARD in the
+          # roster was already validated at the top.
+          run_list=()
+          if [ "${SHARD}" = "rest" ]; then
+            run_list=( "${rest_list[@]}" )
+          else
+            for t in $(pins_for "${SHARD}"); do
+              run_list+=("${t}")
+            done
+          fi
+
+          if [ "${#run_list[@]}" -eq 0 ]; then
+            echo "shard '${SHARD}' selected 0 tests — the pin map or the shard name is wrong" >&2
+            exit 1
+          fi
+
+          echo "shard '${SHARD}': ${#run_list[@]} of ${#tests[@]} unit tests"
+          echo "partition verified: ${n_pinned} pinned + ${#rest_list[@]} rest == ${#tests[@]} canonical"
+
+          failed=()
+          for t in "${run_list[@]}"; do
+            echo "::group::${t}"
+            if bash "${t}"; then
+              echo "PASS ${t}"
+            else
+              rc=$?
+              echo "FAIL ${t} (rc=${rc})"
+              failed+=("${t}")
+            fi
+            echo "::endgroup::"
+          done
+
+          echo ""
+          echo "==================================================================="
+          echo "Shard ${SHARD}: ran ${#run_list[@]} unit test file(s); ${#failed[@]} failed."
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "Failed: ${failed[*]}"
+            exit 1
+          fi
+          echo "All unit tests in shard ${SHARD} passed."
+
+  # ── Required-check anchor ──────────────────────────────────────────────
+  # `unit` is a REQUIRED STATUS CHECK on main (branch protection lists it
+  # alongside the eight lint jobs). A matrix cannot keep that name — its
+  # check runs are `unit-shard (<shard>)` — and deleting the `unit` context
+  # would leave every PR waiting forever on a check that never reports. So
+  # the name survives here as a zero-work aggregator that is red unless
+  # EVERY shard is green. Same convention as lint.yml: the job name is the
+  # branch-protection label — keep it stable.
+  #
+  # `needs.unit-shard.result` is the matrix's ROLLED-UP result: `success`
+  # only when all five legs succeeded. `always()` is required so this job
+  # still runs (and still fails) when a shard fails, times out, or is
+  # cancelled — a cancelled shard yields `cancelled` here and turns `unit`
+  # RED. Note what PR #278's 20m15s cancellation was and was not: it was
+  # NOT silent, and it DID block — the check reported and the PR could not
+  # merge. The defect was that the lane blocked any PR that ADDED a test,
+  # regardless of content. Sharding fixes that; the aggregator exists to
+  # keep the required check name reporting at all.
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [unit-shard]
+    if: always() && (github.event_name == 'push' || github.event_name == 'pull_request')
+    steps:
+      - name: Assert every unit shard succeeded
+        env:
+          SHARD_RESULT: ${{ needs.unit-shard.result }}
+        run: |
+          set -uo pipefail
+          echo "unit-shard (matrix) aggregate result: ${SHARD_RESULT}"
+          if [ "${SHARD_RESULT}" != "success" ]; then
+            echo "unit: the sharded fast lane did not fully succeed (aggregate result: ${SHARD_RESULT}). Open the unit-shard (…) jobs for the failing shard." >&2
+            exit 1
+          fi
+          echo "unit: all unit-shard legs passed."
+
+  # ── Slow lane (sharded) ────────────────────────────────────────────────
+  # Serial, the full suite is ~1h — dominated by ~140 sequential init.sh
+  # project scaffolds concentrated in a few heavy aggregators
+  # (edge-cases-pre-init: 68, edge-cases-scripts: 41). BL-077 splits it into
+  # parallel shards so wall-clock is the slowest single shard (~20 min), not
+  # the sum. Coverage is identical to the un-sharded suite:
+  #   • core          — master suite with the heavy aggregators skipped
+  #                     (SUITE_SKIP_AGGREGATORS=1); still runs TEST 0-8, the
+  #                     inline cohorts, and the fast host-drivers aggregator.
+  #   • edge-pre-init — tests/edge-cases-pre-init.sh   (68 scaffolds)
+  #   • edge-scripts  — tests/edge-cases-scripts.sh    (41 scaffolds)
+  #   • aggregators   — the remaining lighter aggregators, run directly.
+  # Union of shards == the un-sharded suite. Manual dispatch only (no nightly).
+  full:
+    name: full (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Manual-only comprehensive sweep. The full suite is a ~3h monolith
+    # (200+ init.sh scaffolds); it is NOT scheduled. Sharded for parallelism +
+    # failure isolation, but `core` is still the ~3h long pole. Making it
+    # CI-fast is deferred (backlog). Give core room to finish.
+    timeout-minutes: 180
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [core, edge-pre-init, edge-scripts, aggregators]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+        with:
+          fetch-depth: 0
+
+      - name: Verify tools + configure git identity for scaffolds
+        # init.sh / upgrade-project.sh run `git commit` while scaffolding a
+        # project; a fresh CI runner has no git identity, so the commit fails
+        # (rc=128, "empty ident name not allowed"). Configure one.
+        run: |
+          jq --version && git --version
+          git config --global user.name "solo-orchestrator-ci"
+          git config --global user.email "ci@solo-orchestrator.invalid"
+
+      - name: Install semgrep (live SAST cases)
+        # BL-118: the live DOM-XSS blocking cases (test-bl118-sast-dom-xss.sh)
+        # and the semgrep-REQUIRING BL-112 cases SKIP LOUDLY without semgrep,
+        # so without this step the blocking behaviour is never executed in CI —
+        # and a renamed/retired registry rule would re-blind every generated
+        # hook while CI stayed green (verifier finding, 2026-07-17). The unit
+        # lane stays semgrep-free on purpose (a registry fetch on every PR is
+        # flake surface); this manual full lane is where the live proof runs.
+        # An install failure fails the shard LOUDLY rather than silently
+        # skipping the only CI execution of the blocking arm.
+        # semgrep is deliberately UNPINNED — Karl's 2026-07-29 decision, recorded with
+        # its reasoning on solo-orchestrator-backlog.md § BL-192 (DECISION block): a
+        # stale scanner stops catching new vulnerabilities. Do not pin. The generated-
+        # project templates float too, sequenced behind BL-198 — see BL-201.
+        run: pip install semgrep
+
+      - name: Install expect (BL-180 real interactive scaffold)
+        # tests/test-bl180-interactive-scaffold-pty.sh drives a REAL interactive
+        # init.sh over a pty. `expect` is its SUPPORTED driver; the script(1)
+        # fallback is a positional stream that its own header calls best-effort
+        # and that desynchronises on any host where a conditional prompt
+        # ("Install Docker via:", CDF's "Install Context7 now?") appears. The
+        # runner image is not guaranteed to carry expect, so without this step
+        # the only end-to-end proof that a strict project is born with a REAL
+        # filesystem gate would silently degrade to the fallback driver.
+        # Install failure fails the shard LOUDLY rather than quietly downgrading.
+        run: sudo apt-get update && sudo apt-get install -y expect
+
+      - name: Install gitleaks (pinned + checksum-verified)
+        # R-WP2-1, full-lane half. This lane reaches the same suite through
+        # tests/full-project-test-suite.sh, on the same runner image that does
+        # not ship gitleaks — so the twelve gitleaks-gated cases were skipping
+        # here too. Since the suite now FAILS rather than skips when gitleaks
+        # is absent and CI is set, this step is REQUIRED for the lane to pass;
+        # it is not a nice-to-have that can be dropped to save 2 seconds.
+        # Pinned for the same fixture-oracle reason as the unit-shard copy —
+        # see the long comment on that step; 8.30.1 is the version every WP2
+        # fixture fact was verified against.
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --retry 3 -o /tmp/gitleaks.tar.gz "$url"
+          # NOT `sha256sum -c` (R-WP2-6): a malformed pin makes that spelling
+          # warn and exit 0, silently verifying nothing. The script computes and
+          # compares in the shell, rejects a badly-formed value on EITHER side,
+          # and — being a script — has its failure modes executed by the K cases
+          # in tests/test-brownfield-wp2-scout-sections.sh.
+          bash scripts/ci-verify-sha256.sh /tmp/gitleaks.tar.gz "${GITLEAKS_SHA256}"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run shard — ${{ matrix.shard }}
+        # SKIP_KNOWN_FAILING left unset -> 0, so known-RED guards still run.
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -uo pipefail
+          case "$SHARD" in
+            core)
+              SUITE_SKIP_AGGREGATORS=1 bash tests/full-project-test-suite.sh
+              ;;
+            edge-pre-init)
+              bash tests/edge-cases-pre-init.sh
+              ;;
+            edge-scripts)
+              bash tests/edge-cases-scripts.sh
+              ;;
+            aggregators)
+              rc=0
+              for t in tests/edge-cases-upgrade-input.sh \
+                       tests/edge-case-test-suite.sh \
+                       tests/known-bugs-test-suite.sh \
+                       tests/upgrade-path-tests.sh; do
+                echo "::group::${t}"
+                if bash "${t}"; then echo "PASS ${t}"; else echo "FAIL ${t}"; rc=1; fi
+                echo "::endgroup::"
+              done
+              exit "$rc"
+              ;;
+            *)
+              echo "unknown shard: $SHARD" >&2; exit 1
+              ;;
+          esac

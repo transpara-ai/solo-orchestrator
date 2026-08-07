@@ -18,8 +18,9 @@ if [ -n "$BREW_PREFIX" ] && [ -d "$BREW_PREFIX/bin" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/lib/helpers.sh" ]; then
-  source "$SCRIPT_DIR/lib/helpers.sh"
+# BL-046: uses print_fail/info/ok/warn + prompt_input/yes_no only — core subset.
+if [ -f "$SCRIPT_DIR/lib/helpers-core.sh" ]; then
+  source "$SCRIPT_DIR/lib/helpers-core.sh"
 else
   if [ -t 1 ]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -32,6 +33,35 @@ else
   print_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
   print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 fi
+
+# WALK-ISSUE-003-UPDATE-CMD-BEGIN
+# Walk 2026-08-02, ISSUE-003: "Update commands (run manually):" printed the
+# RAW jq output of `.install.<key>`, and BL-033 explicitly allows that value to
+# be an ARRAY of stages. Colima therefore surfaced as
+#     Colima: [ "brew install colima", "brew services start colima" ]
+# — a JSON literal under a heading that promises a runnable command. A junior
+# cannot tell whether that is one command, two, or an error.
+#
+# _cv_jq_install_cmd is the jq tail that normalizes the two BL-033 shapes into
+# ONE runnable string, joined with ` && ` exactly as
+# scripts/resolve-tools.sh's `install_cmd` does — the two readers of the same
+# matrix must not disagree about what a multi-stage install means.
+#
+# _cv_render_update_cmd is the DISPLAY side, shared by the interactive and
+# non-interactive printers so they cannot drift: an empty value and a bare URL
+# are both NOT commands, and this heading must never present them as if they
+# were. A plain string is echoed VERBATIM (the `<name>: <cmd>` grammar that
+# tests/test-specs-plans-remaining-quartet.sh::T-CV-MULTIWORD pins).
+_cv_jq_install_cmd='if type=="array" then (map(select(type=="string")) | join(" && ")) else . end'
+
+_cv_render_update_cmd() {
+  case "${1:-}" in
+    "")                 echo "(no install command in the tool matrix — see the tool's own docs)" ;;
+    http://*|https://*) echo "see $1" ;;
+    *)                  echo "$1" ;;
+  esac
+}
+# WALK-ISSUE-003-UPDATE-CMD-END
 
 # --- Argument parsing ---
 while [ $# -gt 0 ]; do
@@ -59,8 +89,18 @@ version_gte() {
 
   if [ "$a" = "$b" ]; then return 0; fi
 
-  local IFS='.'
-  local -a av=($a) bv=($b)
+  # BL-113: split on '.' WITHOUT setting IFS for the whole function body.
+  # `local IFS='.'` is flagged by semgrep `bash.lang.security.ifs-tampering`
+  # (a function-scoped IFS still changes word-splitting for every unquoted
+  # expansion below it, including any command this function later calls), and
+  # a fresh scaffold must pass the framework's own Phase-3 SAST. The
+  # command-prefix form scopes IFS to the single `read` builtin — exactly the
+  # remediation the rule recommends (`IFS="," read -a my_array`). `read`
+  # returns 1 at EOF-without-delimiter, so `|| :` keeps `set -e` happy when a
+  # version string is empty.
+  local -a av=() bv=()
+  IFS='.' read -r -a av <<< "$a" || :
+  IFS='.' read -r -a bv <<< "$b" || :
   local max=${#av[@]}
   [ ${#bv[@]} -gt $max ] && max=${#bv[@]}
 
@@ -111,7 +151,6 @@ get_latest_version() {
 check_for_update() {
   local method="$1"
   local update_json="$2"
-  local tool_install_json="$3"
 
   UPDATE_CHECK_STATUS="unknown"
   UPDATE_CHECK_MSG=""
@@ -274,6 +313,16 @@ echo ""
 BELOW_MIN=()
 UPDATES=()
 UPDATE_CMDS=()
+# UPDATE_NAMES tracks the verbatim tool name (with whitespace preserved)
+# in parallel with UPDATES[]/UPDATE_CMDS[]. The pre-fix code reconstructed
+# the name by parsing the display-string entry from UPDATES via
+# `${var%% *}` (single-space split), which truncated multi-word tool
+# names (e.g. "Claude Code" → "Claude") in the interactive selection
+# loops AND printed the entire display string verbatim in the
+# non-interactive branch. The parallel array decouples display
+# formatting from the canonical name and is the recommendation
+# recorded against finding specs-plans-tool-matrix-versions-1.
+UPDATE_NAMES=()
 PASS_COUNT=0
 CURRENT_CATEGORY=""
 
@@ -363,10 +412,12 @@ for i in $(seq 0 $((TOOL_COUNT - 1))); do
       BELOW_MIN+=("$NAME")
       UPDATES+=("$NAME $INSTALLED → latest (BELOW MINIMUM)")
       UPDATE_CMDS+=("${UPDATE_CHECK_CMD:-}")
+      UPDATE_NAMES+=("$NAME")
     elif [ "$UPDATE_CHECK_STATUS" = "behind" ]; then
       print_warn "$NAME: ${INSTALLED:-configured} — $UPDATE_CHECK_MSG"
       UPDATES+=("$NAME — $UPDATE_CHECK_MSG")
       UPDATE_CMDS+=("${UPDATE_CHECK_CMD:-}")
+      UPDATE_NAMES+=("$NAME")
     elif [ "$UPDATE_CHECK_STATUS" = "self_updating" ]; then
       print_ok "$NAME: ${INSTALLED:-configured} — $UPDATE_CHECK_MSG"
       PASS_COUNT=$((PASS_COUNT + 1))
@@ -402,25 +453,27 @@ for i in $(seq 0 $((TOOL_COUNT - 1))); do
       # Find update command
       local_update_cmd=""
       if command -v brew &>/dev/null; then
-        local_update_cmd=$(echo "$TOOL" | jq -r '.install.darwin_brew // empty')
+        local_update_cmd=$(echo "$TOOL" | jq -r "(.install.darwin_brew // empty) | $_cv_jq_install_cmd")
       fi
       if [ -z "$local_update_cmd" ]; then
-        local_update_cmd=$(echo "$TOOL" | jq -r '.install.npm // .install.linux_pip // .install.manual // empty')
+        local_update_cmd=$(echo "$TOOL" | jq -r "(.install.npm // .install.linux_pip // .install.manual // empty) | $_cv_jq_install_cmd")
       fi
       UPDATES+=("$NAME $INSTALLED → ${LATEST:-latest} (BELOW MINIMUM)")
       UPDATE_CMDS+=("$local_update_cmd")
+      UPDATE_NAMES+=("$NAME")
     elif [ -n "$LATEST" ] && ! version_gte "$INSTALLED" "$LATEST"; then
       print_ok "$NAME: $INSTALLED$MIN_DISPLAY$LATEST_DISPLAY"
       # Find update command
       local_update_cmd=""
       if command -v brew &>/dev/null; then
-        local_update_cmd=$(echo "$TOOL" | jq -r '.install.darwin_brew // empty')
+        local_update_cmd=$(echo "$TOOL" | jq -r "(.install.darwin_brew // empty) | $_cv_jq_install_cmd")
       fi
       if [ -z "$local_update_cmd" ]; then
-        local_update_cmd=$(echo "$TOOL" | jq -r '.install.npm // .install.linux_pip // .install.manual // empty')
+        local_update_cmd=$(echo "$TOOL" | jq -r "(.install.npm // .install.linux_pip // .install.manual // empty) | $_cv_jq_install_cmd")
       fi
       UPDATES+=("$NAME $INSTALLED → $LATEST")
       UPDATE_CMDS+=("$local_update_cmd")
+      UPDATE_NAMES+=("$NAME")
       PASS_COUNT=$((PASS_COUNT + 1))
     else
       print_ok "$NAME: ${INSTALLED:-configured}$MIN_DISPLAY$LATEST_DISPLAY"
@@ -454,29 +507,38 @@ if [ ${#UPDATES[@]} -gt 0 ] && [ -t 0 ]; then
   echo "  c) Skip for now"
   echo ""
 
-  read -rp "$(echo -e "${BOLD}Choice [a/b/c]${NC}: ")" choice
+  read -rp "$(echo -e "${BOLD}Choice [a/b/c]${NC}: ")" choice # lint-raw-read-prompt: allow multi-letter (a/b/c) choice prompt — prompt_input/prompt_yes_no shape doesn't fit; gated by `-t 0` TTY check at line 444 above; non-interactive branch at line 511 below covers CI/scripted callers
 
   case "$choice" in
     a|A)
       echo ""
       for idx in "${!UPDATE_CMDS[@]}"; do
         cmd="${UPDATE_CMDS[$idx]}"
-        uname="${UPDATES[$idx]%%  *}"
-        uname="${uname%% *}"
+        # specs-plans-tool-matrix-versions-1: pull the verbatim name
+        # from UPDATE_NAMES[] (parallel array). Pre-fix code parsed
+        # UPDATES[] with `${var%% *}` (one-space split), which
+        # truncated multi-word tool names AND shadowed uname(1).
+        tool_name="${UPDATE_NAMES[$idx]}"
         if [ -n "$cmd" ] && [ "$cmd" != "null" ]; then
-          print_info "Updating $uname..."
+          print_info "Updating $tool_name..."
           if eval "$cmd" 2>/dev/null; then
-            print_ok "$uname updated"
+            print_ok "$tool_name updated"
           else
-            print_fail "Could not update $uname. Run manually: $cmd"
+            print_fail "Could not update $tool_name. Run manually: $cmd"
           fi
         else
-          print_warn "$uname: no auto-update command available"
+          print_warn "$tool_name: no auto-update command available"
         fi
       done
       ;;
     b|B)
-      read -rp "Enter numbers (comma-separated): " selections
+      # Wave-3 raw-read sweep: prompt_input centralizes !-t 0 / CI /
+      # SOIF_NONINTERACTIVE default-return. Empty default means CI
+      # callers get an empty selections list → the `IFS=',' read -ra`
+      # below produces a single empty token, which the bounds check
+      # at "$idx -ge 0 && $idx -lt ${#UPDATE_CMDS[@]}" rejects, so
+      # CI safely skips the update rather than auto-installing.
+      selections=$(prompt_input "Enter numbers (comma-separated)" "")
       IFS=',' read -ra sel_arr <<< "$selections"
       echo ""
       for sel in "${sel_arr[@]}"; do
@@ -484,14 +546,15 @@ if [ ${#UPDATES[@]} -gt 0 ] && [ -t 0 ]; then
         idx=$((sel - 1))
         if [ "$idx" -ge 0 ] && [ "$idx" -lt ${#UPDATE_CMDS[@]} ]; then
           cmd="${UPDATE_CMDS[$idx]}"
-          uname="${UPDATES[$idx]%%  *}"
-          uname="${uname%% *}"
+          # specs-plans-tool-matrix-versions-1 — see comment in the a/A
+          # branch above; UPDATE_NAMES[] preserves whitespace verbatim.
+          tool_name="${UPDATE_NAMES[$idx]}"
           if [ -n "$cmd" ] && [ "$cmd" != "null" ]; then
-            print_info "Updating $uname..."
+            print_info "Updating $tool_name..."
             if eval "$cmd" 2>/dev/null; then
-              print_ok "$uname updated"
+              print_ok "$tool_name updated"
             else
-              print_fail "Could not update $uname. Run manually: $cmd"
+              print_fail "Could not update $tool_name. Run manually: $cmd"
             fi
           fi
         fi
@@ -502,18 +565,29 @@ if [ ${#UPDATES[@]} -gt 0 ] && [ -t 0 ]; then
         echo ""
         echo "Manual update commands:"
         for idx in "${!UPDATES[@]}"; do
-          echo "  ${UPDATES[$idx]%%  *}: ${UPDATE_CMDS[$idx]}"
+          # specs-plans-tool-matrix-versions-1 — UPDATE_NAMES[] is the
+          # canonical tool name (whitespace preserved). Pre-fix used
+          # `${UPDATES[$idx]%%  *}` (two-space split) which left the
+          # whole display string ("Claude Code 0.0.1 → latest (BELOW
+          # MINIMUM)") in front of the colon.
+          # WALK-ISSUE-003: render, never echo raw — a multi-stage install is
+          # joined into one runnable line, and a URL / missing entry is labelled
+          # instead of masquerading as a command.
+          echo "  ${UPDATE_NAMES[$idx]}: $(_cv_render_update_cmd "${UPDATE_CMDS[$idx]}")"
         done
       fi
       ;;
   esac
 elif [ ${#UPDATES[@]} -gt 0 ]; then
-  # Non-interactive: just print commands
+  # Non-interactive: just print commands. Same rationale as the c/C
+  # branch above — UPDATE_NAMES[] preserves whitespace; the prior
+  # `${UPDATES[$idx]%%  *}` parse-out-of-display-string was lossy.
   echo ""
   echo "Update commands (run manually):"
   for idx in "${!UPDATES[@]}"; do
-    uname="${UPDATES[$idx]%%  *}"
-    echo "  $uname: ${UPDATE_CMDS[$idx]}"
+    # WALK-ISSUE-003: same renderer as the interactive branch — the two
+    # printers of this heading must not disagree about what is runnable.
+    echo "  ${UPDATE_NAMES[$idx]}: $(_cv_render_update_cmd "${UPDATE_CMDS[$idx]}")"
   done
 fi
 

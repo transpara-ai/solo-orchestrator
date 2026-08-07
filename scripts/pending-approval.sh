@@ -21,13 +21,30 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -f "$SCRIPT_DIR/lib/helpers.sh" ]; then
-  source "$SCRIPT_DIR/lib/helpers.sh"
+# BL-046: uses print_ok/fail/info + guard_not_in_framework only — core subset.
+if [ -f "$SCRIPT_DIR/lib/helpers-core.sh" ]; then
+  source "$SCRIPT_DIR/lib/helpers-core.sh"
 else
   print_ok()   { echo "[OK] $1"; }
   print_fail() { echo "[FAIL] $1" >&2; }
   print_info() { echo "[INFO] $1"; }
+  # When helpers-core.sh is unavailable (vendored stub install), no-op the
+  # framework guard: there's nothing to source. The full Solo install always
+  # ships helpers.
+  guard_not_in_framework() { return 0; }
 fi
+
+# security-audits-2 (S3, 2026-04-26 audit sweep): the helpers.sh docstring at
+# guard_not_in_framework explicitly names scripts/pending-approval.sh as a
+# script that MUST call the guard before any file writes. The pre-existing
+# script wrote .claude/pending-approval.json via cmd_offer (and cmd_resolve
+# deleted+rewrote it) without ever invoking the guard — a contract violation
+# silently missed by the bl-015 audit. Invoke the guard at dispatch time so
+# every subcommand (including read-only ones like --status / --validate)
+# refuses to operate when cwd is the framework repo. Read-only commands are
+# also gated because the find_project_root walk would otherwise return the
+# framework root, painting an inconsistent picture for the caller.
+guard_not_in_framework || exit 1
 
 # --- Helpers ---
 
@@ -162,6 +179,27 @@ cmd_resolve() {
     esac
   done
 
+  # code-escalate-pending-4 (audit v2, S3): validate --decision
+  # BEFORE deleting the sentinel. Pre-fix, cmd_resolve removed the
+  # sentinel first and only afterward called bypass_audit_close_pending,
+  # which rejected unknown decisions with exit 1. A typo such as
+  # `--decision accpet` therefore produced the documented [OK]+[FAIL]
+  # split: sentinel deleted (consumers unblocked) but PENDING audit
+  # rows stranded — the W7 successor-handoff governance record was
+  # silently half-built until the operator noticed and re-ran with
+  # the correct decision string.
+  if [ -n "$decision" ]; then
+    case "$decision" in
+      accept|decline) ;;
+      *)
+        print_fail "--resolve: unknown decision '$decision' (expected: accept | decline). Sentinel left in place."
+        echo "  Re-run: scripts/pending-approval.sh --resolve --decision accept" >&2
+        echo "      or: scripts/pending-approval.sh --resolve --decision decline" >&2
+        return 1
+        ;;
+    esac
+  fi
+
   project_root=$(find_project_root) || {
     print_fail "Not in a Solo project — no .claude/ directory found in \$PWD or any parent."
     return 1
@@ -189,6 +227,7 @@ cmd_resolve() {
         print_ok "Audit log closed: pending bypass rows marked $decision."
       else
         print_fail "Audit log close failed (decision='$decision')."
+        echo "  Re-run 'pending-approval --resolve --decision $decision' to retry the audit close." >&2
         return 1
       fi
     fi

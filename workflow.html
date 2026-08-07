@@ -1,0 +1,1133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Solo Orchestrator Journey — Start to Finish</title>
+<style>
+  :root {
+    --bg: #f7f8fb;
+    --ink: #1e2330;
+    --ink-soft: #4a5468;
+    --line: #b8c1d1;
+    --left-fill: #eef4fb;
+    --left-border: #4a7fb8;
+    --right-fill: #f0f6ee;
+    --right-border: #5a9451;
+    --setup: #6b7a99;
+    --setup-fill: #eef1f7;
+    --phase0: #6a5acd;
+    --phase0-fill: #efedfa;
+    --phase1: #2a7ab8;
+    --phase1-fill: #e8f2fa;
+    --phase2: #c47a1f;
+    --phase2-fill: #fcf3e5;
+    --phase3: #b8412e;
+    --phase3-fill: #fbebe8;
+    --phase4: #2e8b57;
+    --phase4-fill: #e8f4ec;
+    --gate: #8b2f8b;
+    --gate-fill: #f7e9f7;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    margin: 0;
+    padding: 40px 20px 80px;
+    line-height: 1.55;
+  }
+
+  header.page-header {
+    max-width: 1100px;
+    margin: 0 auto 30px;
+    text-align: center;
+  }
+  header.page-header h1 {
+    font-size: 32px;
+    margin: 0 0 10px;
+    letter-spacing: -0.5px;
+  }
+  header.page-header p.subtitle {
+    font-size: 17px;
+    color: var(--ink-soft);
+    margin: 0 auto 25px;
+    max-width: 780px;
+  }
+  header.page-header .legend {
+    display: inline-flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    justify-content: center;
+    background: white;
+    padding: 12px 20px;
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    font-size: 13px;
+  }
+  header.page-header .legend .swatch {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    margin-right: 6px;
+    vertical-align: middle;
+    border: 1px solid rgba(0,0,0,0.1);
+  }
+
+  main.flow {
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: 1fr 60px minmax(280px, 380px) 60px 1fr;
+    align-items: stretch;
+    gap: 0;
+    margin-bottom: 8px;
+  }
+
+  .side {
+    background: white;
+    border-radius: 10px;
+    padding: 18px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    border-top: 3px solid;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .side.left {
+    border-top-color: var(--left-border);
+    background: var(--left-fill);
+  }
+  .side.right {
+    border-top-color: var(--right-border);
+    background: var(--right-fill);
+  }
+  .side h3 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  .side.left h3 { color: var(--left-border); }
+  .side.right h3 { color: var(--right-border); }
+  .side ul {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .side ul li { margin-bottom: 5px; }
+  .side ul li:last-child { margin-bottom: 0; }
+  .side code {
+    background: rgba(0,0,0,0.06);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 12.5px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  .connector-side {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .connector-side .line {
+    width: 100%;
+    height: 2px;
+    background: var(--line);
+    position: relative;
+  }
+  .connector-side.to-center .line::after {
+    content: "";
+    position: absolute;
+    right: -1px;
+    top: -5px;
+    border: 6px solid transparent;
+    border-left-color: var(--line);
+    border-right: 0;
+  }
+  .connector-side.from-center .line::before {
+    content: "";
+    position: absolute;
+    left: -1px;
+    top: -5px;
+    border: 6px solid transparent;
+    border-right-color: var(--line);
+    border-left: 0;
+  }
+
+  .step {
+    background: white;
+    border-radius: 12px;
+    padding: 22px 20px;
+    text-align: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+    border: 2px solid;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .step .num {
+    position: absolute;
+    top: -14px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: white;
+    color: inherit;
+    border: 2px solid;
+    border-color: inherit;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 15px;
+  }
+  .step h2 {
+    margin: 8px 0 6px;
+    font-size: 19px;
+    letter-spacing: -0.2px;
+  }
+  .step .tagline {
+    font-size: 13.5px;
+    color: var(--ink-soft);
+    margin: 0 0 10px;
+  }
+  .step .cmd {
+    display: inline-block;
+    background: rgba(0,0,0,0.05);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    margin-top: 4px;
+  }
+  .step .outputs {
+    font-size: 12px;
+    color: var(--ink-soft);
+    margin-top: 10px;
+    font-style: italic;
+  }
+
+  .step.setup   { border-color: var(--setup);  background: var(--setup-fill); }
+  .step.setup .num { color: var(--setup); }
+  .step.phase0  { border-color: var(--phase0); background: var(--phase0-fill); }
+  .step.phase0 .num { color: var(--phase0); }
+  .step.phase1  { border-color: var(--phase1); background: var(--phase1-fill); }
+  .step.phase1 .num { color: var(--phase1); }
+  .step.phase2  { border-color: var(--phase2); background: var(--phase2-fill); }
+  .step.phase2 .num { color: var(--phase2); }
+  .step.phase3  { border-color: var(--phase3); background: var(--phase3-fill); }
+  .step.phase3 .num { color: var(--phase3); }
+  .step.phase4  { border-color: var(--phase4); background: var(--phase4-fill); }
+  .step.phase4 .num { color: var(--phase4); }
+  .step.gate    { border-color: var(--gate);   background: var(--gate-fill); border-style: dashed; }
+  .step.gate .num { color: var(--gate); }
+  .step.gate h2 { font-size: 16px; }
+
+  .vconnect {
+    display: grid;
+    grid-template-columns: 1fr 60px minmax(280px, 380px) 60px 1fr;
+    height: 40px;
+  }
+  .vconnect .arrow-col {
+    grid-column: 3 / 4;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .vconnect .arrow-col .stem {
+    width: 3px;
+    height: 100%;
+    background: var(--line);
+    position: relative;
+  }
+  .vconnect .arrow-col .stem::after {
+    content: "";
+    position: absolute;
+    left: -6.5px;
+    bottom: -1px;
+    border: 8px solid transparent;
+    border-top-color: var(--line);
+    border-bottom: 0;
+  }
+
+  section.buildloop-detail {
+    max-width: 1200px;
+    margin: 30px auto;
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    border-top: 4px solid var(--phase2);
+    padding: 24px 28px 28px;
+  }
+  section.buildloop-detail h2 {
+    margin: 0 0 6px;
+    color: var(--phase2);
+    font-size: 22px;
+  }
+  section.buildloop-detail .intro {
+    font-size: 15px;
+    color: var(--ink-soft);
+    margin: 0 0 18px;
+  }
+  .loop-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+  }
+  .loop-step {
+    background: var(--phase2-fill);
+    border: 1px solid rgba(196, 122, 31, 0.35);
+    border-radius: 8px;
+    padding: 12px 14px;
+    position: relative;
+  }
+  .loop-step .idx {
+    font-weight: 700;
+    color: var(--phase2);
+    font-size: 12px;
+    letter-spacing: 0.5px;
+  }
+  .loop-step h4 {
+    margin: 2px 0 5px;
+    font-size: 15px;
+  }
+  .loop-step p {
+    margin: 0;
+    font-size: 13px;
+    color: var(--ink-soft);
+    line-height: 1.45;
+  }
+  .loop-note {
+    margin-top: 18px;
+    padding: 14px 16px;
+    background: #fef7e8;
+    border-left: 4px solid var(--phase2);
+    border-radius: 4px;
+    font-size: 14px;
+  }
+
+  section.cross-cutting {
+    max-width: 1200px;
+    margin: 30px auto 0;
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    padding: 24px 28px 28px;
+    border-top: 4px solid var(--gate);
+  }
+  section.cross-cutting h2 {
+    margin: 0 0 12px;
+    color: var(--gate);
+    font-size: 22px;
+  }
+  section.cross-cutting > p {
+    font-size: 14.5px;
+    color: var(--ink-soft);
+    margin: 0 0 16px;
+  }
+  .cross-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+  }
+  .cross-card {
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .cross-card h4 { margin: 0 0 6px; font-size: 15px; }
+  .cross-card p { margin: 0; font-size: 13px; color: var(--ink-soft); line-height: 1.45; }
+
+  section.glossary {
+    max-width: 1200px;
+    margin: 30px auto 0;
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    padding: 24px 28px 28px;
+  }
+  section.glossary h2 {
+    margin: 0 0 12px;
+    font-size: 22px;
+    border-bottom: 2px solid #eee;
+    padding-bottom: 8px;
+  }
+  .gloss-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 10px 30px;
+  }
+  .gloss-item { font-size: 14px; }
+  .gloss-item dt {
+    font-weight: 700;
+    color: var(--ink);
+    margin-bottom: 2px;
+  }
+  .gloss-item dd {
+    margin: 0 0 12px;
+    color: var(--ink-soft);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  footer.page-footer {
+    max-width: 1200px;
+    margin: 40px auto 0;
+    text-align: center;
+    color: var(--ink-soft);
+    font-size: 13px;
+  }
+
+  @media (max-width: 900px) {
+    .row {
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .connector-side { display: none; }
+    .vconnect { grid-template-columns: 1fr; height: 24px; }
+    .vconnect .arrow-col { grid-column: 1 / 2; }
+    .step { order: 0; }
+    .side.left { order: 1; }
+    .side.right { order: 2; }
+  }
+
+  @media print {
+    body { background: white; padding: 10px; }
+    .side, .step, section { box-shadow: none !important; }
+    .row { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<header class="page-header">
+  <h1>The Solo Orchestrator Journey</h1>
+  <p class="subtitle">
+    How a single person builds a real, production-ready application with an AI coding agent —
+    from empty folder to shipped release, one step at a time. Each step below shows what
+    <strong>you do</strong> on the left and what the <strong>framework and AI do</strong> on the right.
+  </p>
+  <div class="legend">
+    <span><span class="swatch" style="background:var(--setup-fill);border-color:var(--setup)"></span>Setup</span>
+    <span><span class="swatch" style="background:var(--phase0-fill);border-color:var(--phase0)"></span>Phase 0 · Discovery</span>
+    <span><span class="swatch" style="background:var(--phase1-fill);border-color:var(--phase1)"></span>Phase 1 · Architecture</span>
+    <span><span class="swatch" style="background:var(--phase2-fill);border-color:var(--phase2)"></span>Phase 2 · Construction</span>
+    <span><span class="swatch" style="background:var(--phase3-fill);border-color:var(--phase3)"></span>Phase 3 · Validation</span>
+    <span><span class="swatch" style="background:var(--phase4-fill);border-color:var(--phase4)"></span>Phase 4 · Release</span>
+    <span><span class="swatch" style="background:var(--gate-fill);border-color:var(--gate);border-style:dashed"></span>Phase Gate</span>
+  </div>
+</header>
+
+<main class="flow">
+
+  <!-- ============================ STEP 1: SETUP ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li>Clone the repository and run <code>./init.sh</code>.</li>
+        <li>Answer prompts (approve each tool install).</li>
+        <li>Optional: run <code>./init.sh --dry-run</code> first to preview.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step setup">
+      <div class="num">1</div>
+      <h2>One-Command Setup</h2>
+      <p class="tagline">Installs everything the framework needs on your machine.</p>
+      <span class="cmd">./init.sh</span>
+      <div class="outputs">Produces: a project folder with all templates, pipelines, and a fresh git repo.</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li>Checks prerequisites (Git, Node.js, jq, Docker) and offers to install any missing.</li>
+        <li>Resolves the tool matrix for your platform and offers to install the applicable security tools (Semgrep, gitleaks, Snyk for all projects; Lighthouse + OWASP ZAP for web).</li>
+        <li>Clones the <em>Development Guardrails for Claude Code</em> (git hooks + session rules).</li>
+        <li>Generates your project folder, CI + release pipelines, CLAUDE.md, and three state files: <code>phase-state.json</code>, <code>.claude/process-state.json</code> (build-loop/UAT/Phase 3 ledger), and <code>.claude/manifest.json</code> (host, deployment, poc_mode, enforcement level).</li>
+        <li>Initializes git, seeds <code>.claude/bypass-audit.json</code>, and runs a health check.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ STEP 2: INTAKE ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li>Run the intake wizard and answer plain-language questions.</li>
+        <li>Describe project name, what it does, who uses it, platform (web/desktop/mobile/etc), language, success criteria, and the four independent settings the framework tracks:
+          <ul>
+            <li><strong>Deployment</strong>: personal or organizational.</li>
+            <li><strong>Track</strong>: Light / Standard / Full (depth of Phase 3 rigor).</li>
+            <li><strong>POC mode</strong>: production, Sponsored POC, or Private POC (Sponsored is org-only; Phase 4 is blocked in POC mode until <code>scripts/upgrade-project.sh --to-production</code>).</li>
+            <li><strong>Enforcement level</strong>: strict / light / no (strict is default and forced for organizational Sponsored POC + Production).</li>
+          </ul>
+        </li>
+        <li>Review the generated <code>PROJECT_INTAKE.md</code> before moving on.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step setup">
+      <div class="num">2</div>
+      <h2>Project Intake</h2>
+      <p class="tagline">Tell the framework exactly what you're building and why.</p>
+      <span class="cmd">bash scripts/intake-wizard.sh</span>
+      <div class="outputs">Produces: PROJECT_INTAKE.md — the AI's product brief. Also seeds <code>data_classification</code> + ZDR attestation for the Phase 1 → 2 gate.</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li>Walks you through a structured Q&amp;A tailored to your chosen platform.</li>
+        <li>Offers context-aware suggestions (e.g. auth options for web, notarization for macOS desktop).</li>
+        <li>Auto-fills the resolved tool matrix so the AI knows exactly which tools apply.</li>
+        <li>Captures data classification (public / internal / confidential / pii / financial / health / regulated) and ZDR attestation — enforced later at the Phase 1 → 2 gate.</li>
+        <li>Writes a complete intake document — no free-form guessing required later.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ STEP 3: LOAD CONTEXT ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li>Start Claude Code (or your AI agent of choice).</li>
+        <li>Paste the context-loading prompt from the README.</li>
+        <li>Read the AI's summary. Correct any misunderstanding <em>before</em> it starts work.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step setup">
+      <div class="num">3</div>
+      <h2>Give the AI Its Context</h2>
+      <p class="tagline">The agent reads its instructions before it does anything.</p>
+      <span class="cmd">claude</span>
+      <div class="outputs">Produces: an AI that understands your project, its phase, and its constraints.</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li>The AI reads five files in order: <code>CLAUDE.md</code> (its rules), <code>PROJECT_INTAKE.md</code> (what to build), the Builder's Guide (how to build), the Platform Module (platform know-how), and <code>phase-state.json</code> (current stage).</li>
+        <li>Summarizes the goal, constraints, current phase, and available tools.</li>
+        <li>Asks you clarifying questions — it does not start coding blind.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ================== PRE-PHASE 0 (Organizational-only) =================== -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do (organizational only)</h3>
+      <ul>
+        <li>Record six blocking pre-conditions as dated rows in <code>APPROVAL_LOG.md</code> before Phase 0 can advance.</li>
+        <li>Personal projects and Private POCs skip this row entirely; Sponsored POCs need rows 1 &amp; 4 up front and may defer the rest.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step gate">
+      <div class="num">0</div>
+      <h2>Pre-Phase 0 · Organizational Pre-Conditions</h2>
+      <p class="tagline">Six governance rows before Day 1 for organizational deployments.
+        See <em>docs/governance-framework.md §V &amp; §IX.4</em>.</p>
+      <span class="cmd">check-phase-gate.sh (Pre-Phase 0)</span>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework checks</h3>
+      <ul>
+        <li><strong>Six named rows</strong> each with an ISO-dated approval (per <code>templates/generated/approval-log-org.tmpl</code> lines 16–28):
+          <ol>
+            <li>AI deployment path — IT Security approval.</li>
+            <li>Insurance clearance / broker confirmation.</li>
+            <li>Liability entity designation.</li>
+            <li>Named Project Sponsor.</li>
+            <li>Backup maintainer designation.</li>
+            <li>ITSM registration.</li>
+          </ol>
+        </li>
+        <li>Sponsored POC: rows 1 &amp; 4 required, rows 2/3/5/6 deferred (verified later by <code>scripts/upgrade-project.sh --to-production</code>).</li>
+        <li>Private POC: all six deferred.</li>
+        <li>Governance mode is forced <strong>strict</strong> for organizational Sponsored POC + Production.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ STEP 4: PHASE 0 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li>Answer the AI's discovery questions about goals and users.</li>
+        <li>Review the draft <em>Product Manifesto</em>.</li>
+        <li>Approve it in <code>APPROVAL_LOG.md</code> (or request revisions).</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step phase0">
+      <div class="num">4</div>
+      <h2>Phase 0 · Product Discovery</h2>
+      <p class="tagline">Turn the idea into a written product agreement.</p>
+      <div class="outputs">Produces: Product Manifesto (goals, users, MVP scope, non-goals).</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li>AI walks the seven Phase 0 sub-steps: 0.1 FRD, 0.2 User Journey (Skeptical PM persona), 0.3 Data Contract, 0.4 Product Manifesto &amp; MVP Cutline, 0.5 Revenue Model (Std+), 0.6 Competency Matrix (drives mandatory CI tooling for any "No" domain), 0.7 Trademark &amp; Legal (Std+).</li>
+        <li>Generates supporting artifacts: user journey, data contract.</li>
+        <li>Organizational deployments: sponsor reviews the Compliance Screening Matrix (SOX / PCI / GDPR / HIPAA / GLBA / SEC / records-retention / EU-AI-Act) — see <em>governance-framework.md §VIII.11</em>.</li>
+        <li>Cannot proceed to Phase 1 until the phase gate is approved. (STRIDE threat model is Phase 1.3, not here.)</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ GATE 0->1 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>Your approval unlocks the next phase</h3>
+      <ul>
+        <li>Personal deployments: self-review recorded in <code>APPROVAL_LOG.md</code> with name and date.</li>
+        <li>Organizational deployments: <strong>Project Sponsor</strong> is the sole named approver for business justification + compliance screening. The Sponsor (not you) must author the git commit that adds their signature.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step gate">
+      <div class="num">✓</div>
+      <h2>Phase Gate 0 → 1</h2>
+      <p class="tagline">Framework refuses to advance without written sign-off. On success, a snapshot is copied to
+        <code>docs/snapshots/phase-0-to-1_YYYY-MM-DD/</code>.</p>
+      <span class="cmd">scripts/check-phase-gate.sh</span>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework checks</h3>
+      <ul>
+        <li>Reads <code>APPROVAL_LOG.md</code> and (organizational) runs <code>git blame --line-porcelain</code> on the Approver row itself — the git-commit author of that specific line must not equal the approver's name (anti-self-approval FAIL). Personal deployments skip this check.</li>
+        <li>Confirms <code>PRODUCT_MANIFESTO.md</code> has all 8 numbered sections filled with content (no placeholders), and NO <code>Status: Open</code> lines remain — either causes a FAIL.</li>
+        <li>Compares the dated Phase 0 → 1 entry against <code>phase-state.json::gates.phase_0_to_1</code>. (Note: the gate script <em>reads</em> both dates; the JSON value itself is populated by <code>scripts/upgrade-project.sh</code> or edited by the approver during the sign-off commit — the gate does not auto-write it.)</li>
+        <li>On PASS, <code>check-phase-gate.sh</code> creates a point-in-time snapshot at <code>docs/snapshots/phase-0-to-1_YYYY-MM-DD/</code>.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ STEP 5: PHASE 1 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li>Review architecture options with tradeoffs (usually 2–3 candidates).</li>
+        <li>Pick the architecture. Read the test plan.</li>
+        <li>Approve at the Phase 1 → 2 gate.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step phase1">
+      <div class="num">5</div>
+      <h2>Phase 1 · Architecture &amp; Planning</h2>
+      <p class="tagline">Design the system on paper before writing any code.</p>
+      <div class="outputs">Produces: Project Bible (architecture, ADRs, data contract, threat model, test plan).</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li>AI walks the Phase 1 sub-steps: 1.1 Business Strategy Gateway (Std+ Go/No-Go), 1.1.5 Market Signal Validation, 1.2 Architecture &amp; Stack Selection (3 candidates, 10 first-class decisions, Competency Matrix as required input), 1.3 STRIDE Threat Model (Penetration Tester persona), 1.4 Data Model, 1.4.5 Data Migration Plan (only if replacing an existing system), 1.5 UI/UX Scaffolding (four-state Empty/Loading/Error/Success), 1.6 Project Bible (16 sections), 1.7 Data Classification &amp; ZDR Attestation.</li>
+        <li>Writes Architecture Decision Records (ADRs) explaining <em>why</em> each big choice was made, and rejected alternatives.</li>
+        <li>Configures branch protection against the real git-host API (GitHub/GitLab/Bitbucket) via <code>scripts/lib/host.sh</code> — free-tier limitations use an attestation escape hatch (<code>github_free_tier</code>, <code>gitlab_free_tier_approvals</code>).</li>
+        <li>Produces a test plan mapped to intake acceptance criteria.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ GATE 1->2 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>Your approval unlocks Phase 2</h3>
+      <ul>
+        <li>Personal: self-review recorded in <code>APPROVAL_LOG.md</code>.</li>
+        <li>Organizational: <strong>Senior Technical Authority</strong> approves architecture, security posture, and data classification.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step gate">
+      <div class="num">✓</div>
+      <h2>Phase Gate 1 → 2</h2>
+      <p class="tagline">Includes the mandatory Zero Data Retention gate (Invariant #16).
+        Snapshot: <code>docs/snapshots/phase-1-to-2_YYYY-MM-DD/</code>.</p>
+      <span class="cmd">scripts/check-phase-gate.sh</span>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework checks</h3>
+      <ul>
+        <li>Dated "Phase 1 → Phase 2" entry in <code>APPROVAL_LOG.md</code>; organizational adds a per-line git-blame check on the STA row.</li>
+        <li><code>PROJECT_BIBLE.md</code> exists with ≥14 numbered sections and no YYYY-MM-DD placeholder dates remaining.</li>
+        <li><strong>Mandatory ZDR gate (Invariant #16)</strong>: <code>phase1_artifacts.data_classification</code> must be one of <em>public / internal / confidential / pii / financial / health / regulated</em>. Anything above <em>public</em> requires <code>zdr_attested=true</code> OR a written <code>zdr_attestation_reason</code>. FAIL otherwise.</li>
+        <li><strong>Branch protection backstop</strong>: real API call verifies force-push disabled + (org) 1+ PR approver + CI status checks. Free-tier attestation limits are accepted only if recorded in <code>process-state.json</code>.</li>
+        <li>Personal → organizational upgrades: recurring WARN until the <em>Retroactive Phase 1 → 2 STA Approval</em> row is filled.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ STEP 6: PHASE 2 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li>Answer clarifying questions when the AI asks.</li>
+        <li>Review test assertions and code diffs for each feature.</li>
+        <li>Every ~2 features: run a UAT session and triage any bugs found.</li>
+        <li>Mark bugs Fix Now / Defer / Won't Fix / Post-MVP.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step phase2">
+      <div class="num">6</div>
+      <h2>Phase 2 · Construction (Build Loop)</h2>
+      <p class="tagline">Build features one at a time, TDD-first, with security review baked in. Full sub-loop shown below.</p>
+      <div class="outputs">Produces: working codebase + passing tests + docs + audit trail.</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li>Runs the <strong>Feature Build Loop</strong> for every feature (detailed diagram below).</li>
+        <li>Enforces the Build Loop checklist on <code>feat:</code> commits: <code>process-checklist.sh</code> requires the first five steps (tests_written → documentation_updated) done before allowing the commit. Non-<code>feat:</code> prefixes (<code>chore:</code>, <code>fix:</code>, <code>refactor:</code>, etc.) bypass this check — this is a scope-limited, not universal, gate. The TDD file-ordering check is <em>warning-only</em> (per <em>README §Enforcement</em>).</li>
+        <li>Runs gitleaks + Semgrep (staged-files) on every commit; blocks <code>--no-verify</code> and captures any that get through in <code>.claude/bypass-audit.json</code>.</li>
+        <li>Blocks <code>gh pr create</code> when UAT is in progress with &lt; 9 steps completed, or Build Loop steps 1–4 done but not step 5.</li>
+        <li>Test-gate reminds you when <code>features_since_last_test</code> reaches the interval; you invoke <code>scripts/test-gate.sh --check-batch</code> to trigger the UAT.</li>
+        <li>Blocks Phase 2 → 3 on any open SEV-1 OR any SEV-2 (open OR <em>deferred</em> — deferred SEV-2 must be resolved or the feature removed; no third option).</li>
+        <li>Organizational: biweekly <strong>Mid-Phase 2 Governance Checkpoint</strong> with the Senior Technical Authority (30-min status review, escalation on ADR-less architecture deviation, test pass &lt; 80%, unresolved security findings, AI quality degradation).</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ GATE 2->3 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>Your approval unlocks Phase 3</h3>
+      <ul>
+        <li>Personal: self-review in <code>APPROVAL_LOG.md</code>.</li>
+        <li>Organizational: <strong>Senior Technical Authority</strong> signs.</li>
+        <li>Reconcile <code>FEATURES.md</code> vs the Manifesto MVP Cutline — any additions require documented orchestrator approval.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step gate">
+      <div class="num">✓</div>
+      <h2>Phase Gate 2 → 3</h2>
+      <p class="tagline">Bug gate blocks; MVP-Cutline reconciliation required.
+        Snapshot: <code>docs/snapshots/phase-2-to-3_YYYY-MM-DD/</code>.</p>
+      <span class="cmd">check-phase-gate.sh → test-gate.sh --check-phase-gate</span>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework checks</h3>
+      <ul>
+        <li>Dated "Phase 2 → Phase 3" entry in <code>APPROVAL_LOG.md</code>.</li>
+        <li><code>FEATURES.md</code> and <code>CHANGELOG.md</code> exist and are non-empty.</li>
+        <li>Bug gate via <code>test-gate.sh --check-phase-gate</code>: SEV-1 open &gt; 0 → BLOCKED; SEV-2 open &gt; 0 → BLOCKED; SEV-2 Deferred &gt; 0 → BLOCKED (must resolve or remove feature); SEV-3 open → WARN.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ STEP 7: PHASE 3 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li>Walk the mechanically-enforced 9-step Phase 3 checklist (<code>process-checklist.sh --start-phase3</code>): integration testing, security hardening, chaos testing, accessibility audit, performance audit, contract testing, results archived, pre-launch preparation, legal review.</li>
+        <li>Run <code>evaluation-prompts/Projects/run-reviews.sh &lt;module&gt;</code> to produce the six adversarial reviewer reports (Standard: recommended; <strong>Full: Security + Red Team REQUIRED</strong>). Address all Critical / High findings.</li>
+        <li>Personal: self-review recorded. <strong>Organizational: gather written sign-offs from both Application Owner AND IT Security</strong> — see the Gate 3 → 4 row below.</li>
+        <li>Security-domain "No" or "Partially" on the Competency Matrix → <strong>mandatory Security Peer Review</strong> before go-live, regardless of track (<em>governance-framework.md §V.C</em>).</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step phase3">
+      <div class="num">7</div>
+      <h2>Phase 3 · Validation &amp; Security</h2>
+      <p class="tagline">Nine substeps + adversarial reviews + track-specific pen test + attorney legal review.
+        Exit rule: <strong>zero Critical or High-severity findings</strong>.</p>
+      <div class="outputs">Produces: <code>docs/test-results/</code> archive, sbom.json, HANDOFF.md, INCIDENT_RESPONSE.md, SECURITY.md, review manifest, penetration test report (Std+).</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li><strong>3.1 Integration Testing</strong> — Platform Module E2E suite over the full User Journey.</li>
+        <li><strong>3.2 Security Hardening</strong> — you run Semgrep (<code>--config=p/owasp-top-ten --config=p/security-audit</code>) + Snyk + gitleaks + license check + SBOM (CycloneDX/syft) + threat-model validation. Web: OWASP ZAP baseline (all tracks) / active (Full). Framework archives artifacts to <code>docs/test-results/[date]_[scan-type]_[pass|fail].[ext]</code>.</li>
+        <li><strong>3.3 Chaos &amp; Edge-Case Testing</strong> — input abuse defenses, error recovery, concurrency, global error boundaries.</li>
+        <li><strong>3.4 UX &amp; Accessibility Audit</strong> — WCAG AA baseline; Lighthouse ≥ 90 for web; Full Track requires explicit screen-reader testing.</li>
+        <li><strong>3.5 Performance Audit</strong> — latency vs data contract, memory stability, minimum-supported-hardware validation.</li>
+        <li><strong>3.5.5 Contract Testing</strong> (Std+ for APIs/IPC/file formats); <strong>3.5.7 Load/Stress Testing</strong> (Full).</li>
+        <li><strong>3.5.9 Test Results Archive</strong> — <code>docs/test-results/</code> is referenced from the Phase 3 → 4 APPROVAL_LOG entry and folded into HANDOFF.md.</li>
+        <li><strong>3.6 Pre-Launch Preparation</strong> (Std+) — Final UAT with formal acceptance sign-off (Sponsored POC / Production); <strong>MANDATORY attorney review of Privacy Policy AND Terms of Service</strong> recorded in APPROVAL_LOG (<em>builders-guide.md §Phase 3.6</em>); license audit passing; trademark search.</li>
+        <li>Six evaluation prompts are <em>operator-invoked</em> via <code>run-reviews.sh</code>; <code>check-phase-gate.sh</code> only WARNs (not FAILs) when <code>docs/eval-results/review-manifest.json</code> is missing. Personas: Senior Engineer (01), CIO (02), <strong>SVP IT Security</strong> (03), <strong>Corporate Legal</strong> (04), Technical User (05), Red Team (06).</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ GATE 3->4 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>The heaviest gate — governance sign-offs required</h3>
+      <ul>
+        <li><strong>Personal</strong>: self-review recorded in <code>APPROVAL_LOG.md</code> (single approver).</li>
+        <li><strong>Organizational — dual approval</strong>: BOTH <em>Application Owner Approval</em> AND <em>IT Security Approval</em> subsections in <code>APPROVAL_LOG.md</code> must have populated Date rows.
+          <ul>
+            <li>Application Owner: accepts operational risk + go-live readiness.</li>
+            <li>IT Security: reviews scan results, penetration test, threat-model validation, risk acceptance.</li>
+            <li>Each subsection is verified independently by <code>validate_approval_section_dated</code> — header presence alone does not satisfy the gate.</li>
+            <li>Approvers must author their own commit (anti-self-approval via per-line git blame; org projects FAIL on self-approval).</li>
+          </ul>
+        </li>
+        <li>Attorney/Legal review recorded for Privacy Policy + ToS if applicable (external users).</li>
+        <li>ITSM deployment change ticket referenced in the Phase 4 Completion row.</li>
+        <li>Sponsored POC / Production Full UAT: formal acceptance sign-off by product sponsor or designated tester.</li>
+        <li>See <em>governance-framework.md §V Approval Authority</em> row for <em>Phase 3 → 4</em>.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step gate">
+      <div class="num">✓</div>
+      <h2>Phase Gate 3 → 4</h2>
+      <p class="tagline">Two written signatures (org), pen test on Std+, artifact roster, hard-block for POC.
+        Snapshot: <code>docs/snapshots/phase-3-to-4_YYYY-MM-DD/</code> — the point-in-time audit record.</p>
+      <span class="cmd">scripts/check-phase-gate.sh</span>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework checks (check-phase-gate.sh:901–1056)</h3>
+      <ul>
+        <li>Dated "Phase 3 → Phase 4" entry within 15 lines of the header.</li>
+        <li>Organizational: BOTH Application Owner AND IT Security Date rows populated — either missing → FAIL.</li>
+        <li>Required artifacts: <code>HANDOFF.md</code>, <code>docs/INCIDENT_RESPONSE.md</code>, <code>sbom.json</code>, non-empty <code>docs/test-results/</code> (empty → FAIL), <code>SECURITY.md</code> (missing → WARN), <code>docs/eval-results/review-manifest.json</code>.</li>
+        <li><strong>Penetration test</strong>: Standard track requires <code>*pen-test*|*pentest*|*penetration*</code> files in <code>docs/test-results/</code> or an <em>IT Security exemption</em> recorded in <code>APPROVAL_LOG.md</code>. <strong>Full track has NO exemption path</strong>.</li>
+        <li><strong>POC hard-block</strong>: if <code>poc_mode</code> is set in <code>phase-state.json</code>, Phase 4 is BLOCKED with <code>::error::</code>. Points at <code>scripts/upgrade-project.sh --to-production</code>, which verifies each of the six deferred Pre-Phase 0 rows (or requires <code>--ack-preconditions=&lt;N1,N2,…&gt;</code>, recorded in <code>.claude/bypass-audit.json</code>).</li>
+        <li>Release pipeline TODO check: <code>.github/workflows/release.yml</code> unconfigured TODOs → WARN.</li>
+        <li>Bug gate (via <code>test-gate.sh --check-phase-gate</code>) must pass.</li>
+        <li>On PASS: point-in-time snapshot copied to <code>docs/snapshots/phase-3-to-4_YYYY-MM-DD/</code> containing gate-checked artifacts plus PRODUCT_MANIFESTO / PROJECT_BIBLE / FEATURES / CHANGELOG / BUGS / USER_GUIDE / RELEASE_NOTES / APPROVAL_LOG / HANDOFF / INCIDENT_RESPONSE / sbom (see <em>builders-guide.md §Phase 3 → 4 Snapshot Mechanism</em>).</li>
+        <li>Every enforcement decision (proposal, block, pass, out-of-band commit, escalation) is appended to <code>.claude/bypass-audit.json</code> — the durable audit ledger.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="vconnect"><div class="arrow-col"><div class="stem"></div></div></div>
+
+  <!-- ============================ STEP 8: PHASE 4 ============================ -->
+  <div class="row">
+    <div class="side left">
+      <h3>What you do</h3>
+      <ul>
+        <li><strong>POC → Production upgrade first</strong>: Phase 4 is <em>hard-blocked</em> for <code>poc_mode</code> projects at BOTH <code>check-phase-gate.sh</code> AND <code>process-checklist.sh --start-phase4</code>. Run <code>scripts/upgrade-project.sh --to-production</code> BEFORE Phase 4 can start.</li>
+        <li>Walk the 6-step Phase 4 checklist: production build, rollback tested, go-live verified, monitoring configured, handoff written, handoff tested.</li>
+        <li>Kick off the release (signing keys, store credentials, deploy) using your chosen strategy: cut-over (Light), blue/green (Std+ web), rolling/canary (Std+ >1000 users), feature flags (any track, high-risk).</li>
+        <li>Update <code>RELEASE_NOTES.md</code> and hand off to users.</li>
+        <li><strong>Organizational</strong>: file the ITSM deployment change ticket (ID recorded in the APPROVAL_LOG Phase 4 Completion row); the <strong>backup maintainer validates <code>HANDOFF.md</code></strong> — must be able to build, test, deploy, and run scans from the doc alone.</li>
+      </ul>
+    </div>
+    <div class="connector-side to-center"><div class="line"></div></div>
+    <div class="step phase4">
+      <div class="num">8</div>
+      <h2>Phase 4 · Release &amp; Maintenance</h2>
+      <p class="tagline">Ship the MVP with a tested rollback and verified monitoring. Then maintain on a four-cadence schedule.</p>
+      <div class="outputs">Produces: signed release, CHANGELOG.md, RELEASE_NOTES.md, <code>HANDOFF.md</code>, <code>docs/INCIDENT_RESPONSE.md</code> (SEV-1..SEV-4 severity matrix + notification chains), monitoring configuration, Phase 4 Completion row in APPROVAL_LOG.md.</div>
+    </div>
+    <div class="connector-side from-center"><div class="line"></div></div>
+    <div class="side right">
+      <h3>What the framework does</h3>
+      <ul>
+        <li>Runs the release pipeline (<code>.github/workflows/release.yml</code>) for your platform: build, sign, package, distribute.</li>
+        <li><strong>MANDATORY rollback test</strong> BEFORE go-live (Step 4.1.5): deploy candidate → execute documented rollback → verify data integrity + revert. <em>"A rollback procedure that has never been tested is not a rollback procedure — it is a hope."</em></li>
+        <li><strong>MANDATORY monitoring verification</strong> (Step 4.3): trigger a test error, confirm the alert was received. <em>"Configured is not verified."</em></li>
+        <li><strong>PLATFORM MODULE MANDATORY go-live checklist</strong> (Step 4.2): SSL/security headers (web), code signing/auto-updater (desktop), app-store metadata &amp; certificates (mobile). Failure may result in deployment rejection.</li>
+        <li>Updates CHANGELOG + RELEASE_NOTES with what shipped.</li>
+        <li>Turns on the maintenance cadence — actual cadences are <strong>monthly (CHANGELOG + SBOM, 35d), quarterly (dependency audit, 95d), biannually (full Phase 3 security+perf re-run + AI provider terms re-verification, 185d)</strong>. Verified on demand by <code>scripts/check-maintenance.sh</code>.</li>
+        <li>Records the release + all post-launch changes in the APPROVAL_LOG "Approval History" table; the point-in-time <code>docs/snapshots/phase-3-to-4_YYYY-MM-DD/</code> stays immutable.</li>
+      </ul>
+    </div>
+  </div>
+
+</main>
+
+<!-- ============================================================ -->
+<!--                 THE FEATURE BUILD LOOP DETAIL                -->
+<!-- ============================================================ -->
+
+<section class="buildloop-detail">
+  <h2>Zoom in: The Feature Build Loop (inside Phase 2)</h2>
+  <p class="intro">
+    This is the sub-loop that runs for <em>every single feature</em>. It's the heartbeat of Phase 2 —
+    a disciplined cycle that guarantees each feature ships with current library knowledge,
+    a passing test, a security review, and a red-team review before it's marked complete.
+    If any review flags an issue, the loop restarts at the fix step; nothing is approved on the first try if it isn't ready.
+  </p>
+
+  <div class="loop-grid">
+    <div class="loop-step">
+      <div class="idx">STEP 1</div>
+      <h4>Context7 Docs Review</h4>
+      <p>AI queries Context7 for <em>current</em> documentation on any libraries in play. Prevents "I remember the API from training data" errors on stale libraries.</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 2</div>
+      <h4>Write the Test First</h4>
+      <p>AI writes the test that describes what "working" means for this feature. Runs it — confirms it FAILS (Red). This proves the test actually tests something.</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 3</div>
+      <h4>Write the Code</h4>
+      <p>AI writes the minimum implementation needed to make the test pass (Green). No over-building.</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 4</div>
+      <h4>Refactor</h4>
+      <p>Clean up the implementation now that it works: better naming, remove duplication, tighten boundaries. Tests stay green throughout.</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 5</div>
+      <h4>Pre-commit Gate</h4>
+      <p>Automatic hooks run: gitleaks (blocks on hit), Semgrep on staged files (blocks on hit), framework-hygiene lints, TDD file-ordering check (warning-only, per README §Enforcement).</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 6</div>
+      <h4>Security Audit</h4>
+      <p>Senior Security Engineer persona reviews the change: injection, authz, secrets, data isolation, N+1, structured logging. Findings marked in <code>process-state.json.build_loop.steps_completed[security_audit]</code>.</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 7</div>
+      <h4>Documentation Updated</h4>
+      <p>Parallel doc updates: CHANGELOG.md, FEATURES.md, interface docs, ADR (if applicable), Bible update. Enforced as a mandatory Build Loop step.</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 8</div>
+      <h4>Iterate If Needed</h4>
+      <p>If steps 5–7 raised issues: back to Step 3 to fix, then re-run 4–7. Loop continues until reviews are clean. (Refactor, Red Team, and Iterate are AI conventions — not framework-enforced Build Loop steps.)</p>
+    </div>
+    <div class="loop-step">
+      <div class="idx">STEP 9</div>
+      <h4>Feature Recorded</h4>
+      <p>Feature is added to <code>FEATURES.md</code>; build progress is recorded in <code>build-progress.json</code>; <code>test-gate.sh --record-feature</code> bumps the UAT counter. Marked complete in <code>process-state.json</code>.</p>
+    </div>
+  </div>
+
+  <div class="loop-note">
+    <strong>Enforced vs documented:</strong> <code>process-checklist.sh</code> mechanically enforces
+    <em>six</em> Build Loop steps: <code>tests_written → tests_verified_failing → implemented →
+    security_audit → documentation_updated → feature_recorded</code>. The Context7 lookup, Refactor,
+    Red Team Review, and Iterate steps above are AI conventions the Builder's Guide describes but
+    that are not gate-blocking on their own. The <code>feat:</code>-commit gate blocks a commit until the
+    first five enforced steps are complete; non-<code>feat:</code> prefixes bypass this check.
+  </div>
+
+  <div class="loop-note">
+    <strong>Every ~2 features (configurable):</strong> the loop pauses for a <strong>UAT session</strong>
+    driven by <code>scripts/test-gate.sh --check-batch</code>.
+    Parallel AI agents (automated testing, malicious user, cross-platform) test the app alongside you.
+    Bugs get triaged into SEV-1 (must fix before release) through SEV-4 (nice to have) and assigned
+    a disposition (Fix Now / Defer / Won't Fix / Post-MVP). Fix-Now bugs re-enter the Build Loop.
+    The framework will refuse to advance Phase 2 → 3 while any SEV-1 is open OR any SEV-2 is open
+    OR deferred (SEV-2 must be resolved or the feature removed; no third option).
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!--                    CROSS-CUTTING CONCERNS                    -->
+<!-- ============================================================ -->
+
+<section class="cross-cutting">
+  <h2>Always Running in the Background</h2>
+  <p>
+    These aren't steps — they're guardrails that run automatically no matter which phase you're in.
+    You never have to remember to invoke them; the framework does it for you and refuses to proceed if something is off.
+  </p>
+  <div class="cross-grid">
+    <div class="cross-card">
+      <h4>Phase Gate Enforcement</h4>
+      <p>Every phase-to-phase transition requires a written approval in <code>APPROVAL_LOG.md</code> plus green tests plus completed gate criteria. Enforced by <code>check-phase-gate.sh</code>. On PASS, an immutable point-in-time snapshot is written to <code>docs/snapshots/phase-N-to-M_YYYY-MM-DD/</code>.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Enforcement Level (strict / light / no)</h4>
+      <p>Recorded in <code>.claude/manifest.json::enforcement_level</code>. <em>Strict</em> is the default and is <strong>forced</strong> for organizational Sponsored POC + Production; it installs <code>.git/hooks/framework-gate.sh</code> which blocks user-terminal commits that violate the classifier. Light and No relax coverage. Every transition is recorded as an <code>enforcement_level_set</code> row in the audit ledger.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Bypass Audit Ledger</h4>
+      <p><code>.claude/bypass-audit.json</code> is the append-only, git-tracked audit trail. Records seven row types: <em>claude_bypass_proposal</em>, <em>terminal_commit_blocked/passed</em>, <em>out_of_band_commit</em>, <em>enforcement_level_set</em>, <em>escalation</em>, <em>detector_error</em>. SessionStart runs <code>detect-out-of-band-commits.sh</code> against the last-checked-commit baseline. Guarantee: "you can route around the block, you cannot route around the audit." See <em>docs/audit-log-lifecycle.md</em>.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Pending-Approval Sentinel</h4>
+      <p><code>.claude/pending-approval.json</code> signals a structured A/B/C decision to the operator. While present, the pre-commit gate blocks <code>git commit</code> and <code>gh pr create</code> — the agent cannot rationalize a unilateral commit while you are still deliberating.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Session Hooks</h4>
+      <p>Every time you start the AI, hooks run: version check, test-gate, out-of-band commit detector, MCP-usage gate. If the Development Guardrails are out of date or the test-gate is red, you're told before any work begins. Qdrant / Context7 requirements only fire when you have those MCP servers configured — the gate expects one call per session, not per library.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Live Docs (Context7)</h4>
+      <p>When Context7 is configured as an MCP server, the framework requires at least one lookup per session before allowing commits (session-mcp-gate). The Build Loop's first step invokes Context7 to prevent "API remembered from training data" errors on library-touching features.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Persistent Memory (Qdrant)</h4>
+      <p>When Qdrant is configured as an MCP server, the framework requires at least one <code>qdrant-store</code>/<code>qdrant-find</code> call per session. Decisions, review findings, and context notes are stored in a local semantic memory the AI can search across sessions — so the AI remembers <em>why</em> something was done, not just what.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Audit Trail</h4>
+      <p>Every phase gate, every UAT session, every bug disposition, every release — all recorded in <code>APPROVAL_LOG.md</code>, <code>docs/snapshots/</code>, <code>docs/test-results/</code>, <code>sbom.json</code>, and <code>.claude/bypass-audit.json</code>. Six canonical jq recipes in <em>docs/audit-log-lifecycle.md</em> support cold-pickup successor handoff (W7 use case).</p>
+    </div>
+    <div class="cross-card">
+      <h4>Organizational Governance (opt-in)</h4>
+      <p>If you selected "organizational" deployment: Project Sponsor (Phase 0 → 1), Senior Technical Authority (Phase 1 → 2 &amp; 2 → 3), Application Owner + IT Security (Phase 3 → 4), Attorney (Phase 3.6 for Privacy Policy + ToS), ITSM ticket linkage (Phase 4 Completion row). Each sign-off is verified with per-line git blame; anti-self-approval is a FAIL. The Pre-Phase 0 organizational roster (six named rows) must be dated before Day 1. POC modes let you defer parts of that roster; <code>upgrade-project.sh --to-production</code> is the only way to unlock Phase 4 from a POC.</p>
+    </div>
+    <div class="cross-card">
+      <h4>Gate Denial Path</h4>
+      <p>When an approver denies a gate: written findings required, rework limited to cited deficiencies, maximum <strong>2 rework cycles</strong> before escalation to the Project Sponsor. Every denial and re-submission is recorded in <code>APPROVAL_LOG.md</code>. See <em>governance-framework.md §V Gate Denial</em>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!--                         GLOSSARY                             -->
+<!-- ============================================================ -->
+
+<section class="glossary">
+  <h2>Plain-English Glossary</h2>
+  <dl class="gloss-grid">
+    <div class="gloss-item">
+      <dt>TDD (Test-Driven Development)</dt>
+      <dd>Write the test first (it fails), then write just enough code to make it pass, then clean up. Guarantees the code does what the test says it does.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>SAST</dt>
+      <dd>Static Application Security Testing — automated tools that read your code (without running it) and look for known unsafe patterns.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>DAST</dt>
+      <dd>Dynamic Application Security Testing — attacks a running copy of your app to find real vulnerabilities from the outside.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>UAT (User Acceptance Testing)</dt>
+      <dd>Sessions where a human — plus AI agents in this framework — actually use the app and try to break it or confirm it does what users need.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Phase Gate</dt>
+      <dd>A checkpoint between phases. The framework refuses to advance until specific artifacts exist, specific tests pass, and (for organizational Phase 3 → 4) BOTH Application Owner and IT Security have written signed approvals in the log.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>MVP</dt>
+      <dd>Minimum Viable Product — the smallest useful version worth releasing. The framework's target for a first release.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Sponsored POC</dt>
+      <dd>Organizational-only POC mode: the organization knows and has approved. Requires AI-deployment-path approval + named sponsor up front; defers insurance, liability, ITSM, exit criteria, and backup maintainer. Phase 4 hard-blocked until <code>upgrade-project.sh --to-production</code>.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Private POC</dt>
+      <dd>Personal-only POC mode: all six Pre-Phase 0 pre-conditions deferred. Same technical rigor as Production Build; NO real user data, NO external users, NO production deployment until upgraded.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Track (Light / Standard / Full)</dt>
+      <dd>Depth of Phase 3 rigor. Light skips Business Strategy Gateway, Market Signal Validation, Revenue Model, contract testing, load/stress testing, and Std+ pre-launch preparation. Standard adds them; Full also requires screen-reader accessibility testing and has no penetration-test exemption.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Enforcement Level (strict / light / no)</dt>
+      <dd>Field in <code>.claude/manifest.json</code>. Strict installs a filesystem-gate hook that blocks user-terminal commits violating the classifier; light logs but allows; no does not enforce. Forced strict for organizational Sponsored POC + Production.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>ZDR (Zero Data Retention)</dt>
+      <dd>Mandatory Phase 1 → 2 gate (Invariant #16). Projects with data classification of internal or higher must attest ZDR (or record a written exception). Enforced by <code>check-phase-gate.sh</code> as a FAIL. Public projects are exempt.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>APPROVAL_LOG.md</dt>
+      <dd>Append-only audit trail of every phase-gate approval. Tamper-evident via git history; anti-self-approval enforced via per-line <code>git blame</code>. Includes an Approval History table for post-launch changes.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Phase Gate Snapshot</dt>
+      <dd>Point-in-time immutable copy of key documents at each phase transition. Auto-created by <code>check-phase-gate.sh</code> at <code>docs/snapshots/phase-N-to-M_YYYY-MM-DD/</code>. Preserves whatever state Manifesto, Bible, FEATURES, CHANGELOG, BUGS, USER_GUIDE, RELEASE_NOTES, APPROVAL_LOG, HANDOFF, INCIDENT_RESPONSE, and sbom are in at gate time.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Bypass Audit Ledger</dt>
+      <dd><code>.claude/bypass-audit.json</code> — append-only, git-tracked, atomic-write JSON ledger recording every enforcement decision, bypass attempt, and out-of-band commit. The framework's guarantee: "you can route around the block, you cannot route around the audit."</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Product Manifesto</dt>
+      <dd>The one-page product agreement produced at the end of Phase 0. What we're building, for whom, and what's out of scope.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Project Bible</dt>
+      <dd>The architecture + planning document produced at the end of Phase 1. Decisions, diagrams, threat model, and test plan.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>ADR (Architecture Decision Record)</dt>
+      <dd>A short note explaining why a specific architectural choice was made (and what alternatives were rejected). Written when the decision is made, not months later.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Threat Model</dt>
+      <dd>A structured list of "what could an attacker do?" scenarios, plus what mitigation exists for each. Verified in Phase 3.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Red Team Review</dt>
+      <dd>An adversarial review that assumes the worst and tries to find failure modes: edge cases, hostile inputs, misuse. Runs on every feature and again in Phase 3.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Context7</dt>
+      <dd>An MCP tool that fetches current library documentation on demand. Prevents the AI from using outdated API knowledge.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>MCP (Model Context Protocol)</dt>
+      <dd>A standard way for AI agents to talk to external tools and services (documentation lookups, memory stores, code search, etc).</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Development Guardrails for Claude Code</dt>
+      <dd>The git-hook-based guardrail layer (sometimes called CDF / Claude Dev Framework) that gets installed alongside your project. Clones from <code>kraulerson/claude-dev-framework</code>. Provides pre-commit hooks, SessionStart hooks, and the framework-gate that (in strict mode) refuses to accept commits which break the rules.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>Anti-Self-Approval Check</dt>
+      <dd>For organizational deployments only, <code>check-phase-gate.sh</code> runs <code>git blame --line-porcelain</code> on the specific <em>Approver</em> row and FAILs if the committer of that line matches the approver's name. Personal deployments skip this check.</dd>
+    </div>
+    <div class="gloss-item">
+      <dt>SEV-1 / SEV-2 / SEV-3 / SEV-4</dt>
+      <dd>Bug severity levels. SEV-1 = blocks basic use; SEV-2 = major broken feature; SEV-3 = noticeable but livable; SEV-4 = polish. Phase 2 can't finish while any SEV-1 or SEV-2 is open.</dd>
+    </div>
+  </dl>
+</section>
+
+<footer class="page-footer">
+  <p>
+    Solo Orchestrator Framework —
+    <a href="README.md">README</a> ·
+    <a href="docs/user-guide.md">User Guide</a> ·
+    <a href="docs/builders-guide.md">Builder's Guide</a> ·
+    <a href="docs/governance-framework.md">Governance</a>
+  </p>
+</footer>
+
+</body>
+</html>

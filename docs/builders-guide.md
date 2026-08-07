@@ -73,7 +73,7 @@ The following are outside the current scope. They are content gaps addressable t
 - **Large-scale distributed systems** (microservices, multi-region) — Addressable through new platform modules. The extensibility model supports this; the modules have not been written.
 - **Enterprise integration projects** (SAP, Salesforce, custom ERP) — Specialized domains addressable through dedicated platform modules and intake suggestion files.
 
-Additional platform modules can be added following the [Extending Platforms Guide](extending-platforms.md).
+Additional platform modules can be added following the [Extending Platforms Guide](https://github.com/kraulerson/solo-orchestrator/blob/main/docs/extending-platforms.md).
 
 ### How This Differs From "Vibe Coding"
 
@@ -88,13 +88,45 @@ The AI writes code. The human makes every decision, validates every output, and 
 
 ### Enforcement Model
 
-The framework's controls operate at three tiers. The **CI pipeline** (SAST, dependency audit, license check, secret detection, build, tests, phase gate consistency, approval log integrity) provides mechanical enforcement — it blocks merges when checks fail. **Pre-commit hooks** (secret detection, SAST quick scan, test co-location) provide early warning on commit. **LLM instructions** (CLAUDE.md, this guide, the Project Bible) provide comprehensive guidance that the agent follows between decision gates, with the human as the review layer.
+The framework's controls operate at three tiers. The **CI pipeline** (SAST, dependency audit, license check, secret detection, build, tests, phase gate consistency, approval log integrity) provides mechanical enforcement — it blocks merges when checks fail. **Pre-commit hooks** (secret detection, SAST quick scan, project test execution (BL-125), test co-location, plus the strict-mode framework gate described below) provide early warning on commit. **LLM instructions** (CLAUDE.md, this guide, the Project Bible) provide comprehensive guidance that the agent follows between decision gates, with the human as the review layer.
 
-**Process enforcement.** In addition to CI and pre-commit checks, a process checklist state machine (`scripts/process-checklist.sh`) mechanically enforces sequential step completion for the Build Loop, UAT sessions, and Phase 3/4 validation. The PreToolUse hook (`scripts/pre-commit-gate.sh`) blocks commits when checklist steps are incomplete. It also blocks `--no-verify` (security hook bypass), `--force` push (history overwrite), and unauthorized process resets. Reset operations require the Orchestrator to run the command directly in a terminal — the agent cannot invoke them. See the User Guide, Section "Process Enforcement," for the complete checklist sequences and enforcement points.
+**Project enforcement level.** Every Solo Orchestrator project carries an enforcement level — `strict` (default), `light`, or `no` — recorded in `.claude/manifest.json::.enforcement_level` and changeable later via `scripts/reconfigure-project.sh --enforcement-level`. The level controls how the framework treats **user-terminal git commits** (Claude-issued commits are governed identically at every level):
+
+- `strict` installs `.git/hooks/framework-gate.sh` which blocks user-terminal commits that violate the Build Loop / Phase classifier. `--no-verify` skips the block but the SessionStart out-of-band detector (`scripts/detect-out-of-band-commits.sh`) still records the commit to `.claude/bypass-audit.json`. The framework's audit guarantee is "you can route around the block, you cannot route around the audit."
+- `light` allows user-terminal commits to land freely; the SessionStart detector still records them.
+- `no` allows user-terminal commits and does not record them. Only the Claude-side audit (BL-029 bypass-detector) keeps running.
+
+Baseline §2.5 forces `strict` for organizational projects in Sponsored POC or Production mode; personal and organizational/Private POC projects are choosable. The User Guide's "What Is Enforced vs. What Is Guided" section is the canonical operator-facing reference for the level matrix, the audit-log row taxonomy, and the operator commands.
+
+**Process enforcement.** In addition to CI and pre-commit checks, a process checklist state machine (`scripts/process-checklist.sh`) mechanically enforces sequential step completion for the Build Loop, UAT sessions, and Phase 3/4 validation. The PreToolUse hook (`scripts/pre-commit-gate.sh`) blocks commits **issued by Claude** when checklist steps are incomplete. The same gate is invoked in `--terminal-mode` by `framework-gate.sh` on user-terminal commits in `strict` projects. It also blocks `--no-verify` at commit time when present (security hook bypass), `--force` push (history overwrite), and unauthorized process resets. Reset operations require the Orchestrator to run the command directly in a terminal — the agent cannot invoke them. See the User Guide, Section "Process Enforcement," for the complete checklist sequences and enforcement points.
+
+**Operator-side lint promotion (cycle 8 slot 5).** The two CI lints — `scripts/lint-counter-antipattern.sh` (PR #72) and `scripts/lint-backlog-references.sh` (PR #76) — also run inside `pre-commit-gate.sh`, on **both** the PreToolUse path (Claude-issued commits) and the `--terminal-mode` path (operator-issued commits in `strict` projects). Regressions therefore fail at commit time rather than waiting for CI. The backlog-references lint accepts a `--pre-commit-mode` flag which scans the prospective commit message instead of walking `git log BASE..HEAD` (no commit exists yet at that point); the structural Step-3 backlog-block scan still runs unchanged so uncited `Closed`/`Resolved` entries can't slip past the operator-side gate.
+
+**`SKIP_LINT=1` escape hatch.** A misconfigured operator-side lint must never strand the operator. Set `SKIP_LINT=1` in the environment to bypass both lints for a single commit; the bypass writes an acknowledgement line to stderr (`[pre-commit-gate] SKIP_LINT=1 set — bypassing counter-antipattern + backlog-references lints`) so emergency use is visible in operator transcripts. Other enforcement layers (process-checklist `--check-commit-ready`, `--no-verify`, `--force` push, pending-approval sentinel) are unaffected — `SKIP_LINT` is scoped narrowly to the two operator-side lint invocations. Use cases: a transient lint regression in `main`, an in-flight remediation PR that hasn't merged yet, or an authored allowlist marker that the lint regex doesn't yet recognize. Pair the bypass with a follow-up PR that fixes the underlying issue so the bypass becomes unnecessary.
 
 **TDD enforcement timing.** The Build Loop enforces test-first ordering at commit time, not at file-write time. This is intentional: file-write gating would add latency to every Write/Edit operation and create false positives for utility files, configuration, and documentation. Commit-time enforcement ensures that when code reaches the repository, it has passed through the full Build Loop sequence — tests written, tests verified failing, implementation complete, security audit, documentation updated.
 
-Only the CI pipeline is a hard enforcement boundary. The process checklist and hooks provide strong mechanical enforcement within Claude Code sessions. Everything else depends on the agent following instructions and the Orchestrator reviewing at decision gates. See the User Guide's "What Is Enforced vs. What Is Guided" section for the complete breakdown.
+The CI pipeline is your global hard enforcement boundary; on `strict` projects, the local `framework-gate.sh` adds a second hard enforcement boundary at commit time. The process checklist and the rest of the hook chain provide strong mechanical enforcement within Claude Code sessions. Everything else depends on the agent following instructions and the Orchestrator reviewing at decision gates. See the User Guide's "What Is Enforced vs. What Is Guided" section for the complete breakdown — including the audit-row taxonomy (`out_of_band_commit`, `terminal_commit_blocked`, `terminal_commit_passed`, `enforcement_level_set`, `escalation`, `claude_bypass_proposal`, `detector_error`) that this framework writes to `.claude/bypass-audit.json` over the project's lifetime (the legacy `terminal_commit_passed` type is now recognized, not written — BL-161). The deeper reference for that ledger — per-row lifecycle, atomic-append guarantees, cold-pickup successor jq recipes — is `docs/audit-log-lifecycle.md`.
+
+#### TDD ordering enforcement (BL-072) — the tier matrix
+
+Test-first ordering is mechanically enforced at commit time by `scripts/pre-commit-gate.sh`. The detector fires on `feat:`/`fix:`/`refactor:` commits (all other Conventional-Commit types — `docs:`, `test:`, `chore:`, `style:`, `build:`, `ci:`, `perf:`, `revert:` — are out of scope) when the commit stages at least one **implementation** file and **no** test file, and no test rode earlier on the same branch (`git diff main...HEAD`). Implementation excludes tests, `docs/`, `.github/`, `Reports/`, `templates/`, `scripts/lint-*.sh`, **all `*.md`**, **lockfiles** (`package-lock.json`, `*.lock`, `yarn.lock`), and **pure file deletions**.
+
+The *severity* of a trigger is keyed on the project **tier** — read from `.claude/phase-state.json` `deployment` + `poc_mode`, never the spoofable `track` (BL-084 proved `--track light` can be set on a sponsored project; the predicate is the shared `# BL-084-TIER-KEY` semantics used by `init.sh` and `check-phase-gate.sh`):
+
+| Tier (`deployment` / `poc_mode`) | On a trigger |
+|---|---|
+| **Personal** (`personal`, non-POC) | **WARN** (bypassable), logged to the ledger with `bypassed:true` |
+| **Private POC** (`personal` / `private_poc`) | **WARN** (bypassable), logged with `bypassed:true` |
+| **Sponsored POC** (`organizational` / `sponsored_poc`) | **HARD BLOCK** (`[FAIL]`, commit aborted) |
+| **Production** (`organizational`, non-POC) | **HARD BLOCK** (`[FAIL]`, commit aborted) |
+| *unscaffolded repo* (no `phase-state.json` / empty `deployment`) | **WARN** only — mothership safety; the framework's own commits never hard-block |
+
+**Where it runs.** For **agent** commits the PreToolUse hook surfaces the WARN as a pre-execution heads-up; the authoritative enforcement point for **both agent and human** commits is a **`commit-msg`** git hook that delegates to `pre-commit-gate.sh --terminal-mode --tdd-only`. `commit-msg` (not `pre-commit`) is used deliberately: git writes the commit message to `.git/COMMIT_EDITMSG` only *after* `pre-commit` runs, so a `pre-commit` hook cannot read the `feat`/`fix`/`refactor` subject the gate scopes on. `init.sh` installs this hook for every scaffolded project whose language has a distinct test-file convention (Rust, which uses inline `#[cfg(test)]` tests, is skipped).
+
+**Escape hatch — attested, never silenced.** On a non-bypassable tier, `SOLO_TDD_ATTESTED=1` (optionally `SOLO_TDD_REASON="<why>"`) allows the commit *and* records `{date, subject, reason, files}` to `.claude/process-state.json::tdd_attestations[]` via an atomic tmp+mv write. This exists for the integration surfaces (`init.sh`, host drivers, `upgrade-project.sh`) that are validated by UAT/scenario/integration rather than a fast-lane unit test. If the attestation *cannot* be recorded, the gate is LOUD and REFUSES the commit — an escape without a durable record is never granted.
+
+**Audit trail.** Every trigger appends a JSON row to `.claude/tdd-warn-ledger.jsonl` carrying `{date, subject, files, would_block:true, deployment, poc_mode, bypassed, attested, blocked}`. The logged bypass row *is* the audit trail across a tier promotion: when `upgrade-project.sh --to-sponsored-poc` (or `--deployment organizational`) rewrites `phase-state.json`, the same commit that only WARNed as Personal now hard-blocks — no code change to the gate, the tier flip alone flips enforcement.
 
 ---
 
@@ -241,6 +273,26 @@ claude --version
 
 See the CLI Setup Addendum (SOI-005-CLI) for complete configuration including permission management, MCP servers, and CLAUDE.md setup.
 
+#### Effort
+
+**Effort is the primary dial for the intelligence / latency / cost trade-off** on current Claude models — it governs how much reasoning the agent spends before it acts, and it adapts to the task rather than applying a fixed budget. It is a separate control from model choice: a smaller model at higher effort and a larger model at lower effort are genuinely different operating points, and the framework cares about both.
+
+Set it at two scopes:
+
+| Scope | How | Applies to |
+|---|---|---|
+| **Session** | `/effort` in an interactive session, `--effort` on the CLI, or `effortLevel` in `settings.json` — note a settings file cannot set `max` | Every turn in that session until changed |
+| **Subagent / skill** | an `effort:` field in the agent's or skill's YAML frontmatter | Only while that subagent or skill is active — it overrides the session level, but an environment-level effort setting still takes precedence over frontmatter |
+
+**Anthropic's recommended defaults, mapped onto this framework:**
+
+- **`high` — the default for most work.** Assume this unless a step argues otherwise. It is already the default on every current model that supports effort except Opus 4.7, which defaults to `xhigh` — so most of the time the right action is to leave it alone.
+- **`xhigh` — capability-sensitive work.** Adversarial review, security analysis and threat modeling (Step 1.3, Step 3.2), architecture selection (Step 1.2), and any gate where a missed defect is expensive. The framework's own `pr-reviewer` agent pins `effort: xhigh` in frontmatter for exactly this reason.
+- **`low` / `medium` — routine steps.** Mechanical documentation updates, changelog entries, formatting passes, and other work where the answer is not in doubt and latency and cost dominate.
+- **`max` — reach for it deliberately, not by default.** Anthropic documents it as prone to diminishing returns and overthinking, with the explicit advice to "test before adopting broadly." Treat a move to `max` as an experiment that owes you a measured comparison, not a free upgrade.
+
+Effort is **not** wired into `init.sh` or the intake — generated projects inherit whatever effort the Orchestrator's session or subagent definitions set. Raise it per-subagent via frontmatter where a step warrants it; that is where the setting actually binds.
+
 ### 2. Version Control — Git + Repository Host
 
 **Repository requirements (non-negotiable):**
@@ -284,6 +336,19 @@ snyk auth
 **License compliance tooling:**
 
 > **⟁ PLATFORM MODULE:** License compliance tooling varies by ecosystem. Reference your Platform Module for the appropriate tool (`license-checker` for Node.js, `pip-licenses` for Python, `cargo-license` for Rust, etc.).
+
+**License deny policy (BL-086).** The Phase-3 `license` scanner does not only inventory licenses — it enforces a **tier-keyed deny policy** against strong copyleft (`GPL-2.0*`, `GPL-3.0*`, `AGPL-1.0*`, `AGPL-3.0*`, `SSPL-1.0`, plus bare `GPL`/`AGPL`). `LGPL-*`, `MPL-*`, `EPL-*`, and permissive licenses are **not** denied; matching is on the license field only (never package names) and boundary-safe; a dual `MIT OR GPL-3.0` passes (elect the safe side).
+
+The tier decides block vs. warn — keyed on the **actual tier** (`deployment` + `poc_mode`), never the spoofable `track`:
+
+| Tier | On a denied license |
+|---|---|
+| Organizational, Sponsored POC, **or Private POC** (the corporate track) | **HARD BLOCK** — the Phase 3→4 gate fails |
+| Pure personal (`deployment=personal`, no POC mode) | PASS + a large warning banner |
+
+**Why the Private POC blocks too (Karl, 2026-07-11).** A copyleft dependency is a one-way ratchet. A private POC is the runway to a Sponsored POC / production; at that transition the company must rip the dependency out, buy a commercial license, or accept share-your-source obligations on distribution or network service — and no sponsor approves that. So the entire corporate track is held to the destination tier's standard; only a purely personal project may proceed, behind a warning that the obligation travels with the code.
+
+Override or exempt via the optional `.claude/license-policy.json` DATA file (`{"deny":[...], "allow_packages":[...]}` — `deny` replaces the default list; `allow_packages` exempts commercially-licensed packages by name; malformed JSON is a LOUD scanner FAIL). Record a deliberate exception on a blocked tier with `SOLO_LICENSE_ATTESTED=1 SOLO_LICENSE_REASON="…"` (appended to `.claude/phase-state.json::phase3.license_exceptions[]` — attested, never silenced; a failed record REFUSES the pass). Full deny list, schema, and rationale: [Security Scan Interpretation Guide](security-scan-guide.md#license-compliance--deny-policy).
 
 ### 4. Platform-Specific Toolchain
 
@@ -557,9 +622,11 @@ The competency matrix is not advisory — it drives mandatory tooling:
 
 ### Phase 0 → Phase 1 Gate
 
-**Organizational deployments:** The Project Sponsor must approve the business justification and compliance screening before proceeding to Phase 1. Record the approval in `APPROVAL_LOG.md` (Phase 0 → Phase 1 section) with the approver's name, date, method, and evidence reference.
+**Organizational deployments:** The Project Sponsor must approve the business justification and compliance screening before proceeding to Phase 1. Record the approval by **appending** a completed table under the `## Phase Gate: Phase 0 → Phase 1` header in `APPROVAL_LOG.md`, with the approver's name, date, method, and evidence reference.
 
-**Personal projects:** Review the Phase 0 artifacts yourself and record the self-review in `APPROVAL_LOG.md` before proceeding.
+**Personal projects:** Review the Phase 0 artifacts yourself and record the self-review by appending a completed table under the same gate header in `APPROVAL_LOG.md` before proceeding.
+
+> **How to record an approval (append-only).** `APPROVAL_LOG.md` is append-only once pushed — the emitted `Governance - Approval log integrity` CI job fails any commit that modifies or deletes a line already in the file. So do **not** fill a gate section's table in place. Each gate/section ships a short `<!-- BL-170-APPEND-DESIGN -->` instruction; when you cross the gate, **append** a completed copy of the table shape (shown once at the top of the file) directly under that section's `##`/`###` header, then commit — and never edit a line once it is committed. Keep the appended **Date** row within 15 lines of the gate header so the auto-record and gate checks find it.
 
 #### Phase 0 Artifact Map
 
@@ -569,21 +636,21 @@ The competency matrix is not advisory — it drives mandatory tooling:
 | Step 0.2 — User Personas & Interaction Flow | `docs/phase-0/user-journey.md` | Section 3 (User Journeys) |
 | Step 0.3 — Data Input/Output & State Logic | `docs/phase-0/data-contract.md` | Section 4 (Data Contract) |
 | Step 0.4 — Product Manifesto & MVP Cutline | `PRODUCT_MANIFESTO.md` | Section 1 (Product Intent), Section 5 (MVP Cutline) |
-| Step 0.5 — Revenue Model & Unit Economics | Appendix A to `PRODUCT_MANIFESTO.md` (Standard+; Light: mark SKIPPED) | Section 7 (Revenue Model) |
-| Step 0.6 — Orchestrator Competency Matrix | Appendix B to `PRODUCT_MANIFESTO.md` (all tracks) | Section 6 (Competency Matrix) |
-| Step 0.7 — Trademark & Legal Pre-Check | Appendix C to `PRODUCT_MANIFESTO.md` (Standard+; Light: mark SKIPPED) | Section 8 (Legal & Compliance) |
+| Step 0.5 — Revenue Model & Unit Economics | Appendix A to `PRODUCT_MANIFESTO.md` (Standard+; Light: mark SKIPPED) | Appendix A (the manifesto body's Section 7 is Will-Not-Have — BL-105 map fix) |
+| Step 0.6 — Orchestrator Competency Matrix | Appendix B to `PRODUCT_MANIFESTO.md` (all tracks) | Appendix B (Section 6 is Post-MVP Backlog — BL-105 map fix) |
+| Step 0.7 — Trademark & Legal Pre-Check | Appendix C to `PRODUCT_MANIFESTO.md` (Standard+; Light: mark SKIPPED) | Appendix C (Section 8 is Open Questions — BL-105 map fix) |
 
 #### Gate Enforcement — What `check-phase-gate.sh` Validates
 
 The following items are enforced by `scripts/check-phase-gate.sh` when `current_phase >= 1` in `.claude/phase-state.json`. If any check fails, the gate blocks (exit 1) unless `SOIF_PHASE_GATES=warn` is set.
 
 - [ ] **`APPROVAL_LOG.md` exists.** The gate script fails immediately if `phase-state.json` exists but `APPROVAL_LOG.md` does not. Create `APPROVAL_LOG.md` before (or at the same time as) `phase-state.json` — the `init.sh` script does this automatically.
-- [ ] **`phase_0_to_1` date key recorded in `.claude/phase-state.json`.** The gate script checks for this key when `current_phase >= 1`. If the key is missing, the gate issues a warning and increments the failure count.
+- [ ] **`phase_0_to_1` date key recorded in `.claude/phase-state.json`.** The gate script checks for this key when `current_phase >= 1`. When the key is empty but `APPROVAL_LOG.md` carries a dated Phase 0 → Phase 1 entry, the gate **auto-records** today's date into `gates.phase_0_to_1` (plus a sibling `gates.phase_0_to_1_by` actor field) and continues — you no longer have to hand-edit `phase-state.json`. The write is idempotent (a valid first-pass date is preserved, never overwritten) and never cleared by a later FAIL. If the key is empty **and** no dated approval entry exists, the gate issues a warning and increments the failure count (no date is synthesized without evidence). Note: because an evidence-backed gate date is a recorded fact, this auto-record also runs under `SOIF_PHASE_GATES=warn` — warn only downgrades the blocking exit, it is not a read-only mode. To inspect without mutating state, don't run the gate at a phase past a crossed-but-unrecorded gate.
 - [ ] **`APPROVAL_LOG.md` has a dated Phase 0 → Phase 1 entry.** The script searches for a line matching `Phase 0.*Phase 1` and then scans the next 15 lines (`grep -A 15`) for a date in `YYYY-MM-DD` format. The date must appear within 15 lines of the gate header — entries with excessive whitespace or content between the header and the date will fail this check.
 - [ ] **`PRODUCT_MANIFESTO.md` exists.**
 - [ ] **`PRODUCT_MANIFESTO.md` has substantive content.** The script checks that all 8 numbered sections (`## 1.` through `## 8.`) are present and contain text beyond template placeholders. Missing sections produce a FAIL; placeholder-only sections produce a WARN.
 - [ ] **No unresolved Open Questions in `PRODUCT_MANIFESTO.md`.** Any line matching `Status: Open` (case-insensitive) produces a FAIL.
-- [ ] **Phase 0 intermediate outputs saved** (advisory). If `docs/phase-0/` exists, the script checks for `frd.md`, `user-journey.md`, and `data-contract.md`. Partial saves produce a WARN, not a block.
+- [ ] **Phase 0 intermediate outputs saved** (blocking). The script requires all three of `docs/phase-0/frd.md`, `user-journey.md`, and `data-contract.md`. Any missing file — or a missing `docs/phase-0/` directory entirely — produces a `[FAIL]` and blocks the gate (BL-114: this check was hardened from its earlier advisory behavior; the gate label and verdict now agree).
 
 **Limitation — Manifesto content depth:** The gate script verifies that `PRODUCT_MANIFESTO.md` exists and has the 8 required section headings with non-empty content. It does not validate that section content matches the track requirements (e.g., Full track requiring revenue model detail, Standard track requiring competency matrix entries). Track-specific content completeness is the reviewer's responsibility.
 
@@ -597,6 +664,10 @@ The following items are enforced by `scripts/check-phase-gate.sh` when `current_
 
 **Start a new Claude conversation for Phase 1.** Attach the completed `PRODUCT_MANIFESTO.md` and the Project Intake (if available).
 
+**Process checkpoint:** Start Phase 1 architecture planning: `scripts/process-checklist.sh --start-phase1`
+
+Run this **before** the Phase 1 steps below, not after. It consults the Phase 0→1 gate, opens the five-step architecture checklist (`architecture_selected`, `threat_model_complete`, `data_model_defined`, `ui_scaffolding_done`, `bible_synthesized`), and advances `current_phase` to 1 for you — do not set `current_phase` by hand. Mark each step as you finish it: `scripts/process-checklist.sh --complete-step phase1_architecture:STEP_ID`.
+
 ---
 
 ### Step 1.1: Business Strategy Gateway (Standard+ Track — skip for internal tools)
@@ -605,13 +676,34 @@ Direct the AI to argue AGAINST building: competitors, existing solutions, Go/No-
 
 **DECISION GATE — Orchestrator decides Go or No-Go.**
 
-**Save as:** Record the Go/No-Go decision and key competitive factors as an appendix to `PRODUCT_MANIFESTO.md` or in the Project Bible Section 3 (Architecture Decision Record). The decision rationale must be persistent — an auditor should be able to verify this decision was made.
+```
+Record the Go/No-Go decision in PRODUCT_MANIFESTO.md Appendix D (Market
+Signal & Go/No-Go Evidence). The decision is the Orchestrator's, not the
+AI's. Cite the market-signal rows (Appendix D table) that support it. If
+there is no positive signal tagged `seen it`, the DECISION GATE applies:
+return to Phase 0 — do not proceed to architecture on hunches. The decision
+must be persistent and auditor-verifiable: dated, named, and reasoned in the
+appendix, not in chat.
+```
+
+**Save as:** `PRODUCT_MANIFESTO.md` Appendix D (Market Signal & Go/No-Go Evidence) — the decision row plus the signal table. The Phase 1→2 gate checks the appendix on Standard+ tracks (WARN-first). The decision rationale must be persistent — an auditor should be able to verify this decision was made.
 
 ---
 
 ### Step 1.1.5: Market Signal Validation (Standard+ Track)
 
-**Performed by the Orchestrator, not the AI.** At least one market signal before committing to architecture. Record the signal type (customer interview, letter of intent, survey result, landing page signups) and outcome in the Product Manifesto appendix or Project Bible. "At least one positive signal" means documented evidence, not a gut feeling.
+**Performed by the Orchestrator, not the AI.** At least one market signal before committing to architecture. Record the signal type (customer interview, letter of intent, survey result, landing page signups) and outcome in `PRODUCT_MANIFESTO.md` **Appendix D** (Market Signal & Go/No-Go Evidence — shipped by the template). "At least one positive signal" means documented evidence, not a gut feeling.
+
+**Evidence grammar.** Tag every signal row: **`seen it`** (≈3 independent sources, each verified per the protocol below) · **`hunch`** (plausible, unconfirmed) · **`guess`** (inferred). A differentiator built on a hunch is a bet, not a finding — Go decisions rest on `seen it` rows only.
+
+**Source-verification protocol (fail closed):**
+1. **Re-fetch every deliverable-bound source** before the decision — a source you cannot re-fetch is not evidence.
+2. **Text-match, not gist-match:** the quoted words must be findable at the URL; only `[...]` elisions are allowed.
+3. **Fail closed:** an unverified source cannot lift a claim to `seen it`, and cannot carry it alone.
+4. **A high fail rate condemns the whole sweep** — re-research; do not salvage the survivors.
+5. **Record the counts** in Appendix D: checked / failed / dropped.
+
+The protocol is deliberately source-agnostic: it is a standard, not a fetch pipeline — do not gate on any particular third-party mirror or API.
 
 **DECISION GATE — If no positive signal, return to Phase 0.**
 
@@ -790,9 +882,9 @@ Synthesize all Phase 1 outputs into `PROJECT_BIBLE.md`:
 
 **DECISION GATE — Review the complete Bible. This is the point of no return.**
 
-**Organizational deployments:** The Senior Technical Authority must approve the Project Bible before proceeding to Phase 2. Record the approval in `APPROVAL_LOG.md` (Phase 1 → Phase 2 section).
+**Organizational deployments:** The Senior Technical Authority must approve the Project Bible before proceeding to Phase 2. Record the approval by appending a completed table under the `## Phase Gate: Phase 1 → Phase 2` header in `APPROVAL_LOG.md` (append-only — see the "How to record an approval" note under the Phase 0 → Phase 1 gate).
 
-**Personal projects:** Record your self-review in `APPROVAL_LOG.md` before proceeding. **Known risk:** Self-review at this gate means the person least likely to catch their own architectural blind spots is the sole reviewer. For Standard+ track personal projects, consider seeking an external architecture review — a peer, mentor, or a separate Claude session using the adversarial evaluation prompt (`evaluation-prompts/Projects/bases/01-senior-engineer.md`). If this project is later upgraded to organizational deployment via `upgrade-project.sh`, the Senior Technical Authority will be required to retroactively review and approve the Project Bible.
+**Personal projects:** Record your self-review by appending a completed table under the same gate header in `APPROVAL_LOG.md` before proceeding. **Known risk:** Self-review at this gate means the person least likely to catch their own architectural blind spots is the sole reviewer. For Standard+ track personal projects, consider seeking an external architecture review — a peer, mentor, or a separate Claude session using the adversarial evaluation prompt (`evaluation-prompts/Projects/bases/01-senior-engineer.md`). If this project is later upgraded to organizational deployment via `upgrade-project.sh`, the Senior Technical Authority will be required to retroactively review and approve the Project Bible.
 
 #### Gate Enforcement — What `check-phase-gate.sh` Validates (Phase 1→2)
 
@@ -803,6 +895,17 @@ When `current_phase >= 2` in `.claude/phase-state.json`:
 - [ ] **`PROJECT_BIBLE.md` exists.**
 - [ ] **`PROJECT_BIBLE.md` has at least 14 numbered sections** (template specifies 16; minimum 14 to pass).
 - [ ] **No placeholder dates in `PROJECT_BIBLE.md`.** Any remaining `YYYY-MM-DD` strings produce a WARN.
+- [ ] **ZDR / data_classification gate (tier-crosscheck-6).** `.claude/process-state.json::phase1_artifacts.data_classification` must be one of `public`, `internal`, `confidential`, `pii`, `financial`, `health`, `regulated`. For any classification above `public`, EITHER `zdr_attested = true` OR a non-empty `zdr_attestation_reason` must be present. Missing or invalid → FAIL (blocking). See docs/governance-framework.md § VII "Mandatory ZDR gate" (invariant #16).
+
+#### Step 1.7: Data Classification & ZDR Attestation (Phase 1→2 invariant — tier-crosscheck-6)
+
+`scripts/intake-wizard.sh` § 5.5 captures `data_classification` + `zdr_attested` and writes them to `.claude/process-state.json::phase1_artifacts`. The Phase 1→2 backstop in `scripts/check-phase-gate.sh` enforces them. When ZDR (Zero Data Retention) is in place, set `zdr_attested = true`. When ZDR is not in place but the deviation has been formally risk-accepted (e.g. a customer SOW that requires retention, or a self-hosted Ollama instance that already controls retention), record the written exception in `zdr_attestation_reason` — the gate honors either evidence shape.
+
+**When ZDR is needed:** Personal/light tier projects handling `public` data only are exempt. Any project handling `internal` or higher data (per docs/governance-framework.md § VII line 297-299) must have ZDR or self-hosted LLM — this includes most organizational projects and any personal project handling PII, financial, health, or regulated data. Setting `zdr_attested = false` without a documented `zdr_attestation_reason` will fail the Phase 1→2 gate.
+
+**Retrofitting an existing project:** Run `bash scripts/reconfigure-project.sh --field data_classification --new <value>` (and optionally `--field zdr_attested --new true|false [--reason "<text>"]`). The reconfigure script appends an audit row to `APPROVAL_LOG.md` and rolls back atomically on failure (PR #57 / PR #93 pattern).
+
+**Personal→Organizational upgrade:** `scripts/upgrade-project.sh --deployment organizational` refuses up-front when `phase1_artifacts.data_classification` is unset — set it first via reconfigure, then re-run the upgrade.
 
 **Save as:** `PROJECT_BIBLE.md`
 
@@ -882,12 +985,20 @@ glab repo create <name> --private
 # init.sh handles: git setup + glab api POST projects/<path>/protected_branches
 ```
 
-**Bitbucket Cloud (first-class)** — requires an App Password (not account password) at https://bitbucket.org/account/settings/app-passwords/ with scopes `repository:admin`, `project:admin`, `pullrequest:write`, exported as env vars:
+**Bitbucket Cloud (first-class)** — requires an Atlassian API Token (App Passwords are sunset 2026; per https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/, API tokens use HTTP Basic with the Atlassian account **email** as the username):
+```bash
+# PREFERRED — API token (create at https://id.atlassian.com/manage-profile/security/api-tokens)
+export BITBUCKET_API_TOKEN_EMAIL="you@example.com"    # Atlassian account email
+export BITBUCKET_API_TOKEN="your-api-token"
+export BITBUCKET_WORKSPACE="your-workspace-slug"
+# init.sh handles: repo create + branch-restrictions via curl
+```
+
+Legacy App Password path (sunset 2026 — still works today, will break on enforcement; scopes `repository:admin`, `project:admin`, `pullrequest:write` at https://bitbucket.org/account/settings/app-passwords/):
 ```bash
 export BITBUCKET_USER="your-bitbucket-username"
 export BITBUCKET_APP_PASSWORD="your-app-password"
-# (Org workspace? also: export BITBUCKET_WORKSPACE="org-name")
-# init.sh handles: repo create + branch-restrictions via curl
+export BITBUCKET_WORKSPACE="your-workspace-slug"
 ```
 
 **Other hosts (Gitea, Codeberg, self-hosted)**:
@@ -898,8 +1009,27 @@ export BITBUCKET_APP_PASSWORD="your-app-password"
    - Admins not exempt (if supported)
    - Org mode only: require at least 1 PR review
 4. At the attestation prompt in init.sh, type `yes` to confirm protection is configured.
-5. No CI template is laid down for `other`. Supply your own `.gitlab-ci.yml` / Jenkinsfile / etc.
+5. No CI or release template is laid down for `other`. Supply your own `.gitlab-ci.yml` / Jenkinsfile / etc.
 6. Attestation expires after 90 days; re-confirm when the Phase 1→2 backstop fires.
+
+**`other`-host CI/CD is a non-blocking warning (BL-084).** `other` has no canonical CI/release destination, so `verify-install.sh` reports *"CI pipeline: configure manually"* / *"Release pipeline: configure manually"* in a dedicated **"configure manually (non-blocking)"** section that does **not** count toward the manual-action total. Supplying your own CI/CD is a one-time setup item, not a failure — the check still passes. (Genuine incompleteness on a *supported* host still fails, per the BL-064 hard-fail contract.)
+
+**A failed initial push is a REAL failure — tier-aware, never silently masked (BL-084).** `other` is the bring-your-own-*host* path: init.sh runs `git remote add origin <your-url>` then `git push`. When that push does not complete (wrong/placeholder URL, repo not yet created, proxy/firewall), what happens depends on your project's **tier** — which is decided by `deployment` + governance mode (`poc_mode`), **not** by the `track` field. (`track=light` can be set on a Sponsored/Production project in `--non-interactive` mode; the framework deliberately does *not* trust `track` here, so a sponsored/production project can never bypass a failed push by carrying a light track.)
+
+| Tier (Karl's term) | How it's detected | Push-fail behavior on `--git-host other` |
+|--------------------|-------------------|------------------------------------------|
+| **Personal** | `deployment=personal`, non-POC | **Real failure by default**, but bypassable with an explicit, on-the-record acknowledgment (below). |
+| **POC-Personal** | `deployment=personal`, `poc_mode=private_poc` | Same as Personal — bypassable with acknowledgment. |
+| **POC-Sponsored** | `deployment=organizational`, `poc_mode=sponsored_poc` | **HARD FAIL, non-bypassable.** A working remote is mandatory. init records the failure, prints **"Setup INCOMPLETE"**, exits non-zero. **No flag helps — not even with `--track light`.** |
+| **MVP / Production** | `deployment=organizational` (production build) | **HARD FAIL, non-bypassable.** Same as POC-Sponsored. |
+
+For the **bypassable** tiers (Personal / POC-Personal) only, a failed push can be explicitly acknowledged via one of:
+- `--accept-local-only-risk` — keep the project **local** (no remote) and accept the **data-loss** risk. Recorded in `.claude/process-state.json::phase2_init.remote.local_only_acknowledged`. init exits 0.
+- `--defer-remote-push` — push manually later. Recorded as `push_deferred_acknowledged`. init exits 0, **but the Phase 1→2 gate WILL block** until the remote actually has the branch.
+
+Interactively (no flag), init prompts and defaults to **do not proceed** (treat as a failure). First-class hosts (`github`/`gitlab`/`bitbucket`) always keep the hard-fail contract: a real repo-creation, push, or protection failure records an init failure and exits non-zero (BL-064).
+
+**Phase 1→2 gate enforces a verified remote (BL-084).** `check-phase-gate.sh` verifies the remote actually has the branch (`git ls-remote --heads origin`, `other` host only), keyed on the **same tier** (deployment + poc_mode) as init — so the gate cannot be fooled by `track=light` on a sponsored/production project either. For **POC-Sponsored / MVP-Production** a verified remote is **mandatory** (non-bypassable FAIL if the code isn't pushed — a `local_only_acknowledged` does **not** let these tiers pass). For **Personal / POC-Personal** the gate PASSES only if the remote has the branch **or** `local_only_acknowledged` is on record; a `push_deferred_acknowledged` that was never actually pushed still **FAILS** (the deferral does not let you advance).
 
 **2. Protection bar** (personal vs organizational):
 
@@ -910,6 +1040,23 @@ export BITBUCKET_APP_PASSWORD="your-app-password"
 
 This is enforced by `init.sh` via the selected host driver and verified by `scripts/check-phase-gate.sh` at every Phase 1→2 check. Drift detection is automatic — if protection is loosened later, the gate blocks until `scripts/check-gate.sh --repair` restores it.
 
+**In CI, that same check WARNs instead of enforcing until you give it a token — please clear it (walk ISSUE-006).** Verifying branch protection is an authenticated API read, and a workflow runner holds no credential for it: GitHub Actions puts no token in a step's environment, and the built-in `secrets.GITHUB_TOKEN` **cannot** read branch protection at all (the workflow `permissions:` block has no `administration` key). Rather than fail a check that is structurally impossible there, the gate prints a loud `[WARN] … COULD NOT RUN` — honest, but not enforcement, and a warning nobody clears becomes a check nobody reads. One guided command sets up the real thing:
+
+```bash
+scripts/check-gate.sh --setup-ci-token
+```
+
+It explains what the token is for, walks you through a **least-privilege fine-grained PAT** (Repository access: this repo only; Repository permissions → **Administration: Read-only** — that one permission is the whole requirement, no write anywhere), **verifies the token can actually read protection before storing anything** (a stored-but-powerless token would turn today's honest WARN into a hard FAIL), stores it as the Actions secret `SOIF_PROTECTION_TOKEN` with the value on stdin rather than argv, and then checks your workflow against **both** conditions that enforcement depends on. An unset secret evaluates to the empty string, which the gate reads as "no credential" — exactly today's warning.
+
+Enforcement needs two things, and the command reports on each rather than assuming them:
+
+1. **The workflow maps the secret** into the phase-gate step (`GH_TOKEN: ${{ secrets.SOIF_PROTECTION_TOKEN }}`). The generated `ci.yml` does.
+2. **The gate's exit code decides that step.** Until 2026-08-02, seven of the ten generated GitHub workflows ran the gate as `bash scripts/check-phase-gate.sh 2>/dev/null || echo "…skipping"`, which throws the verdict away — the gate could print `[FAIL]` and exit 1 while the step graded green (and the "not found" message was a lie: the script *was* found, its verdict failed). All ten now use the strict shape. **If you scaffolded before that date, `--setup-ci-token` will detect the swallowing `run:` line and print the replacement** — a token cannot enforce anything through a discarded exit code.
+
+When both hold, the next push enforces.
+
+Non-interactive: `SOIF_PROTECTION_TOKEN=<token> scripts/check-gate.sh --setup-ci-token`. GitLab and Bitbucket need **both** a token variable **and** the host CLI installed in the governance job (`glab` / `curl`); the same command prints those steps for those hosts. Local runs are unaffected throughout — the gate has always blocked on the dev workstation and still does.
+
 **Existing projects that predate this gate:**  The first time you upgrade or cross Phase 1→2, you may need to backfill manifest + protection:
 
 ```bash
@@ -917,6 +1064,21 @@ scripts/check-gate.sh --backfill-host   # infers host from git remote URL
 scripts/check-gate.sh --preflight       # dry-run: verifies protection
 scripts/check-gate.sh --repair          # re-applies protection if preflight fails
 ```
+
+**Recovering a `--no-remote-creation` project (manual remote wiring) — BL-157.** If you scaffolded with `init.sh --no-remote-creation` (no repo was created on the host) and later attached the remote by hand:
+
+```bash
+git remote add origin <your-clone-url>
+git push -u origin main
+```
+
+then `init.sh`'s create/push bookkeeping never ran, so `.claude/process-state.json` has no `remote_repo_created` / `pushed_initial` markers. `scripts/check-gate.sh --repair` now **reconciles those markers in its preflight** — but only after a *genuine* check that the configured `origin` answers `git ls-remote` **and** its branch head is a commit your local repo actually holds — i.e. your code was really pushed, not merely a same-named branch on the remote (never an assumption). On a free-tier host where protection APIs are unavailable (GitHub private-repo 403, GitLab Premium-only approvals), that lets a **single** command record the tier-limited attestation:
+
+```bash
+scripts/check-gate.sh --repair --branch-protection-attested
+```
+
+No two-step dance is needed. If you have **not** pushed a branch yet (`origin` missing, or created but empty), the attestation still **refuses** — push first, then re-run (the refusal message names the exact command). This is the same tier-limited attestation described under **GitHub tier limitation** and **GitLab Free-tier limitation** below; the only difference is that the create/push markers are reconciled from your manually-wired remote instead of being written by `init.sh`.
 
 **GitHub tier limitation — important.** On free-tier GitHub personal accounts, branch protection rules are **only supported on public repos**. Private repos require GitHub Pro ($4/month) or higher. If you run `init.sh` with a free-tier personal account and select `private` visibility, the driver will create the repo and push successfully but fail at `host_configure_protection` with HTTP 403: *"Upgrade to GitHub Pro or make this repository public to enable this feature."*
 
@@ -926,6 +1088,13 @@ Workarounds:
 - **Accept risk:** choose `private` and accept that protection cannot be configured automatically; you'll need to rely on personal discipline until you upgrade. (Framework does not currently support this path cleanly — verification will keep failing at the backstop gate. Tracked as BL-002 in the backlog for a future graceful-degradation fix.)
 
 For organizational deployments: GitHub Team or Enterprise includes branch protection on private repos by default, so this limitation does not apply to org projects.
+
+**GitLab Free-tier limitation — organizational deployments.** On gitlab.com Free, the `projects/:id/approvals` API is Premium-only. When `init.sh` runs with `--git-host=gitlab --deployment=organizational`, the driver's default flow tries to `PUT /projects/:id/approvals` with `approvals_before_merge=1`, which returns HTTP 403: *"This feature is not available on your plan."* (exact wording has varied across GitLab releases — the driver matches a broad union of Premium-only signals). Two escape hatches:
+
+- **Reactive (interactive):** The driver returns exit 4 with a structured remediation message. `init.sh` prompts you to attest that approvals will be enforced by convention. On `yes`, an attestation is recorded and check-gate.sh honors it.
+- **Proactive (non-interactive):** Pass `--approvals-attested` to `init.sh` (or export `SOLO_APPROVALS_ATTESTED=1`). The driver skips the approvals PUT entirely and emits a `[WARN]` pointing you at **Settings > Merge requests > Merge request approvals** to set the value manually. init.sh records the attestation with reason `gitlab_free_tier_approvals`, and `scripts/check-gate.sh --preflight` + the `scripts/check-phase-gate.sh` Phase 1→2 backstop honor it as the load-bearing gate — same pattern as `github_free_tier` for the GitHub analog. Upgrade the namespace to GitLab Premium (or self-host GitLab CE/EE with an appropriate license) to enable API-level enforcement.
+
+Tracked as BL-032 in `solo-orchestrator-backlog.md`.
 
 **3. Initialize the project with the AI agent:**
 
@@ -970,6 +1139,7 @@ Direct the agent to generate the CI configuration:
 - [ ] Initial data model applies successfully
 - [ ] Pre-commit hook catches a test secret (gitleaks detects a hardcoded test value)
 - [ ] Pre-commit hook runs Semgrep (verify SAST scanning is active)
+- [ ] Pre-commit hook runs the project tests (BL-125): commit with a deliberately-failing test staged → the commit must be `[BLOCKED]`. The command resolves from `.claude/test-command` (first non-blank, non-comment line — point it at your fast lane if the full suite is slow), else a detected stack default (a real `package.json` scripts-block test entry / pytest / cargo / go). No command configured or runnable → the commit lands with a LOUD "PROJECT TESTS NOT ENFORCED" warning, never silently; commits staging no source (including deletes, renames and **type changes** — a de-symlinked file is a real staged source blob, and all three DO count as source) skip with a receipt. Deliberate: a detected suite that runs but collects zero tests BLOCKS — this methodology is tests-first; write the first test or set `.claude/test-command`.
 - [ ] License checker runs clean
 - [ ] CI pipeline passes on first push
 - [ ] Backup/restore verified
@@ -996,6 +1166,17 @@ During the Phase 2 initialization steps above, some scaffolding work produces co
 **If you've already shipped Cutline work without the Build Loop:** retroactively run the Build Loop steps for that feature — write the tests you didn't write, run the security audit you skipped, update `FEATURES.md`, record the feature. It's awkward but recoverable. Don't leave the drift uncorrected; future phase gates will surface the gap at Phase 2→3.
 
 **Mechanical enforcement.** This rule is enforced by the pre-commit gate: any `git commit` with a message subject starting with `feat`, `feat(scope)`, `feat!`, or `feat(scope)!` is blocked unless a Build Loop is active and its first five steps (`tests_written`, `tests_verified_failing`, `implemented`, `security_audit`, `documentation_updated`) are complete. Non-feature scaffolding — tooling, CI, build configs — should use the correct Conventional Commits type (`chore:`, `build:`, `ci:`, `docs:`), which the gate does not enforce against. See `docs/superpowers/specs/2026-04-23-build-loop-precommit-enforcement-design.md` for the full design.
+
+**Ordering: commit the feature BEFORE you close the loop.** The intended sequence is steps 1–5 (`tests_written` … `documentation_updated`) → **commit the feature** → PR/merge → `test-gate.sh --record-feature` → `--complete-step build_loop:feature_recorded`. Step 6 is post-merge bookkeeping (you cannot record a merged PR before the PR exists), and committing while the loop is open is the path with the fewest constraints.
+
+**If you closed the loop first, you are not stuck.** Completing step 6 *closes* the loop and clears `build_loop` — the next feature must start its own — but it does not strand the feature you just finished. The checklist keeps a receipt of the closed loop (feature name, the five completed steps, and the files that loop was working on), and the gate still accepts a `feat:` commit when **both** hold:
+
+1. the subject **names that feature** — the full name anywhere in the scope or description, or one *distinctive* word of it (five characters or more, and not a generic term like `service`, `config` or `update`). Matching is by whole word, so `feat(auth2): …` does **not** name the feature `auth`; and
+2. the commit **stages at least one of that loop's own files** — the half you do not author, so typing an old feature's name above unrelated work does not get it through.
+
+A `feat:` commit for a *different* feature is blocked exactly as it always was. If you genuinely continue the same feature with files that did not exist when the loop closed (a rename, a new file), start a fresh loop for it — the gate cannot distinguish that from new work, and it says so when it blocks. (Walkthrough 2026-08-02, ISSUE-010: before this, closing the loop before committing made the feature's own commit impossible, and the gate's only advice was to re-register a loop for finished work.)
+
+**Verify every commit actually landed.** A blocked commit prints its reason and exits non-zero — and `git commit … | tail -5` can scroll that reason away and leave you believing the work was saved. The same walkthrough lost four commits that way. Never pipe `git commit`; after committing, confirm with `git log -1 --oneline`.
 
 ---
 
@@ -1097,13 +1278,31 @@ After verifying tests fail: `scripts/process-checklist.sh --complete-step build_
 
 #### Step 2.4 — Security & Quality Audit
 
-1. Run SAST:
+1. Run SAST — **the same rule set your pre-commit gate enforces, plus the audit pack:**
    ```bash
-   semgrep scan --config=p/owasp-top-ten --config=p/security-audit src/
+   semgrep scan --config=p/owasp-top-ten \
+     --config=p/security-audit \
+     --config=r/javascript.browser.security.insecure-document-method \
+     --config=.semgrep/soif-dom-sinks.yml \
+     --max-target-bytes=0 \
+     src/
    ```
 
+   > **Why the extra configs.** The generated pre-commit hook scans staged files with
+   > `p/owasp-top-ten` **plus** the browser DOM-sink pack **plus** the project's own
+   > `.semgrep/soif-dom-sinks.yml` (BL-118 / BL-131 — the rules that catch
+   > `innerHTML`, `document.write`, `insertAdjacentHTML` and friends), and disables
+   > semgrep's 1 MB file-size filter. An audit command narrower than the gate gives you
+   > a clean audit and then a blocked commit on a finding the audit never ran — that is
+   > exactly what happened on the 2026-08-02 walkthrough (ISSUE-009). Keep this command
+   > in step with the hook: the authority is the emitted `.git/hooks/pre-commit`
+   > (framework side: the `# BL-194-HOOK-SEMGREP-POLICY` anchor in
+   > `scripts/lib/hook-templates.sh`). The audit adds `p/security-audit` and leaves the
+   > severity bound off on purpose — an audit should see more than the gate blocks on,
+   > never less.
+
 **Parallel execution (if Superpowers available):** Dispatch these as parallel subagents — they have no cross-dependencies:
-1. **SAST agent:** Runs `semgrep scan --config=p/owasp-top-ten --config=p/security-audit src/`
+1. **SAST agent:** Runs the SAST command above (the gate's config set + `p/security-audit`)
 2. **Threat model agent:** Reviews implementation against Phase 1.3 Threat Model
 3. **Data isolation agent:** Tests whether one user/context can access another's data
 4. **Input validation agent:** Tests all entry points with injection payloads
@@ -1123,6 +1322,8 @@ Consolidate findings from all agents before remediation. Without Superpowers, ru
 
 **Process checkpoint:** `scripts/process-checklist.sh --complete-step build_loop:security_audit`
 
+The checkpoint READS the audit's verdict (BL-120): in the newest matching findings file(s) under `docs/security-audits/`, the LAST `**All findings resolved:**` line must be an unqualified `Yes`, and the last numeric `| Open | N |` Summary row must not record open findings (comments and fenced code blocks are ignored — a quoted example is not a verdict). An audit that records open findings, says No, still carries the template's `Yes / No` placeholder, or has no machine-readable verdict at all BLOCKS the step — "the audit ran" is not "the audit passed".
+
 **AI-specific caution areas:** AI-generated code is disproportionately likely to have subtle issues in: complex state management (race conditions), data access efficiency, authentication edge cases, and content security configuration. Apply extra scrutiny in these areas.
 
 **Concrete mitigations for AI-generated code risks:**
@@ -1141,9 +1342,9 @@ When a CI security check blocks the build, follow this escalation:
 2. **Genuine vulnerability:** Fix the code or update the dependency. Re-push. Do not bypass.
 3. **False positive:** Suppress at the line level with documentation (see Phase 3: Handling False Positives). Re-push.
 4. **Dependency vulnerability with no fix available:** Check if a patched version exists. If not, evaluate whether the vulnerable code path is reachable in your application. Document the risk and create a tracking issue. For organizational projects, get IT Security approval to proceed.
-5. **License violation:** Do not override. Find an alternative dependency with a compatible license. If no alternative exists, escalate to Legal (organizational) or evaluate the license terms carefully (personal).
+5. **License violation (denied copyleft, BL-086):** Do not override. Find an alternative dependency with a compatible license. On the corporate track (organizational / Sponsored POC / **Private POC**) this is a hard block; if no alternative exists, obtain a commercial license and exempt the package via `.claude/license-policy.json` `allow_packages`, or — only with Legal sign-off — record a deliberate exception with `SOLO_LICENSE_ATTESTED=1 SOLO_LICENSE_REASON="…"`. On a purely personal project the scanner warns rather than blocks, but heed the banner: the copyleft obligation travels with the code if you ever distribute, sell, run it as a service, or move it onto the corporate track.
 
-**Never** commit directly to main, disable CI, or use `--no-verify` to bypass security checks. If you are blocked and unsure how to proceed, ask for a security peer review.
+**Never** commit directly to main, disable CI, or use `--no-verify` to bypass security checks. If you are blocked and unsure how to proceed, ask for a security peer review. (On `strict` projects, every `--no-verify` commit is captured by the SessionStart out-of-band detector and recorded to `.claude/bypass-audit.json` — the bypass costs you nothing at commit time but it is visible in the audit log forever.)
 
 #### Step 2.5 — Update Documentation
 
@@ -1390,12 +1591,14 @@ Consolidate all findings into a single remediation list. Fix critical findings f
    ```
 3. Full repository secret scan:
    ```bash
-   gitleaks detect --source . --verbose
+   gitleaks dir . --verbose
    ```
 4. License compliance (using your ecosystem's tool)
 5. Direct the agent to: fix all critical/high findings, verify data isolation on every interface, verify input validation at every entry point, write regression tests for every fix.
 6. Re-run all scans to confirm resolution.
 7. **DAST scan (web applications):** Run OWASP ZAP baseline scan against the deployed staging environment. Full Track: run active scan. Save results to `docs/test-results/[date]_zap_[pass|fail].[ext]`. Reference your Platform Module for DAST configuration. (Non-web platforms: skip this step.)
+
+   > **Static apps — hardened-serve harness (BL-165).** A static app's bare preview (`vite preview` over `dist/`) cannot emit the deploy-time host headers (CSP, `X-Frame-Options`, HSTS, …) that live at the deploy boundary and are documented in Project Bible §11, so ZAP baseline correctly FAILs on every missing one — a genuinely clean app structurally FAILs DAST with no code change able to fix it. Do **not** learn to discount the scanner. Instead, declare the production header set in **`.claude/dast-headers.json`** (a flat `{"headers": { "<Name>": "<value>", … }}` map — only non-empty string values are applied; a malformed, non-object, or empty declaration is ignored with a visible `hardening NOT applied` note, never silently); the `zap-dast` arm of `scripts/run-phase3-validation.sh` then applies those headers to the responses ZAP judges and rules on the app *as served in production*, recording the applied config as evidence (`zap-dast-<timestamp>.hardened-serve.json`). The check is not softened: only the declared headers are applied, every other Medium+ alert still FAILs, and a missing/unapplied header still FAILs (fail-closed). Declare only headers your deploy layer actually ships — verify with `curl -I` against the live URL at go-live. Projects that claim no header dependence omit the file and keep the raw-preview FAIL semantics. Full example + schema: the web Platform Module, §4.2 DAST.
 8. **SBOM generation** (using your ecosystem's tool — CycloneDX, syft, or equivalent). Save to project root as `sbom.json` (current SBOM) and archive a dated copy to `docs/test-results/[date]_sbom.json` (Phase 3 snapshot). The root copy is the living document updated during monthly maintenance; the archived copy is the Phase 3 audit evidence.
 9. **Threat Model Validation:** Review the Phase 1.3 Threat Model. For every identified threat vector, verify: the mitigation was implemented, it works as designed, or the risk was explicitly accepted with documented rationale. Any threat vector without a verified mitigation or documented acceptance is a finding that must be resolved before go-live.
 
@@ -1519,7 +1722,7 @@ Direct the agent to create `docs/test-results/` and save:
 
 File naming convention: `[date]_[scan-type]_[pass|fail].[ext]` (e.g., `2026-04-02_semgrep_pass.json`).
 
-These artifacts serve as the audit evidence for Phase 3 completion. They are referenced in `APPROVAL_LOG.md` (Phase 3 → Phase 4 section) and included in the HANDOFF.md. Update the Approval Log with the go-live approval(s) before proceeding to Phase 4 deployment.
+These artifacts serve as the audit evidence for Phase 3 completion. They are referenced in `APPROVAL_LOG.md` (Phase 3 → Phase 4 section) and included in the HANDOFF.md. Record the go-live approval(s) by appending completed tables under the `## Phase Gate: Phase 3 → Phase 4` header before proceeding to Phase 4 deployment — for organizational deployments append one under **each** of the `### Application Owner Approval` and `### IT Security Approval` subsection headers (append-only — see the "How to record an approval" note under the Phase 0 → Phase 1 gate).
 
 **Process checkpoint:** `scripts/process-checklist.sh --complete-step phase3_validation:results_archived`
 
@@ -1547,6 +1750,7 @@ These artifacts serve as the audit evidence for Phase 3 completion. They are ref
 
 **Legal:**
 - [ ] Privacy Policy (if collecting any data) — **MANDATORY: must be reviewed by qualified legal counsel before deployment.** AI-generated privacy policies commonly contain inaccuracies, omissions, and generic language that fails to address specific processing activities. Do not deploy AI-generated legal documents without attorney review.
+  - **Collecting nothing still means writing the policy — a policy that says so.** The `phase3_validation:legal_review` step is fail-closed on `data_classification`: any non-public classification requires a `PRIVACY_POLICY.md`, and it is not satisfied by *not writing* the document. That is not a mismatch for a local, zero-collection tool — the classification describes the data the product **handles**, not a claim that it collects it, and "this product collects, stores and transmits no user data; all processing happens locally in your browser/on your device" is a complete and honest Privacy Policy. Write that, record the review row in `APPROVAL_LOG.md`, and the step completes normally. Do not force-override the step to avoid writing it.
 - [ ] Terms of Service (if applicable) — **MANDATORY: must be reviewed by qualified legal counsel before deployment.** Same requirement as Privacy Policy above.
 - [ ] License audit passing in CI
 - [ ] Trademark search completed
@@ -1569,11 +1773,18 @@ When `current_phase >= 3` (pre-gate checks that run before the transition is rec
 - [ ] **`docs/INCIDENT_RESPONSE.md` exists.**
 - [ ] **`sbom.json` exists.**
 - [ ] **`docs/test-results/` directory exists and is non-empty.** An empty directory produces a FAIL.
+- [ ] **Phase 3 validation scans clean (BL-070 driver + BL-082 staleness).** The gate auto-invokes `scripts/run-phase3-validation.sh` and requires an aggregate summary at `docs/test-results/phase3/summary-*.md` in which **every** registered scanner — `semgrep-full-tree`, `license`, `snyk`, `zap-dast`, `threat-model` (all five are REAL as of BL-070, 2026-07-10; none stubbed-by-decision) — is **PASS or an attested skip**. A missing summary, any scanner FAIL, or any **un-attested** SKIP **FAILs the gate** (blocking). The summary is bound to the tree it validated (BL-082: `- tree:` / `- dirty:` provenance); a stale, dirty, or pre-BL-082 summary is treated as STALE and the gate auto-regenerates it by re-running the driver — unless `SOLO_PHASE3_GATE_NOAUTORUN=1` or the driver is unavailable, in which case the stale summary FAILs. Attest an unavailable scanner with `bash scripts/run-phase3-validation.sh --attest <scanner> --reason "<why>"` (recorded to `.claude/phase-state.json::phase3.attestations.<scanner>` — skips carry a sign-off, they are not silenced).
 - [ ] **`SECURITY.md` exists.** Missing produces a WARN.
 - [ ] **POC mode check.** If `poc_mode` is set in `phase-state.json`, Phase 4 (production release) is blocked. POC projects complete at Phase 3.
 - [ ] **Release pipeline check.** If `.github/workflows/release.yml` exists, any remaining `TODO` items produce a WARN.
 - [ ] **Penetration test results** (Standard+ track). The script looks for files matching `*pen-test*`, `*pentest*`, or `*penetration*` in `docs/test-results/`. Standard track allows IT Security exemption recorded in `APPROVAL_LOG.md`; Full track has no exemption path.
-- [ ] **Review manifest** (`docs/eval-results/review-manifest.json`) exists.
+- [ ] **Review manifest** (`docs/eval-results/review-manifest.json`) exists **and records the required reviewers** (BL-073, track-aware). **On organizational deployments, the Phase-3 reviews of record are executed by live people — including a senior developer — recorded via `signed_by`; agent-persona reviews are supplementary preparation for those human audits, never a substitute** (Karl, 2026-07-11). The gate parses `.reviews[]` and verifies the Security and Red Team reviews are `complete`:
+  - **`track=full` / `track=standard`:** the gate **FAILs** (blocks) if the Security **or** Red Team review is missing or not `complete`. **Full track** additionally requires all six reviewers — the other four (Engineer, CIO, Legal, Technical User) produce a WARN that still counts toward gate blocking.
+  - **`track=light` / personal:** WARN only (POC preserved); the bypass is logged to the console/CI audit trail. Enforcement flips to FAIL automatically once the track is promoted to `standard`/`full`.
+  - **Grandfather clause:** the FAIL applies only to projects created or advanced under the enforcement regime — keyed on `phase-state.json::review_gate_enforced` (stamped `true` by `init.sh` at creation and re-stamped by `upgrade-project.sh` on any tier advance). A pre-existing project that lacks the flag keeps the legacy WARN-only behavior and is never retroactively blocked.
+    - **Note (threat model):** `review_gate_enforced` is operator-editable self-attested state — deleting the key or setting it `false` reverts an enforced project to the grandfathered WARN-only path. This downgrade-bypass is accepted under the framework's solo-operator threat model (the operator can already edit their own gate state), the same class as `SOIF_PHASE_GATES=warn`. It is a convenience for the honest operator, not a control against a hostile one.
+  - **Escape hatch:** set `SOLO_REVIEWERS_ATTESTED=1` with `SOLO_REVIEWERS_ATTESTED_REASON="<reason>"` to downgrade the FAIL to an attested OK. The decision is recorded to `.claude/process-state.json::phase3.attestations.reviewers` — blocks are attested, not silenced.
+  - The manifest schema is validated by `scripts/lint-review-manifest.sh` (CI): each `.reviews[]` entry must carry `reviewer`, `status` (`complete`|`skipped`|`failed`), and `artifact`; `signed_by` and `date` (`YYYY-MM-DD`) are validated when present.
 - [ ] **Bug gate passes** (`scripts/test-gate.sh --check-phase-gate`).
 
 #### Gate-Checked vs. Snapshot-Only Artifacts
@@ -1615,7 +1826,21 @@ Artifacts marked "No" in the Gate-Checked column are included in the snapshot fo
 
 **Re-run protocol after major remediation:** If a fix changes application behavior (not just scan configuration), re-run the affected test steps. Security fix → re-run Steps 3.1 (integration) and 3.2 (security). Accessibility fix → re-run Step 3.4. Performance fix → re-run Step 3.5. If multiple step types are affected, use `scripts/process-checklist.sh --reset phase3_validation` to re-run the full Phase 3 sequence. For minor fixes that don't change behavior (suppression configuration, documentation), re-running is not required.
 
-**Evaluation prompts:** For additional validation depth, consider running the Security Review (`evaluation-prompts/Projects/bases/03-security.md`) and Red Team Review (`evaluation-prompts/Projects/bases/06-red-team-review.md`) evaluation prompts. Results should be archived to `docs/eval-results/`. Required for Full Track projects.
+**Evaluation prompts:** Run the Security Review (`evaluation-prompts/Projects/bases/03-security.md`) and Red Team Review (`evaluation-prompts/Projects/bases/06-red-team-review.md`) evaluation prompts (or the full six-reviewer suite via `evaluation-prompts/Projects/run-reviews.sh`, which writes `docs/eval-results/review-manifest.json`). Results should be archived to `docs/eval-results/`.
+
+> **Two supported routes — pick by who is running it.** Bare `run-reviews.sh <module>` launches six nested `claude -p` CLI sessions and assumes an **interactive shell that owns the terminal**. If the caller is **already an agent** (a Claude Code session, a subagent, any headless runner), use the compose route instead — it is a first-class alternative, not a fallback, and it is what the 2026-08-02 walk used for all six reviewers (ISSUE-014):
+>
+> ```bash
+> run-reviews.sh <module> --compose-only        # writes docs/eval-results/prompts/*.md, starts nothing
+> # run each prompt on the surface you already have — one subagent per reviewer, in parallel —
+> # and save each output at the artifact filename its prompt demands
+> run-reviews.sh <module> --assemble-manifest   # builds the manifest from the artifacts on disk
+> bash scripts/lint-review-manifest.sh docs/eval-results/review-manifest.json
+> ```
+>
+> Never hand-write `review-manifest.json`: `--assemble-manifest` derives it from the files that actually exist, which is what keeps the Phase 3 → 4 gate's verdict honest. Full details: `evaluation-prompts/Projects/README.md` § Usage.
+
+**Track-specific enforcement (BL-073):** the Security and Red Team reviews are a **hard Phase 3 → 4 gate** for `track=standard` and `track=full` — `scripts/check-phase-gate.sh` reads the review manifest and **FAILs the gate** if either the Security or Red Team review is missing or not `complete`. Full Track additionally requires all six reviewers (the other four WARN but still block). `track=light` / personal projects are WARN-only (POC preserved) and the bypass is logged; enforcement flips to FAIL if the project is later upgraded to `standard`/`full`. Pre-existing projects (created before this enforcement shipped, keyed on `phase-state.json::review_gate_enforced`) are grandfathered — WARN-only, never retroactively blocked. To ship an enforced project with a documented reviewer gap, attest with `SOLO_REVIEWERS_ATTESTED=1 SOLO_REVIEWERS_ATTESTED_REASON="<reason>"` (recorded to `.claude/process-state.json::phase3.attestations.reviewers`). See the Phase 3 → 4 gate checklist above for the full contract.
 
 ---
 
@@ -1708,7 +1933,9 @@ Walk through the production application manually on each target platform:
 - [ ] All production configuration values set correctly
 - [ ] Platform-specific checks per Platform Module
 
-> **⟁ PLATFORM MODULE — MANDATORY:** You MUST complete the platform-specific go-live checklist from your Platform Module in addition to the core checklist above. The Platform Module checklists contain critical platform requirements (SSL/security headers for web, code signing/auto-updater for desktop, app store metadata/certificates for mobile) that are not optional. Failure to complete platform-specific checks may result in deployment rejection (app store), security exposure (web), or broken functionality (desktop).
+> **⟁ PLATFORM MODULE — MANDATORY (machine-checked, BL-106):** You MUST complete the platform-specific go-live checklist from your Platform Module in addition to the core checklist above. The Platform Module checklists contain critical platform requirements (SSL/security headers for web, code signing/auto-updater for desktop, app store metadata/certificates for mobile) that are not optional. Failure to complete platform-specific checks may result in deployment rejection (app store), security exposure (web), or broken functionality (desktop).
+>
+> **How it is enforced:** init.sh rendered your module's checklist into `docs/test-results/go-live-checklist.md` at scaffold time. Tick every box as you verify it in production and fill the Date field — `scripts/process-checklist.sh --complete-step phase4_release:go_live_verified` parses your module's Go-Live section directly and BLOCKS while any module item is unticked or missing from the artifact, any box remains unticked, or the date is a placeholder. (Platforms whose module ships no go-live checklist are exempt with a note.)
 
 **DECISION GATE: All core AND platform-specific checks green before announcing launch.**
 
@@ -1737,41 +1964,105 @@ Core requirements:
 
 Document the monitoring configuration in `HANDOFF.md` Section 8 (Monitoring & Alerting subsection): tool name, dashboard URL, alert channel, and access instructions.
 
+**Record the verification event in this exact block** (P4-001 reads it; the checklist prints it back at you if it is missing):
+
+```markdown
+### Monitoring verification
+- Error event: <the error that occurred — a deliberately triggered test error, OR a real failure>
+- Alert fired: <the rule / workflow / channel that fired>
+- Alert arrived: <where it was RECEIVED, and who acted on it>
+- Date verified: YYYY-MM-DD
+```
+
+All four lines are required and each needs real content. Bold/list markup and any
+capitalisation are fine; `Alert received:` is accepted for `Alert arrived:`, and
+`Test error triggered:` for `Error event:`.
+
+**Zero-telemetry projects qualify — you do not need Sentry.** A static site, a local
+CLI, a desktop tool with no server error stream still has monitoring: deploy-failure
+alerts from CI, uptime checks, release-workflow notifications, store-review alerts.
+Those are the alert channels that matter for that project, and a **real** failure whose
+alert arrived is *stronger* evidence than a simulated one — record it honestly as an
+`Error event:` rather than calling it a test error. What the step will not accept is a
+monitoring section with no verified error → alert → arrived cycle: "configured" is not
+"verified", and an untested alert channel is indistinguishable from no monitoring.
+(Walkthrough 2026-08-02, ISSUE-017: an honest zero-telemetry write-up was rejected four
+times by a detector that only spoke server-telemetry vocabulary. The block above is the
+contract now, not a shape to be guessed.)
+
+If the check still blocks a legitimately-monitored project, the `SOIF_FORCE_STEP=true`
+override exists — but it is **human-only by design and stays that way**: it requires an
+interactive terminal and refuses agent, CI and other non-interactive sessions. An agent
+that hits this wall should **escalate to the human Orchestrator** (who runs the override
+in their own terminal, where it is logged) rather than retrying it — the retry will
+always refuse. Fixing the evidence is usually faster than the escalation.
+
 **Process checkpoint:** `scripts/process-checklist.sh --complete-step phase4_release:monitoring_configured`
 
 ---
 
 ### Step 4.4: Ongoing Maintenance Cadence
 
-**Schedule these cadences proactively** — create recurring calendar events for each application. Do not rely on memory. Run `scripts/check-maintenance.sh` to verify whether any cadence is overdue.
+**Schedule these cadences proactively** — create recurring calendar events for each application. Do not rely on memory. `scripts/check-maintenance.sh` is the tool that says whether any of them is overdue, and you can run it by hand at any time.
 
-**Weekly (30 minutes):**
+**Does it also run on its own? That depends on how this project got here.**
+
+- **Scaffolded by `init.sh`:** yes. `scripts/session-cadence-check.sh` is registered as a SessionStart hook, so every session opens with a check.
+- **Upgraded from an older version by `scripts/upgrade-project.sh`:** the upgrade delivers **both scripts** — so the checker itself is current, including the repaired exit codes below — but it does **not** add the SessionStart registration. Until it does, run the checker by hand on your own cadence, or register the hook yourself by adding `bash "$CLAUDE_PROJECT_DIR"/scripts/session-cadence-check.sh` to `hooks.SessionStart` in `.claude/settings.json`.
+
+#### The two cadences the tool measures
+
+Two of the buckets below are **mechanically checked**; the rest are practice the tool cannot see. Both windows are **policy, not constants** — a project on a slower schedule changes a config, it does not fork the script:
+
+| Cadence | Signal it reads | Default window | Policy key |
+|---|---|---|---|
+| **Routine review** | the last commit that touched `CHANGELOG.md`, and the last that touched `sbom.json` | 14 days | `cadence.routine_review_days` |
+| **Deep security scan** (the dependency audit is folded into it) | the newest dated file in `docs/test-results/` matching `*snyk*`, `*dep*`, `*audit*`, `*semgrep*` or `*sast*` | 95 days | `cadence.deep_security_days` |
+
+Both keys live in the project's post-1.0 policy file (`.claude/delta-policy.json`, `cadence` block). An absent file, an absent key — or a project that has never opened any post-release work at all — falls back to the defaults above, so the checker works everywhere.
+
+**Its three exit codes, and what they mean.** Read the code, not the closing sentence:
+
+- **0** — every applicable cadence was **measured** and is current.
+- **1** — one or more cadences are **overdue**.
+- **2** — one or more **could not be measured**, and none is overdue. A `CHANGELOG.md` with no git history, an empty `docs/test-results/`, a scan file with no date in its name, or a date no parser accepts all land here.
+
+A release cut **refuses on 1 and on 2**. Unmeasurable is not a pass: before this was fixed, an unreadable date was silently skipped and reported as current, so a cadence nobody had actually measured could sail through a tag.
+
+**What the check does NOT prove.** Two of these signals are **dates parsed out of filenames**. A file named with today's date and containing nothing satisfies the cadence completely. The windows above make the *schedule* stricter; they do not make the *evidence* stronger. Treat a green run as "the calendar is being kept", never as "the scan found nothing".
+
+**A cadence surface you do not have is not a failure.** No `CHANGELOG.md`, no `sbom.json` or no `docs/test-results/` is reported as *not applicable* and does not move any counter — the tool measures a cadence, it does not audit whether you have a maintenance practice. Where the session-start nag is registered, it stays completely quiet unless something is wrong, and says nothing at all until the project reaches Phase 4 — none of this applies to a product that has not launched. It also stays quiet if the checker itself fails to run: a hook that cannot measure anything reports nothing rather than guessing.
+
+#### The practice
+
+**Weekly (30 minutes) — habit, not checked:**
 - Review error dashboard and monitoring alerts
 - Health check: application is up and responsive
 - Review any user feedback or support requests
 
-**Monthly (1-2 hours):**
-- Dependency and security audit
+**Routine review (1-2 hours, every 14 days by default) — CHECKED:**
 - Apply non-breaking security patches
 - Review error dashboard. Fix recurring errors.
 - Rotate API keys/tokens approaching expiration
-- Update SBOM
-- Run full E2E test suite before each maintenance release
+- Update the SBOM (`sbom.json`)
+- Run the full E2E test suite before each maintenance release
 - Triage incoming bugs from production monitoring (same severity classification as Phase 2)
+- Write the CHANGELOG entry — it is half of what the check reads
 
-**Quarterly (2-3 hours):**
+**Quarterly (2-3 hours) — habit, not checked:**
 - Review usage: what are users doing? What are they requesting?
 - Performance comparison to last quarter
 - Infrastructure/distribution cost review
 - Prioritize post-MVP backlog based on real user signals
 - Run full regression test suite (all Phase 2 + Phase 3 tests)
 
-**Biannually (3-4 hours):**
-- Full dependency audit. Identify deprecated packages.
+**Deep security scan (3-4 hours, every 95 days by default) — CHECKED:**
+- **Full dependency audit. Identify deprecated packages.** (This used to sit under a separate biannual bucket and a separate 95-day check; it is one activity on one clock now.)
 - Plan version upgrades.
-- Re-run full Phase 3 security and performance audit.
+- Re-run the full Phase 3 security and performance audit.
 - Verify AI provider terms (if using AI in development).
 - Review platform requirements (SDK versions, OS support, store policies).
+- **Leave the evidence where the tool looks:** a dated artefact in `docs/test-results/` (for example `2026-08-03_semgrep_pass.txt`). A scan you ran and did not record is a scan the cadence cannot see.
 
 ---
 
@@ -1792,6 +2083,8 @@ Direct the agent to generate `HANDOFF.md`:
 **Reality check:** Have someone attempt development setup and issue triage using only this document. Fix every gap they find. Repeat.
 
 **Process checkpoint:** `scripts/process-checklist.sh --complete-step phase4_release:handoff_written`
+
+**Then test the handoff (Step 4.5b — required 6th step):** have a fresh session (or the New-Maintainer persona with no prior context) follow HANDOFF.md end-to-end and record the result in `docs/test-results/YYYY-MM-DD_handoff-test.md`; then `scripts/process-checklist.sh --complete-step phase4_release:handoff_tested`. `--finalize-phase 4` requires all SIX steps — production_build, rollback_tested, go_live_verified, monitoring_configured, handoff_written, **handoff_tested** (this step was previously undocumented here: BL-105 D-6).
 
 **Agent persona — New Maintainer:** When writing handoff documentation, the agent adopts the mindset of a developer who is taking over this project on Monday with zero context. This is a business application — quality is more important than positivity. Be critical, extremely thorough, and meticulous. "I have 2 hours to get a dev environment running and fix a production bug. Every command must work verbatim. Every file path must be correct. Every dependency must be listed with version and install command." Test your own docs: could someone follow these instructions from a blank machine to a running dev environment to a fixed bug, using nothing but this document?
 
@@ -1827,6 +2120,22 @@ Direct the agent to generate `HANDOFF.md`:
 
 ---
 
+## Documentation Rules
+
+> **Enforcement note (rule 5 applied to this guide):** where this guide describes enforcement, the **gate scripts are canonical** — `scripts/check-phase-gate.sh`, `scripts/pre-commit-gate.sh`, `scripts/process-checklist.sh`, `scripts/run-phase3-validation.sh`. Prose may lag; the scripts do not.
+
+Seven rules for every document this framework scaffolds (BL-091; the essentials also ship downstream in `docs/INDEX.md`'s Conventions section):
+
+1. **Corrections appear ABOVE what they supersede.** Agents read top-down; a stale claim absorbed first wins. Living documents are rewritten in place with a short history note — never corrected by appending below.
+2. **Ledgers append; living documents are rewritten in place.** APPROVAL_LOG and CHANGELOG are append-only records. BUGS.md appends rows and updates each row's status cells in place — that is its inline format contract, and the phase gate parses those cells (a literally-append-only BUGS.md would leave a fixed SEV-1 counted as Open and block the Phase 2→3 gate). Everything else is living: PROJECT_BIBLE, PRODUCT_MANIFESTO, FEATURES, the doc map. The doc map (`docs/INDEX.md`) labels each document's kind.
+3. **Absolute language carries its premise.** Any "never/always" ruling records the premise beside it, so the conditions under which it could be reversed stay visible. (Guidance only — unenforceable, and recorded as such.)
+4. **Every decision has ONE canonical home.** All other mentions LINK to it; when a document moves, a pointer stub stays at the old path. Copying a ruling creates duplicate truth, and duplicate truth drifts. Echo lists only where duplication is genuinely forced — and then each echo cites the canonical home.
+5. **Enforcement claims name the gate scripts as canonical.** Each document that describes enforcement carries a one-line banner (see the top of this section) naming the scripts as the source of truth.
+6. **Fail-closed loudness is an engineering rule, not a doc rule.** Any subsystem degraded by configuration says so LOUDLY at startup. This lands in two enforceable homes: this rule, and the standing **silently degraded subsystem** threat row (TM-001) shipped in every PROJECT_BIBLE template (the Bible itself is agent-authored in Phase 1 — the row arrives with the template the agent authors from) — which the Phase-3 threat-model scanner requires to be validated. A gate, not prose.
+7. **Non-operator text is attributed inline.** Quoted text from non-operator authors (multi-agent buses, external contributors) inside canon documents is attributed inline where it appears.
+
+---
+
 ## Appendix A: Document Artifacts Produced Per Project
 
 | Artifact | Phase | Purpose | Location | Template |
@@ -1836,6 +2145,9 @@ Direct the agent to generate `HANDOFF.md`:
 | `APPROVAL_LOG.md` | 0 (init) | Phase gate approval audit trail (append-only) | Root | `approval-log-*.tmpl` |
 | `PRODUCT_MANIFESTO.md` | 0 | Requirements, MVP Cutline, Revenue Model, Competency Matrix | Root | `product-manifesto.tmpl` |
 | `PROJECT_BIBLE.md` | 1 | Architecture, data model, threat model, test strategy, coding standards | Root | `project-bible.tmpl` |
+| `docs/INDEX.md` | 0 (init) | Doc map: authority order, doc kinds, conventions (BL-089) | `docs/` | `doc-index.tmpl` |
+| `docs/IDENTIFIERS.md` | 0 (init) | Identifier registry, pre-seeded with the framework's namespaces (BL-089) | `docs/` | `identifiers.tmpl` |
+| Archive convention | 0 (init) | Superseded-doc rules: move with banner + pointer stub (BL-089) | `docs/archive/README.md` | `archive-readme.tmpl` |
 | Architecture Decision Records | 1-2 | Every major choice with alternatives and rationale | `docs/ADR documentation/NNNN-title.md` | `adr.tmpl` |
 | `CONTRIBUTING.md` | 2 | Coding standards for AI reference | Root | — |
 | `FEATURES.md` | 2+ | Living feature index — what each feature does, interfaces, ADRs, test coverage | Root | `features.tmpl` |

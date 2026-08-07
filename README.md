@@ -4,6 +4,12 @@ A structured software development methodology where a single technically literat
 
 This is not vibe coding. It's a phase-gated, test-driven, documentation-mandatory process with security scanning, threat modeling, and incident response built in.
 
+> ### 📊 New here? See the whole journey in one page
+>
+> **[View the visual workflow diagram](https://kraulerson.github.io/solo-orchestrator/workflow.html)** — a Visio-style walkthrough of the entire process from `./init.sh` to release, written for non-engineers. Each step shows what *you* do on the left and what the *framework* does on the right.
+>
+> Mirror link (works even without GitHub Pages): [raw.githack.com/kraulerson/solo-orchestrator/main/workflow.html](https://raw.githack.com/kraulerson/solo-orchestrator/main/workflow.html)
+
 ### AI Agent: Claude Code
 
 **This framework is built on and tested with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (Anthropic).** The init script, CLAUDE.md configuration, Superpowers plugin, MCP server integrations, and CLI Setup Addendum are all Claude Code-specific.
@@ -35,8 +41,19 @@ The User Guide is your operating manual. The other documents (Builder's Guide, G
 git clone https://github.com/kraulerson/solo-orchestrator.git
 cd solo-orchestrator
 chmod +x init.sh
-./init.sh
+./init.sh --project-dir my-project
 ```
+
+**Where your project lands.** `--project-dir my-project` — a bare folder name —
+creates the project **next to the clone**, as a sibling of `solo-orchestrator/`,
+not inside it. Clone into `~/Code` and you get `~/Code/my-project/` alongside
+`~/Code/solo-orchestrator/`. Give an **absolute path** instead
+(`./init.sh --project-dir ~/work/my-project`) and it is used exactly as written,
+anywhere outside the framework. Running plain `./init.sh` with no flags still
+works and prompts you interactively — the directory question defaults to that
+same sibling path, so you can just press Enter. The one thing init will refuse
+is a target that would write onto the framework itself: the clone, anything
+inside it, or another copy of solo-orchestrator.
 
 > **Preview first?** Run `./init.sh --dry-run` to see what will be installed and created without making any changes.
 
@@ -53,19 +70,32 @@ The init script will:
 1. Authenticate: `claude` (OAuth) and `snyk auth`
 2. Fill out the Intake: run `bash scripts/intake-wizard.sh` for a guided walkthrough (interactive script or AI-assisted conversation), or open `PROJECT_INTAKE.md` directly. For **personal or Private POC projects only**, you can paste the intake form into your AI of choice and work with it to fill out the sections — but read through the result yourself to verify accuracy. Do not use this shortcut for organizational or production projects where intake accuracy drives compliance decisions.
 3. For organizational deployments: complete governance pre-conditions — or use a POC mode (Sponsored or Private) to defer non-technical approvals while you validate the framework
-4. Start Claude Code and give it the full project context:
+4. Start Claude Code **from inside your generated project directory** — and let
+   your project print its own first message rather than composing one by hand:
+   ```bash
+   cd ../my-project         # the SIBLING init created, not the framework clone
+   bash scripts/resume.sh   # prints the exact first message — copy it
+   claude                   # paste it as your very first message
    ```
-   Read the following files in order, then confirm what you understand about
-   this project before taking any action:
-   1. CLAUDE.md (your instructions and constraints)
-   2. PROJECT_INTAKE.md (the product definition)
-   3. docs/reference/builders-guide.md (the phase-gate methodology)
-   4. docs/platform-modules/<your-platform>.md (platform-specific guidance)
-   5. .claude/phase-state.json (current phase)
-   After reading, summarize: the project goal, your constraints, the current
-   phase, and what tools/MCP servers are available to you. Then begin Phase 0.
-   Ask me only for clarifying questions.
-   ```
+   `scripts/resume.sh` is copied into your project by the init script, so it
+   **does not exist in this framework repo** — it becomes available once init
+   has created your project, and not before. The same is true of everything the
+   message it prints will name (`CLAUDE.md`, `PROJECT_INTAKE.md`,
+   `docs/reference/`, `.claude/`): those live in your generated project.
+
+   The script is state-aware, so the message is right wherever you actually
+   stopped:
+   - **Intake not finished** — a prompt asking Claude to walk you through the
+     unfilled sections of `PROJECT_INTAKE.md`, writing your answers into the
+     file as you go.
+   - **Intake finished, Phase 0 not started** — your project's own Section 13
+     *Agent Initialization Prompt*, printed verbatim out of your
+     `PROJECT_INTAKE.md`. That is the prompt that points the agent at the
+     Intake, the Builder's Guide, and your Platform Module, and starts Phase 0.
+   - **Work already under way** — a resume prompt carrying your current phase,
+     recent commits, and tool-version status.
+
+   The script brackets the message with a `--- Copy everything below this line into Claude Code ---` banner and a matching `--- End ... ---` line; copy what sits between them. **A blank Claude Code screen means it is ready and waiting, not stuck** — nothing happens until you send that first message.
 
 See the [User Guide](docs/user-guide.md) for detailed walkthrough of each step.
 
@@ -75,7 +105,7 @@ See the [User Guide](docs/user-guide.md) for detailed walkthrough of each step.
 
 - **Phase-gated development** — Five phases (Discovery, Architecture, Construction, Validation, Release) with explicit gate criteria. No skipping ahead.
 - **Security by default** — SAST (Semgrep), secret detection (gitleaks), dependency scanning (Snyk), license compliance, and DAST (OWASP ZAP) installed and configured automatically. CI pipeline blocks merges on findings.
-- **Test-driven development** — Tests first, implementation second. Pre-commit hooks warn when implementation ships without tests.
+- **Test-driven development** — Tests first, implementation second. A tier-keyed commit-time gate hard-blocks a `feat`/`fix`/`refactor` commit that ships implementation with no accompanying test on Sponsored-POC and Production projects (a logged warning on Personal and Private POC), with a recorded attestation escape for integration surfaces that can't carry a unit test.
 - **9 languages, extensible to any** — TypeScript, Python, Rust, Go, C#, Kotlin, Java, Dart, Swift ship out of the box. Need C++? Drop one CI template at `templates/pipelines/ci/cpp.yml` — it appears as a language option automatically.
 - **4 platforms, extensible to any** — Web, desktop, mobile, and MCP server ship out of the box. Need Azure Microservices? Drop a platform module at `docs/platform-modules/azure-microservices.md` and a release pipeline at `templates/pipelines/release/azure-microservices.yml` — it appears as a platform option automatically. **No code changes to the init script.** The framework auto-discovers platforms and languages from the file system. See [Modular Architecture](#modular-architecture) for details.
 - **Enterprise governance** — Approval authorities, compliance screening, insurance requirements, backup maintainer, and audit trail. Full documentation suite for CIO/CISO/Legal review.
@@ -89,11 +119,13 @@ See the [User Guide](docs/user-guide.md) for detailed walkthrough of each step.
 | Tool | Required | Install |
 |---|---|---|
 | **Git** | Yes | Init script offers to install automatically (brew/apt/dnf). Or install manually: [git-scm.com](https://git-scm.com/downloads) |
-| **Node.js** | Yes | Floor: 18.17+ (matches init script version check). **Recommended: 20 LTS or 22 LTS** — Node 18 reached end-of-life April 2025, so new installs should pick a supported LTS. Init script offers to install automatically. Required as infrastructure tooling (Snyk CLI, license-checker) regardless of your project language. Also the runtime for JS/TS projects. |
+| **Node.js** | Yes | Floor: 18+ (the init script checks the major version). **Recommended: 20 LTS or 22 LTS** — Node 18 reached end-of-life April 2025, so new installs should pick a supported LTS. Init script offers to install automatically. Required as infrastructure tooling (Snyk CLI, license-checker) regardless of your project language. Also the runtime for JS/TS projects. |
 | **Language runtime** | Yes | Python, Rust/Cargo, .NET SDK, JDK, Go, or Flutter (if not using Node.js/TypeScript). Init script offers to install your selected runtime automatically. |
 | **jq** | Yes | Init script offers to install automatically (brew/apt/dnf). Required by the Development Guardrails for Claude Code for JSON operations. |
+| **Git host CLI** (`gh` or `glab`) | Yes, if using GitHub or GitLab (default host: GitHub) | **Install and authenticate BEFORE running init** — not auto-installed. Interactive runs discover a missing/unauthenticated CLI partway through the run, right before repo creation. `--non-interactive` runs preflight CLI *presence* up front and fail fast — but neither mode ever checks authentication ahead of time, so `gh auth login` / `glab auth login` first regardless of mode. `gh` (GitHub): `brew install gh` (macOS) or [Linux install](https://github.com/cli/cli/blob/trunk/docs/install_linux.md), then `gh auth login`. `glab` (GitLab): `brew install glab`, then `glab auth login`. **Bitbucket** needs no CLI (just `curl`, which ships by default on macOS/Linux) — export `BITBUCKET_API_TOKEN` + `BITBUCKET_API_TOKEN_EMAIL` + `BITBUCKET_WORKSPACE` instead (legacy `BITBUCKET_USER`/`BITBUCKET_APP_PASSWORD` also accepted). `--git-host other` needs neither. Full instructions: [CLI Setup Addendum § Git Host CLIs](docs/cli-setup-addendum.md#git-host-clis). |
 | **Docker** | Recommended | Init script offers to install automatically. macOS: choice of Colima (recommended — headless, no license required, auto-starts on boot) or Docker Desktop. Linux: system package with systemd auto-start. Used by Qdrant (persistent semantic memory) and OWASP ZAP (DAST scanning). |
 | **Claude Code** | Recommended | Installed by init script. Framework is optimized for Claude Code; other AI coding agents can use the methodology but the CLI Setup Addendum and Phase 2 workflow accelerators are Claude Code-specific. |
+| **GPG** | Optional | Used for commit signing. Init's tool plan offers to install it — macOS: `brew install gnupg`; Linux: gnupg/gnupg2 via your package manager (apt/dnf/pacman). |
 
 Init also auto-installs security tooling: Semgrep (SAST), gitleaks (secret detection), Snyk CLI (dependency scanning), Lighthouse (web performance), and OWASP ZAP (DAST, requires Docker).
 
@@ -108,6 +140,11 @@ wsl --install
 # After restart, open Ubuntu from the Start menu
 # Install Git and jq (needed before init can run):
 sudo apt install -y git jq
+
+# If you'll use GitHub or GitLab, install + authenticate the host CLI too
+# (not auto-installed — see Prerequisites table above):
+#   gh:   https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+#   glab: https://gitlab.com/gitlab-org/cli/-/releases
 
 # Clone and run from within WSL, not from Windows
 # The init script will offer to install Node.js and other prerequisites
@@ -141,7 +178,8 @@ your-project/
 │   └── release.yml                       # Release pipeline — platform-specific
 ├── .gitignore                             # Language + platform-appropriate ignores
 ├── .git/hooks/
-│   └── pre-commit                        # Secret detection + SAST quick scan
+│   ├── pre-commit                        # Secret detection + SAST quick scan
+│   └── commit-msg                        # Tier-keyed TDD-ordering gate + Build-Loop commit-message check
 ├── .claude/
 │   ├── framework/                        # Development Guardrails for Claude Code (gates, hooks, rules)
 │   ├── manifest.json                     # CDF config: pinned commit, active profile, active rules/hooks
@@ -197,10 +235,10 @@ your-project/
 │   ├── session-test-gate-check.sh         # SessionStart hook: test gate + MCP gate init
 │   ├── session-mcp-gate.sh                # PreToolUse hook: block Write/Edit until MCP called
 │   ├── session-end-qdrant-reminder.sh     # Stop hook: Qdrant storage reminder
-│   ├── resume.sh                          # Session resume prompt generator
+│   ├── resume.sh                          # Prints the exact first message to paste (state-aware: intake / Phase 0 / resume)
 │   └── lib/helpers.sh                     # Shared shell helpers (colors, logging, MCP detection)
 ├── templates/
-│   ├── generated/                         # 26 .tmpl files (CLAUDE.md, Manifesto, Bible, ADR, ...)
+│   ├── generated/                         # 24 .tmpl files (CLAUDE.md, Manifesto, Bible, ADR, ...)
 │   ├── tool-matrix/                       # Tool resolution matrix per platform
 │   │   ├── common.json                    # Universal tools (git, node, jq, docker, ...)
 │   │   ├── web.json
@@ -332,10 +370,10 @@ Each phase produces artifacts that gate entry into the next phase. The AI execut
 ### The Workflow
 
 1. **Fill out the Intake** — run `bash scripts/intake-wizard.sh` for a guided walkthrough, or open `PROJECT_INTAKE.md` directly
-2. **Start Claude Code** — point it at the Intake and Builder's Guide
+2. **Start Claude Code** — paste the first message printed by `bash scripts/resume.sh`; it points the agent at the Intake, the Builder's Guide, and your Platform Module
 3. **The agent executes each phase** — asking you only for clarifying questions and approval at decision gates
 4. **You review at decision gates** — architecture selection, test assertions, security scan results, go-live readiness
-5. **Phase 3 validates everything** — security scans, integration tests, accessibility audit, threat model verification. Zero critical findings before proceeding.
+5. **Phase 3 validates everything** — five validation scanners (full-tree Semgrep, license compliance with a tier-keyed strong-copyleft deny policy, Snyk, OWASP ZAP DAST, threat-model verification), integration tests, and accessibility audit. The Phase 3→4 gate refuses to advance until every scanner reports pass or carries a signed skip attestation. Zero critical findings before proceeding.
 6. **Phase 4 releases** (full path) or **confirms ready to deploy** (POC path)
 
 The [User Guide](docs/user-guide.md) walks through each step in detail — what you do, what the agent does, what external approvals are needed (organizational), and what output to expect at each phase.
@@ -522,11 +560,11 @@ The methodology, intake template, platform modules, and CI pipeline templates ar
 
 ## Known Limitations
 
-- **Enforcement has two mechanical layers but gaps remain.** The CI pipeline (SAST, dependency audit, license checking, tests) blocks merges on failure. The Development Guardrails for Claude Code pre-commit hooks (gitleaks, Semgrep) catch issues at commit time locally. Together these provide mechanical enforcement for security, testing, and code quality. However, phase gates, TDD ordering, scope control, and documentation updates currently rely on the AI agent following CLAUDE.md instructions and the human reviewing at decision gates. These are Tier 3 (guided) controls with no automated backstop yet.
+- **Enforcement has mechanical layers but some gaps remain.** The CI pipeline (SAST, dependency audit, license checking, tests) blocks merges on failure. The Development Guardrails for Claude Code pre-commit hooks (gitleaks, Semgrep) catch issues at commit time locally. **TDD ordering is now a tier-keyed commit-time gate (BL-072): a `feat`/`fix`/`refactor` commit that ships implementation with no accompanying test is a HARD BLOCK on Sponsored-POC / Production projects (keyed on `deployment` + `poc_mode`, not the spoofable `track`) and a logged WARNING on Personal / Private-POC projects — with a recorded `SOLO_TDD_ATTESTED=1` escape hatch for the integration surfaces that cannot carry a fast-lane unit test.** Together these provide mechanical enforcement for security, testing, and code quality. Phase transitions are backstopped too: `scripts/test-gate.sh` blocks Phase 2→3 while SEV-1/2 bugs are open, and `scripts/check-phase-gate.sh` refuses Phase 3→4 until all five validation scanners pass or carry a signed skip attestation (the summary is bound to the tree it validated, so a stale or dirty summary is never silently trusted). Scope control and documentation updates still rely on the AI agent following CLAUDE.md instructions and the human reviewing at decision gates — these remain Tier 3 (guided) controls with no automated backstop yet.
 - **Release pipelines require configuration.** CI pipelines work immediately on first push. Release pipelines are templates with TODOs for code signing, deployment secrets, and store credentials that must be configured before first release.
 - **Docker is local only.** OWASP ZAP and Qdrant run as local Docker containers (via Colima or Docker Desktop on macOS, system Docker on Linux). Remote Docker hosts and network-accessible containers are not yet supported.
 - **Linux package manager support covers apt, dnf, and pacman.** Alpine (apk) and other distributions require manual tool installation. The init script auto-detects brew (macOS), apt (Debian/Ubuntu), dnf (Fedora/RHEL), and pacman (Arch/Manjaro).
-- **CI/CD templates are GitHub Actions only.** The framework provides pipeline templates for GitHub Actions. GitLab CI and Azure DevOps are supported as repository hosts, but pipeline templates must be translated manually.
+- **CI/CD templates ship for GitHub Actions, GitLab CI, and Bitbucket Pipelines.** `init.sh` auto-selects the host-specific tree from `templates/pipelines/ci/<host>/` and `templates/pipelines/release/<host>/` based on `--git-host`. Azure DevOps templates are not yet provided; pick host `other` and supply your own. See `docs/extending-platforms.md` for the contributor guidance on keeping the three host trees in sync.
 - **Single language per init.** The init script generates CI for one primary language. Polyglot projects (e.g., TypeScript frontend + Python backend) require manual addition of CI steps for secondary languages.
 - **Not yet validated through an organizational pilot.** The framework has been used by the author to build two cross-platform MVP applications (K-PDF, MeshScope), validating Phases 0-2. The pilot evaluation process (Executive Review, Section X) defines how to test it organizationally. Treat this as a methodology with demonstrated personal-project results, not yet organizationally proven.
 
@@ -542,7 +580,7 @@ This is the initial release of the Solo Orchestrator Framework. It has been used
 
 | Document | Role | Version | Date |
 |---|---|---|---|
-| **User Guide** | **Follow step-by-step** | v1.3 | 2026-04-10 |
+| **User Guide** | **Follow step-by-step** | v1.5 | 2026-08-01 |
 | **Project Intake Template** | **Fill out (wizard helps)** | v1.0 | 2026-04-02 |
 | **Platform Modules** (Web, Desktop, Mobile, MCP Server) | **Reference during build** | v1.0 | 2026-04-02 / 2026-04-10 |
 | Builder's Guide | Reference — advanced methodology detail | v1.1 | 2026-04-10 |

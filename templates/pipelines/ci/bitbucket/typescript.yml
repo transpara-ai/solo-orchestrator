@@ -1,4 +1,4 @@
-# solo-orchestrator: platforms=web,desktop,mobile,mcp-server
+# solo-orchestrator: platforms=web,desktop,mobile,mcp_server
 image: node:20
 
 definitions:
@@ -17,17 +17,38 @@ pipelines:
               - npm test -- --ci
         - step:
             name: SAST
-            image: returntocorp/semgrep
-            script: [semgrep --config=p/security-audit --error]
+            # BL-201-FLOAT: the tag floats deliberately — a pinned scanner silently stops catching new vulnerabilities (backlog BL-201); the job logs semgrep --version. Do not re-pin without reversing that decision.
+            image: semgrep/semgrep:latest
+            script: [semgrep --version, semgrep scan --config=p/owasp-top-ten --config=r/javascript.browser.security.insecure-document-method --config=.semgrep/soif-dom-sinks.yml --severity=ERROR --error]
         - step:
             name: Secrets
-            image: zricethezav/gitleaks:latest
-            script: [gitleaks detect --source . --verbose --redact]
+            image: ghcr.io/gitleaks/gitleaks:v8.30.1
+            script: [gitleaks dir . --verbose --redact]
         - step:
             name: Dependencies
             caches: [node]
-            script: [npm ci, npm audit --audit-level=moderate]
+            # BL-160-AUDIT-SCOPE: blocking arm audits shipped deps only
+            # (--omit=dev); dev-toolchain advisories loud, non-blocking
+            # (BL-122/BL-149 false-FAIL doctrine — never a silent skip).
+            script:
+              - npm ci
+              - npm audit --omit=dev --audit-level=moderate
+              - 'npm audit --audit-level=moderate || echo "WARNING dev-toolchain advisories or audit failure (non-blocking) - run npm audit locally"'
     - step:
         name: Governance
         image: bash:5
+        # PHASE-GATE CREDENTIALS (walk ISSUE-006): the Phase 1-2 branch-protection backstop needs a host API token this runner does not have.
+        # This step installs only jq+git: there is no curl client and no Bitbucket
+        # credential. So that ONE check prints a loud [WARN] "could NOT run" here
+        # instead of failing the step. It is UNVERIFIED on this runner, NOT
+        # satisfied, and it still BLOCKS on the dev workstation
+        # (scripts/check-gate.sh --preflight).
+        # >> STRONGLY RECOMMENDED — clear this warning permanently. BOTH halves are
+        # required, and the check still cannot run with only one of them:
+        #   1. repository variables BITBUCKET_API_TOKEN + BITBUCKET_API_TOKEN_EMAIL
+        #      (or the legacy BITBUCKET_APP_PASSWORD + BITBUCKET_USER), set under
+        #      Repository settings > Repository variables;
+        #   2. curl installed in this step.
+        # `scripts/check-gate.sh --setup-ci-token` prints these steps for Bitbucket.
+        # A warning nobody clears is a check nobody reads.
         script: [apk add --no-cache jq git, bash scripts/check-phase-gate.sh]

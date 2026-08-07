@@ -39,35 +39,35 @@ n1_happy_path() {
 }
 
 n11_invalid_platform() {
-  local out; out=$(run_validate --project p --platform foo --deployment personal --language ts)
+  local out; out=$(run_validate --project p --platform foo --deployment personal --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N11" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--platform"* ]] || { fail_ "N11" "stderr should mention --platform: ${out##*|}"; return; }
   pass "N11: invalid --platform → exit 1 with platform listed"
 }
 
 n12_invalid_project_name() {
-  local out; out=$(run_validate --project "Foo!" --platform web --deployment personal --language ts)
+  local out; out=$(run_validate --project "Foo!" --platform web --deployment personal --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N12" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"project"* ]] || { fail_ "N12" "stderr should mention project: ${out##*|}"; return; }
   pass "N12: invalid --project name → exit 1 with naming-rule message"
 }
 
 n2_missing_project() {
-  local out; out=$(run_validate --platform web --deployment personal --language ts)
+  local out; out=$(run_validate --platform web --deployment personal --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N2" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--project"* ]] || { fail_ "N2" "stderr should mention --project: ${out##*|}"; return; }
   pass "N2: missing --project → exit 1"
 }
 
 n3_missing_platform() {
-  local out; out=$(run_validate --project p --deployment personal --language ts)
+  local out; out=$(run_validate --project p --deployment personal --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N3" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--platform"* ]] || { fail_ "N3" "stderr should mention --platform: ${out##*|}"; return; }
   pass "N3: missing --platform → exit 1"
 }
 
 n4_missing_deployment() {
-  local out; out=$(run_validate --project p --platform web --language ts)
+  local out; out=$(run_validate --project p --platform web --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N4" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--deployment"* ]] || { fail_ "N4" "stderr should mention --deployment: ${out##*|}"; return; }
   pass "N4: missing --deployment → exit 1"
@@ -81,51 +81,129 @@ n5_missing_language() {
 }
 
 n6_org_without_govmode() {
-  local out; out=$(run_validate --project p --platform web --deployment organizational --language ts)
+  local out; out=$(run_validate --project p --platform web --deployment organizational --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N6" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--gov-mode"* ]] || { fail_ "N6" "stderr should mention --gov-mode: ${out##*|}"; return; }
   pass "N6: --deployment=organizational without --gov-mode → exit 1"
 }
 
-n7_personal_with_govmode() {
-  local out; out=$(run_validate --project p --platform web --deployment personal --gov-mode production --language ts)
+# N7 pins that a personal deployment paired with a gov-mode that is INVALID
+# for personal is rejected. The rejected combo is personal + sponsored_poc
+# (Sponsored POC is always organizational per baseline §2.5 / tier-crosscheck-2).
+# NOTE: personal + production is NOT rejected — production is valid for both
+# deployments — so N7 must not assert on that combo (the original did and was
+# stale against the current product).
+n7_personal_with_invalid_govmode() {
+  local out; out=$(run_validate --project p --platform web --deployment personal --gov-mode sponsored_poc --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N7" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--gov-mode"* ]] || { fail_ "N7" "stderr should mention --gov-mode: ${out##*|}"; return; }
-  pass "N7: --deployment=personal with --gov-mode → exit 1"
+  pass "N7: --deployment=personal with --gov-mode=sponsored_poc (invalid for personal) → exit 1"
+}
+
+# BL-129 (Dogfood-2 F-DF2-001): --help-non-interactive said --gov-mode is
+# "NOT VALID when --deployment=personal" while the CODE accepts
+# personal+private_poc (the ONLY way to reach Private POC, per baseline §2.5 /
+# tier-crosscheck-2) and REJECTS organizational+private_poc — following the
+# help verbatim got you rejected. THE SCRIPTS WIN → the help must state the
+# real mapping. N30 pins the help text to the truth (and pins the false claim
+# OUT); N31/N32 pin the code mapping in both directions so help and code
+# cannot drift apart silently again.
+n30_bl129_help_states_real_govmode_mapping() {
+  local htxt
+  htxt=$("$INIT_SH" --help-non-interactive 2>&1 || true)  # lint-no-live-remote: allow help-only invocation prints usage and exits before any remote logic
+  if printf '%s' "$htxt" | grep -q "NOT VALID when --deployment=personal"; then
+    fail_ "N30" "--help-non-interactive still carries the FALSE claim 'NOT VALID when --deployment=personal' (BL-129: personal+private_poc is the only valid Private-POC pairing)"; return
+  fi
+  printf '%s' "$htxt" | grep -q "production, sponsored_poc" || { fail_ "N30" "help does not state the organizational mapping (production, sponsored_poc)"; return; }
+  printf '%s' "$htxt" | grep -q "production, private_poc" || { fail_ "N30" "help does not state the personal mapping (production, private_poc)"; return; }
+  pass "N30: --help-non-interactive states the real gov-mode mapping (BL-129)"
+}
+
+n31_bl129_personal_private_poc_accepted() {
+  local out; out=$(run_validate --project p --platform web --deployment personal --gov-mode private_poc --language typescript)
+  [ "${out%%|*}" = "0" ] || { fail_ "N31" "personal+private_poc REJECTED (rc=${out%%|*}) — the one valid Private-POC pairing must validate: ${out##*|}"; return; }
+  pass "N31: --deployment=personal with --gov-mode=private_poc → exit 0 (BL-129)"
+}
+
+n32_bl129_org_private_poc_rejected() {
+  local out; out=$(run_validate --project p --platform web --deployment organizational --gov-mode private_poc --language typescript --visibility public)
+  [ "${out%%|*}" = "1" ] || { fail_ "N32" "organizational+private_poc ACCEPTED (rc=${out%%|*}) — baseline §2.5: Private POC is always personal"; return; }
+  [[ "${out##*|}" == *"not valid for --deployment=organizational"* ]] || { fail_ "N32" "stderr should name the invalid pairing: ${out##*|}"; return; }
+  pass "N32: --deployment=organizational with --gov-mode=private_poc → exit 1 (BL-129)"
 }
 
 n8_other_without_remoteurl() {
-  local out; out=$(run_validate --project p --platform web --deployment personal --language ts --git-host other)
+  local out; out=$(run_validate --project p --platform web --deployment personal --language typescript --git-host other)
   [ "${out%%|*}" = "1" ] || { fail_ "N8" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--remote-url"* ]] || { fail_ "N8" "stderr should mention --remote-url: ${out##*|}"; return; }
   pass "N8: --git-host=other without --remote-url → exit 1"
 }
 
 n9_other_without_attest() {
-  local out; out=$(run_validate --project p --platform web --deployment personal --language ts --git-host other --remote-url https://example.com/x)
+  local out; out=$(run_validate --project p --platform web --deployment personal --language typescript --git-host other --remote-url https://example.com/x)
   [ "${out%%|*}" = "1" ] || { fail_ "N9" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--branch-protection-attested"* ]] || { fail_ "N9" "stderr should mention --branch-protection-attested: ${out##*|}"; return; }
   pass "N9: --git-host=other without --branch-protection-attested → exit 1"
 }
 
 n10_org_with_public_visibility() {
-  local out; out=$(run_validate --project p --platform web --deployment organizational --gov-mode production --language ts --visibility public)
+  local out; out=$(run_validate --project p --platform web --deployment organizational --gov-mode production --language typescript --visibility public)
   [ "${out%%|*}" = "1" ] || { fail_ "N10" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"--visibility=public"* ]] || { fail_ "N10" "stderr should explain org-forces-private: ${out##*|}"; return; }
   pass "N10: --deployment=organizational + --visibility=public → exit 1"
 }
 
 n13_invalid_language_for_platform() {
-  # If the platform's intake-suggestions JSON doesn't expose a language list, this
-  # test is a soft-no-op (passes by default because check is skipped) — that's
-  # acceptable: it documents intent without false-failing on schema variance.
+  # Audit code-init-sh-5 + specs-plans-init-intake-noninteractive-5: the
+  # Pass-2 language-for-platform check MUST be strict (no soft-no-op). It
+  # walks templates/pipelines/ci/github/*.yml and accepts only languages
+  # whose template marker lists the requested platform.
+  # mcp_server platform allows: python, typescript, other (per CI markers).
+  # swift on mcp_server is invalid and must exit 1.
   local out; out=$(run_validate --project p --platform mcp_server --deployment personal --language swift)
-  if [ "${out%%|*}" = "0" ]; then
-    pass "N13: invalid --language for platform — check skipped (intake-suggestions schema does not expose language list)"
+  [ "${out%%|*}" = "1" ] || { fail_ "N13" "expected exit 1 for swift on mcp_server, got: $out"; return; }
+  [[ "${out##*|}" == *"language"* ]] || { fail_ "N13" "stderr should mention language: ${out##*|}"; return; }
+  [[ "${out##*|}" == *"mcp_server"* ]] || { fail_ "N13" "stderr should mention platform mcp_server: ${out##*|}"; return; }
+  pass "N13: invalid --language for platform → exit 1 (hard fail, not soft no-op)"
+}
+
+n27_invalid_language_lists_supported() {
+  # Audit code-init-sh-5: the failure message must enumerate the platform's
+  # actually-supported languages so the user can re-run with a valid value.
+  # dart's CI template marker is `platforms=mobile`, so dart on web must fail.
+  local out; out=$(run_validate --project p --platform web --deployment personal --language dart)
+  [ "${out%%|*}" = "1" ] || { fail_ "N27" "expected exit 1 for dart on web, got: $out"; return; }
+  # web platform supports typescript, python, java, csharp, go, rust, kotlin per CI markers
+  [[ "${out##*|}" == *"typescript"* ]] || { fail_ "N27" "stderr should list typescript as supported for web: ${out##*|}"; return; }
+  [[ "${out##*|}" == *"python"* ]] || { fail_ "N27" "stderr should list python as supported for web: ${out##*|}"; return; }
+  pass "N27: invalid --language lists actually-supported languages from CI templates"
+}
+
+n28_swift_on_linux_blocked() {
+  # Audit code-init-sh-5: mirror the interactive Linux/Swift OS-compatibility
+  # block (init.sh:506-537). Swift requires macOS (Xcode toolchain).
+  # We can't change OS_TYPE easily, so only assert on Linux hosts.
+  if [ "$(uname -s)" != "Linux" ]; then
+    pass "N28: Swift-on-Linux OS-incompatibility block — skipped (test host is $(uname -s), check is Linux-only)"
     return
   fi
-  [[ "${out##*|}" == *"language"* ]] || { fail_ "N13" "stderr should mention language validity: ${out##*|}"; return; }
-  pass "N13: invalid --language for platform → exit 1"
+  local out; out=$(run_validate --project p --platform mobile --deployment personal --language swift)
+  [ "${out%%|*}" = "1" ] || { fail_ "N28" "expected exit 1 for swift on Linux, got: $out"; return; }
+  [[ "${out##*|}" == *"macOS"* || "${out##*|}" == *"Xcode"* ]] \
+    || { fail_ "N28" "stderr should mention macOS/Xcode requirement: ${out##*|}"; return; }
+  pass "N28: --language=swift on Linux → exit 1 (OS-incompatibility block)"
+}
+
+n29_mcp_server_platform_alias() {
+  # Audit specs-plans-init-intake-noninteractive-3: the suggestion-file set
+  # ships mcp_server.json (not cli.json). Confirm mcp_server is a first-class
+  # platform value in non-interactive mode and that typescript/python (the
+  # languages with CI templates marking mcp_server) both validate.
+  local out; out=$(run_validate --project p --platform mcp_server --deployment personal --language typescript)
+  [ "${out%%|*}" = "0" ] || { fail_ "N29a" "expected exit 0 for typescript on mcp_server, got: $out"; return; }
+  out=$(run_validate --project p --platform mcp_server --deployment personal --language python)
+  [ "${out%%|*}" = "0" ] || { fail_ "N29b" "expected exit 0 for python on mcp_server, got: $out"; return; }
+  pass "N29: mcp_server platform accepts typescript and python (matches shipped suggestion file)"
 }
 
 n20_validate_only_success() {
@@ -140,7 +218,7 @@ n20_validate_only_success() {
 }
 
 n21_validate_only_failure() {
-  local out; out=$(run_validate --platform web --deployment personal --language ts)
+  local out; out=$(run_validate --platform web --deployment personal --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N21" "expected exit 1, got: $out"; return; }
   pass "N21: --validate-only failure → exit 1 with same error as real run"
 }
@@ -185,7 +263,7 @@ JSON
 }
 
 n16_config_not_found() {
-  local out; out=$(run_validate --config /nonexistent/path/init.json --project p --platform web --deployment personal --language ts)
+  local out; out=$(run_validate --config /nonexistent/path/init.json --project p --platform web --deployment personal --language typescript)
   [ "${out%%|*}" = "1" ] || { fail_ "N16" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"not found"* ]] || { fail_ "N16" "stderr should mention 'not found': ${out##*|}"; return; }
   pass "N16: --config file not found → exit 1"
@@ -195,7 +273,7 @@ n17_config_malformed_json() {
   local cfg
   cfg=$(mktemp)
   echo '{"project": "p"' > "$cfg"
-  local out; out=$(run_validate --config "$cfg" --project p --platform web --deployment personal --language ts)
+  local out; out=$(run_validate --config "$cfg" --project p --platform web --deployment personal --language typescript)
   rm -f "$cfg"
   [ "${out%%|*}" = "1" ] || { fail_ "N17" "expected exit 1, got: $out"; return; }
   [[ "${out##*|}" == *"not valid JSON"* ]] || { fail_ "N17" "stderr should mention 'not valid JSON': ${out##*|}"; return; }
@@ -279,7 +357,7 @@ n3_missing_platform
 n4_missing_deployment
 n5_missing_language
 n6_org_without_govmode
-n7_personal_with_govmode
+n7_personal_with_invalid_govmode
 n8_other_without_remoteurl
 n9_other_without_attest
 n10_org_with_public_visibility
@@ -299,6 +377,12 @@ n23_dir_exists_no_allow_flag
 n24_default_track
 n25_default_git_host_visibility
 n26_default_project_dir
+n27_invalid_language_lists_supported
+n28_swift_on_linux_blocked
+n29_mcp_server_platform_alias
+n30_bl129_help_states_real_govmode_mapping
+n31_bl129_personal_private_poc_accepted
+n32_bl129_org_private_poc_rejected
 
 echo ""
 echo "== Total: $((PASSED + FAILED)) | Passed: $PASSED | Failed: $FAILED =="
