@@ -5,12 +5,12 @@
 | Field | Value |
 |---|---|
 | **Document ID** | DELTA-001-ARCH |
-| **Version** | v1.1, 2026-08-02 — **review-r1 folded** (`major_concerns`; fidelity verdict **FAITHFUL** — all eight settled decisions intact, all twelve v1.0 §14 rows independently reproduced). One mandatory finding and six one-liners, all mapped in §0.2. No decision table, adopted mechanism, or WP boundary changed; WP6 gains one deliverable. The mandatory finding was a **docblock-trusted claim that was never executed** — the one such claim in a document that logs fourteen runs. |
+| **Version** | v1.2, 2026-08-09 — **build-evidence amendment folded** (Karl's approval, 2026-08-09). Two corrections the implementers *proved by execution*, mapped in §0.2: §3.1's severability revert is **six** consumers and not one (enumerated by running the test, across three review rounds), and §3.3's CORE set gains `scripts/host-drivers/*.sh` (a planted `core → delta` source line passed the lint at rc=0) — plus **A-DT-3**, the front-matter correction they forced: the "Status of the thing described" row below no longer says "Nothing is built". No settled decision, decision table, adopted mechanism, or WP boundary changed. · v1.1, 2026-08-02 — **review-r1 folded** (`major_concerns`; fidelity verdict **FAITHFUL** — all eight settled decisions intact, all twelve v1.0 §14 rows independently reproduced). One mandatory finding and six one-liners, all mapped in §0.2. No decision table, adopted mechanism, or WP boundary changed; WP6 gains one deliverable. The mandatory finding was a **docblock-trusted claim that was never executed** — the one such claim in a document that logs fourteen runs. |
 | **Classification** | Product architecture — normative-once-reviewed for the build |
 | **Audience** | (a) the adversarial design reviewer this document must survive; (b) the session that plans and builds the work packages in §11 |
 | **Product** | **The Delta Track** — the maintenance and feature lifecycle a Solo Orchestrator project runs *after* it cuts v1.0.0 |
 | **Companion documents** | `docs/builders-guide.md` (Phases 0–4, the Build Loop, Step 4.4 maintenance cadences) · `docs/governance-framework.md` (§ VII Post-Release Vulnerability Response, § X Graduation) · `docs/designs/2026-07-24-operating-model-v1.md` (the house exemplar for this document's shape) · `docs/designs/2026-08-02-team-orchestrator-v1.md` (a sibling design that forks this asset base) |
-| **Status of the thing described** | **Nothing is built.** No `docs/deltas/`, no `.claude/delta-state.json`, no `scripts/cut-release.sh`, no `scripts/lib/delta-*.sh` exists in this tree — verified 2026-08-02 (§14-V11). Every "exists today" claim below is about the *existing* framework, which the delta track consumes rather than replaces. |
+| **Status of the thing described** | **BUILT and SHIPPING as of 2026-08-10 — WP0–WP8 have shipped, and WP9 (the docs) is landing with this amendment.** *(v1.2.1 correction: this row said "WP0–WP7 have shipped; WP8 and WP9 have not" and named `resume.sh` as carrying **zero** delta references. WP8 merged as PR #339 and that clause is now false — `resume.sh` carries the `DELTA-RESUME` fence, which is also consumer 5 of §3.1's revert set. v1.2 correction, kept: the row read "Nothing is built … verified 2026-08-02 (§14-V11)" through v1.1; that verification was accurate at its commit.)* **Built in this tree:** the inherited-predicate pins (WP0, PR #323); `scripts/lint-delta-boundary.sh` (WP1, PR #324); `scripts/lib/delta-state.sh`, `delta-policy.sh` and the `process-checklist.sh` `DELTA-SEAM` fence (WP2, PR #327); the era invariant and `delta-classify.sh` (WP3, PR #328); the per-class gates and close-rubric bind (WP4, PR #330); the hotfix lane and retro ledger (WP5, PR #332); `delta-cadence.sh` with the `check-maintenance.sh` rewire, the `DELTA-` row in `identifiers.tmpl` and the builders-guide Step 4.4 reconciliation (WP6, PR #333); `scripts/cut-release.sh` plus the severability test (WP7, PR #334); the three intake paths, `templates/generated/delta-brief.tmpl`, the ledger row, the `resume.sh` fourth branch and **the `init.sh` shipping of the whole module into generated projects** (WP8, PR #339); and the release cut's ledger-row close with its new exit 12 (PR #341). **The user-facing guide is `docs/delta-track.md`** (WP9). **One built lane is production-unreachable and named rather than assumed:** the `breaking` marker has **no writer** — §9.1's major row and §8.2's full revalidation are implemented and tested, but nothing in `delta.sh`'s close pathway sets the field `cut-release.sh` reads, so every real cut computes minor or patch (`## BL-219:`; its sibling `## BL-220:` records that severing the module takes `check-maintenance.sh`'s only coverage with it — `cut-release.sh`'s header called both "filed as a tracked item" and neither was, which is why the two entries now exist). `docs/deltas/` and `.claude/delta-state.json` still do not exist *here*, and never will: they are **generated-project** artifacts, not framework-repo ones. The v1.0 row cited their absence as evidence that nothing was built — a reading that was true then and is misleading now. **Every "exists today" claim below is stamped 2026-08-02** and is about the *existing* framework the delta track consumes rather than replaces; §14 is a log of what those commands returned at that commit, not a standing property. |
 
 **Provenance.** Every architecture decision in §0.1 was made **by Karl in a joint working
 session on 2026-08-02**. This document **transcribes** those decisions into the house design
@@ -106,6 +106,77 @@ free for the author.
 | **D8** | **Verified corrections to carry honestly.** No mechanical queue-interrupt exists for SEV-1 — the shipped Severity Guide's "must fix immediately", the deferral prohibition, and the gate block are the enforcement, and the document **must not claim a queue mechanism**. A fix rides the **NEXT** UAT session (the batch counter counts *features*). Today's bug/feature workflow instructions are **retrieval surfaces** (guide + ledger headers); the ambient session-greeting branch is what closes that gap. | §0.3, §5.4, §10.5 | — (transcribed; §0.3-C5 strengthens one half and narrows another) |
 
 ### §0.2 — Amendment changelog
+
+**v1.2.1 (2026-08-10) — one counted correction, from the WP9 documentation pass.** No settled
+decision, decision table, adopted mechanism, or WP boundary changes.
+
+- **A-DT-4 (REVERT SET, AGAIN) → §3.1 / Document Control** — A-DT-1 below corrected the revert
+  set from **one** to **six**, and **six was stale at the moment it was printed**. WP8 added two
+  consumers — `scripts/resume.sh`'s `DELTA-RESUME` fence and `init.sh`'s **two** `DELTA-INSTALL`
+  fences — and `tests/test-delta-severability.sh` named both by path the first time it ran
+  against the WP8 tree, before this document was amended. **Re-derived by execution on
+  2026-08-10** rather than by adding two rows to reach a number somebody expected: the suite
+  runs 14/14 at rc 0, its m1 mutation reports the dangling references in six scripts
+  (`init.sh`, `check-maintenance.sh`, `process-checklist.sh`, `resume.sh`, `upgrade-project.sh`,
+  `validate.sh`) and its m3 mutation names `.github/workflows/lint.yml` separately, with
+  `tests/full-project-test-suite.sh` the eighth. The Document Control status row is corrected in
+  the same pass, for the reason A-DT-3 records: WP8 has shipped and the row still said it had not.
+- **A-DT-5 (THE NINTH, AND THE LIMIT OF A-DT-4's OWN SAFEGUARD) → §3.1** — A-DT-4 landed with the
+  rule *"re-run the suite rather than quote the number"*, and adversarial review found the one
+  consumer that rule cannot reach. `sever_module` additionally drops the **eleven** delta rows
+  from `.github/workflows/tests.yml`'s unit-lane array (plus the `pin_*` row) and deletes the
+  module's own suites — a real revert surface, in the same file class as the m3 lesson, and
+  without it the unit lane would invoke deleted files at rc 127. But the sever performs it
+  **before** V1's residual sweep, so the sweep sees a clean tree and **no run will ever print
+  it**. §3.1 gains it as row 9, marked as suite-handled-and-unreported, with the safeguard
+  restated honestly: re-running finds consumers the recipe does *not* already handle; reading
+  `sever_module` is the only thing that finds the ones it does. Found by review, not by the
+  instrument — which is itself the argument for the row.
+
+**v1.2 (2026-08-09) — build-evidence amendment. Approved by Karl, 2026-08-09.** Two substantive
+corrections, both **produced by running the thing this document specified** rather than by
+preferring a different wording, plus a third row (A-DT-3) recording the front-matter correction they
+forced. No settled decision, decision table, adopted mechanism, or WP boundary changes. Amendment
+rows are prefixed `A-` to distinguish them from the review findings below, which are `R-`.
+
+- **A-DT-1 (REVERT SET) → §3.1** — the severability test's revert was specified as "the seam block in
+  `process-checklist.sh`", **singular**. Building and running the test enumerated **six** consumers,
+  found across three review rounds: the `DELTA-SEAM` fence (WP2), `_postmvp_policy_notice` and its
+  call site in `upgrade-project.sh` (WP2), `_postmvp_era_assertion` and its call site in
+  `validate.sh` (WP3), the `# CADENCE-POLICY-READ` line in `check-maintenance.sh` (WP6), the
+  `delta-boundary-lint` job in `.github/workflows/lint.yml` (WP1), and a **direct**
+  `run_child_suite "scripts/lint-delta-boundary.sh"` registration in `tests/full-project-test-suite.sh`
+  (WP1). That last one falsified this section's own central claim — §3.1 defines severability as
+  "the full suite must pass", and the file that *is* the full suite invoked a module script directly,
+  so post-sever it was `bash` on a deleted file at rc 127. §3.1 also records **what running it
+  taught**: functional severability is already free (every consumer fails soft — measured), so the
+  load-bearing instrument is the **reference sweep**, not the behavioural one, and the obvious WP7
+  mutation cannot be a functional one; and **a multi-line construct must be dropped as a construct**,
+  because a line-based drop left an orphaned continuation that `bash -n` accepts. §3.1's file
+  inventory omits the module's own test files, which the test deletes anyway — with one real cost
+  named on the record.
+- **A-DT-2 (CORE GLOBS) → §3.3** — the CORE set was **four** globs, which excludes
+  `scripts/host-drivers/*.sh`, and `scripts/lint-delta-boundary.sh` was built faithful to that
+  number and says so in its own header. Proof by plant, not inference: review added
+  `source "$SCRIPT_DIR/lib/delta-state.sh"` to `scripts/host-drivers/github.sh` and **the lint passed
+  it at rc=0**, while the identical line in `scripts/validate.sh` reds at rc=1 on T1 — re-executed in
+  both directions for this amendment. The predicate is sound; the population was short. Karl approved extending coverage, so the CORE set is now
+  **five globs** here, in the brownfield design's §3.3, and in `docs/module-contract.md` M3 — the
+  three surfaces are kept at parity by design. **The lint edit shipped separately and has now
+  landed (`## BL-215:`):** both `CORE_GLOBS` arrays carry the fifth glob under the sync-sibling
+  marker `# BL-215-CORE-GLOB-SYNC`, so §3.3 is a description of shipped behaviour again rather
+  than a contract running ahead of it.
+- **A-DT-3 (FRONT MATTER) → Document Control, "Status of the thing described"** — that row read
+  **"Nothing is built."** through v1.1, verified at the time against §14-V11. True at that commit;
+  false by 2026-08-09, because **WP0–WP7 have shipped** (PRs #323, #324, #327, #328, #330, #332,
+  #333, #334) and both corrections above are derived from that shipped code. Corrected in this same
+  v1.2 pass: the row now names what is built, what is not (WP8's intake paths and `resume.sh`
+  branch, WP9's docs), and the PR for each. One clause is **retired rather than updated** — v1.0
+  cited the absence of `docs/deltas/` and `.claude/delta-state.json` as evidence that nothing
+  existed, but those are **generated-project** artifacts that will never exist in the framework
+  repo, so their absence was never evidence of anything and would have read as a false negative
+  indefinitely. The "exists today" caveat is kept and rescoped: those claims are stamped 2026-08-02,
+  and §14 is a log of what commands returned at that commit, not a standing property.
 
 **v1.1 (2026-08-02) — review-r1 amendment map.** Verdict `major_concerns`; fidelity **FAITHFUL**
 (all eight settled decisions intact, all twelve §14 rows independently reproduced). One mandatory
@@ -249,8 +320,102 @@ commit-gate classifier `pre-commit-gate.sh` calls (`# BL-010-COMMITMSG-BL006` an
 The seam is a small, declared set of `--delta-*` actions that source `scripts/lib/delta-state.sh`.
 
 **Severability test (author-proposed, and the thing the lint really protects):** delete every
-delta-module file and revert the seam block in `process-checklist.sh`, and the full suite must
+delta-module file and revert **every core consumer of the module**, and the full suite must
 pass. That is the property "severable" means operationally; §11-WP7 makes it a test.
+
+**The revert set is EIGHT consumers by the suite's own output, and NINE by its recipe. v1.2.1
+(2026-08-10) — evidence-led, like every number this table has carried: rows 1–8 are what running
+the test produced, across four review rounds and two work packages; row 9 is what reading the
+sever recipe produced, because the recipe handles it silently and no run will ever print it.** v1.0/v1.1 said "the seam block in
+`process-checklist.sh`", singular. v1.2 said **six**, which was the count at WP7 and was already
+stale when it was printed: WP8 added two more, and `tests/test-delta-severability.sh` named both by
+path the first time it ran against the WP8 tree. This is the count **re-derived by execution on
+2026-08-10** (`bash tests/test-delta-severability.sh` → 14/14, rc 0; its m1 mutation reports the
+dangling references in `init.sh`, `scripts/check-maintenance.sh`, `scripts/process-checklist.sh`,
+`scripts/resume.sh`, `scripts/upgrade-project.sh` and `scripts/validate.sh`, and m3 names the
+workflow separately), corroborated by an independent grep of the code surface. **Do not quote the
+number — re-run the suite.** It has now been wrong in this table twice, both times by being a
+measurement of a tree that had since grown.
+
+| # | Consumer | What reverts | Arrived in |
+|---|---|---|---|
+| 1 | `scripts/process-checklist.sh` | the `DELTA-SEAM` fence — the seam itself, and the only allowlisted edge | WP2 |
+| 2 | `scripts/upgrade-project.sh` | `_postmvp_policy_notice` **and its call site** | WP2 (§3.2's NOTICE-ONLY arm) |
+| 3 | `scripts/validate.sh` | `_postmvp_era_assertion` **and its call site** | WP3 (§10.1's report-only assertion) |
+| 4 | `scripts/check-maintenance.sh` | the `# CADENCE-POLICY-READ` line | WP6 |
+| 5 | `scripts/resume.sh` | the §10.5 fourth branch — the `DELTA-RESUME-BEGIN` / `-END` fence, another core→core seam delegation | WP8 |
+| 6 | `init.sh` | the **two** `DELTA-INSTALL-BEGIN` / `-END` fences (the scripts block and the template block) that ship the module into generated projects | WP8 |
+| 7 | `.github/workflows/lint.yml` | the `delta-boundary-lint` job, as a whole block | WP1 |
+| 8 | `tests/full-project-test-suite.sh` | the direct `run_child_suite "scripts/lint-delta-boundary.sh"` registration | WP1 |
+| **9** | **`.github/workflows/tests.yml` + the module's own test estate** | the **eleven** delta rows in the unit-lane `tests=(` array and the `pin_*` row for `test-delta-wp5-hotfix-retro.sh`, plus `tests/test-delta-*.sh`, `tests/test-lint-delta-boundary.sh` and `tests/test-delta-severability.sh` themselves | WP1 → WP8, accreting |
+
+**Row 9 is REVERTED BY THE SUITE AND REPORTED BY NOTHING — read it before you
+trust the eight above.** `sever_module` deletes the module's suites and then runs
+`_drop_lines "$d/.github/workflows/tests.yml"` over the delta registrations, as
+part of the sever rather than as a declared consumer. That is correct behaviour
+— without it the unit lane invokes deleted files, which is `bash` at rc 127, the
+identical shape consumer 8 produced in the aggregator and in the identical file
+class the m3 lesson is about. But it means **the suite's output can never name
+this one**: V1's residual sweep runs *after* the drop, so it sees a clean tree and
+every future run prints the same eight paths.
+
+So the safeguard two paragraphs above — *"re-run the suite rather than quote the
+number"* — **is not sufficient on its own, and this row is the counter-example.**
+Re-running tells you about consumers the sever does not already handle silently.
+For the ones it does, only reading `sever_module` does. A reviewer checking this
+table should read the sever recipe alongside the suite output, not instead of it.
+
+**Consumer 6 is a different shape from the rest and is worth the sentence.** The scaffolder does
+not *call* the module; it copies its bytes, and it has to name each file literally because
+`scripts/lib/scaffold-shipped-set.sh` derives the shipped set by parsing those `cp` lines.
+Post-sever there is nothing to copy, so the fence goes as a whole block —
+`scripts/lint-delta-boundary.sh` accepts those literal paths in the intact tree only inside that
+fence and only for `cp` / `chmod` / `mkdir` statements, under its own `DELTA-BOUNDARY-INSTALLER`
+fence, cardinality one, asserted exactly the way the seam's is.
+
+Consumers 7 and 8 each falsified this section's own claim once. §3.1 defines severability as *"the
+full suite must pass"*; consumer 8 is the file that **is** the full suite, invoking a module script
+directly rather than through a `tests/…` path, so post-sever that line was `bash` on a deleted file
+— rc 127 — and the very run the property is stated in terms of went red. Both misses had the same
+shape: a consumer living in a **file class the residual sweep never opened** (a workflow, then the
+aggregator). Consumers 5 and 6 have the same moral from the other direction: they were found by
+the suite's completeness sweep rather than by anyone remembering to add them here, which is the
+only reason a revert *manifest* is allowed to exist at all. The transferable lesson is the **scope
+list**, not the manifest.
+
+**Two things running it taught, which change what the test is for.**
+
+1. **Functional severability is already free, so the load-bearing instrument is the *reference
+   sweep*, not the behavioural one.** Measured: with every module file deleted and **no revert at
+   all**, the four script consumers the suite probes still behave — the seam answers rc 2 ("the
+   delta module is not installed"), `validate.sh`'s assertion is `|| return 0`, upgrade's notice
+   is `|| true`, and
+   `check-maintenance.sh`'s policy read falls back to the framework constants. Each fails soft by
+   design and each says so in its own header. The consequence for §11-WP7 is concrete: the obvious
+   mutation — *delete a module file but not the seam revert → RED* — **cannot be a functional
+   one**; it stays green precisely because the fail-soft design works, and it has to be killed by
+   the structural arm instead.
+2. **A multi-line construct must be dropped as a construct, never line-by-line.** A line-based drop
+   on the aggregator left an **orphaned continuation line** — `run_child_suite` calls span three
+   lines, and a dangling `"…string…" \` is a syntactically valid command. **`bash -n` passes on
+   it**, so no parse check could have caught it; only reading the surviving references does.
+
+**§3.1's file inventory omits the module's own test files** (`tests/test-delta-*.sh`,
+`tests/test-lint-delta-boundary.sh`, and their registrations in `tests/full-project-test-suite.sh`
+and the `tests.yml` unit list) — **that omission is now row 9 of the revert table above**, where it
+belongs, rather than a closing paragraph. The severability test deletes them anyway: a module whose
+own suites stayed behind would leave a suite full of red, which is not something "severable" can
+mean. Two real costs are on the record rather than in a footnote.
+
+1. **A core script loses its only coverage.** `tests/test-delta-wp6-cadence.sh` is a delta-track
+   suite that is also the **only** behavioural coverage of a CORE script,
+   `scripts/check-maintenance.sh` — specifically of its three-code exit contract, including the
+   `undetermined` counter WP6 added to close a fail-OPEN hole. Severing the module takes that
+   coverage with it, and the severed tree still passes because nothing is left to fail. Tracked as
+   `## BL-220:`, with the split-along-the-seam option and its cost stated there.
+2. **The deletion is invisible to the instrument.** See row 9: because the sever performs it before
+   the residual sweep runs, no execution of this suite will ever report the test estate or the
+   `tests.yml` rows as consumers.
 
 ### §3.2 — The mechanism/policy split
 
@@ -308,10 +473,41 @@ severability property is gone with no test failing. The lint makes the fusion a 
    file. A boundary lint that scans nothing passes trivially, and a passing lint that proves
    nothing is worse than no lint — this repo has the scar.
 
-**Set definitions.** CORE = `init.sh` + `scripts/*.sh` + `scripts/lib/*.sh` + `scripts/hooks/*.sh`,
-**minus** the delta-module inventory of §3.1 **and** the lint itself (which names every delta path
-by construction). DELTA = the §3.1 inventory. Both sets come from one literal manifest at the top
-of the lint, so adding a module file is a one-line edit and the sets can never disagree.
+**Set definitions.** CORE = `init.sh` + `scripts/*.sh` + `scripts/lib/*.sh` + `scripts/hooks/*.sh` +
+`scripts/host-drivers/*.sh`, **minus** the delta-module inventory of §3.1 **and** the lint itself
+(which names every delta path by construction). DELTA = the §3.1 inventory. Both sets come from one
+literal manifest at the top of the lint, so adding a module file is a one-line edit and the sets can
+never disagree.
+
+**`scripts/host-drivers/*.sh` is a v1.2 addition (2026-08-09) — evidence-led, approved by Karl, and
+proved by plant rather than argued.** v1.0/v1.1 named **four** globs, and both boundary lints were
+built faithful to that number; both disclose the exclusion in their own headers as a pending design
+question ("widen it only by amending the design, and then in both places"). This is that amendment.
+The gap is not a theoretical one: appending `source "$SCRIPT_DIR/lib/delta-state.sh"` to
+`scripts/host-drivers/github.sh` in a fixture tree leaves `scripts/lint-delta-boundary.sh` at
+**rc=0** — `OK: no core -> delta edge`, 72 core files scanned and the planted file not among them —
+while the **identical** line appended to `scripts/validate.sh`, which the four globs do reach, reds
+at **rc=1** with a T1 violation. First planted by review; **re-executed for this amendment**, both
+directions. The predicate is sound; the population was short. The three host
+drivers (`github.sh`, `gitlab.sh`, `bitbucket.sh`) are ordinary core code by every other measure —
+`init.sh`, `scripts/lib/host.sh` and `scripts/intake-wizard.sh` all source them by path, and
+`init.sh` ships them downstream — so a `source .../delta-state.sh` added to one fuses the
+module exactly as thoroughly as the same line in `check-phase-gate.sh`, and the severability
+property is gone with no check failing. **The sibling brownfield lint has the same hole for the same
+reason and takes the same correction** (`docs/designs/2026-08-02-brownfield-adoption-v1.md` §3.3 and
+`docs/module-contract.md` M3), because the two lints are kept at exact parity by design.
+**Implemented (`## BL-215:`).** Both `CORE_GLOBS` arrays now carry the fifth glob, under the
+sync-sibling marker `# BL-215-CORE-GLOB-SYNC` — grep it to find the pair, and change them together.
+This section describes shipped behaviour again; it is no longer a contract stated here and
+under-enforced there. On the real tree the widening raised this lint's scanned CORE population from
+**73 to 76** files with no new violation, so the three host drivers carried no pre-existing
+`core → delta` edge. The enforcement half is pinned three ways in
+`tests/test-lint-delta-boundary.sh`, and the third pin is the load-bearing one: **S4** plants the
+line above in a host driver and requires tier **T1**; **S5** requires a *clean* host driver to raise
+the reported CORE population by exactly one, because `rc=0` cannot distinguish "scanned and clean"
+from "never scanned" and that ambiguity is the whole reason this gap survived several work packages;
+and **S6** deletes the glob from a copy of the lint and requires the plant to pass again, so the pin
+cannot stay green under the very edit it forbids.
 
 **Two match tiers, because literal paths are evadable (R-DT-6).** Clause 2 as written matches
 *literal* delta paths, and bash lets a reference be composed at runtime:

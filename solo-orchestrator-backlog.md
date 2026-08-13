@@ -8429,7 +8429,24 @@ agree)
 **Severity:** Low today, gate-relevant tomorrow (nothing invokes the script —
 manual runs only — but the Delta Track design wires it into release-cut
 refusals, where fail-open becomes a real hole)
-**Status:** Open
+**Status:** Closed — merged 2026-08-04 in PR #333 (`e8fc70b`, the delta track's
+WP6). Both defects are fixed, and the second fix is what makes the first one
+reachable. **Defect 1:** `cadence_epoch` now returns NON-ZERO and prints
+**nothing** when neither `date -j -f` nor `date -d` accepts its input — the
+`|| echo 0` tail that manufactured the `last_epoch=0` sentinel is gone, so an
+undeterminable date no longer disappears inside the `[ "$last_epoch" -gt 0 ]`
+guard. Every arm that cannot date its signal calls `mark_undetermined`, which
+holds the only line that moves the counter (`# CADENCE-UNDETERMINED-COUNTER`),
+and the closing verdict reports the counter. **Defect 2:** the advertised third
+exit code now exists in code rather than only in the docblock —
+`# CADENCE-EXIT-UNDETERMINED` is a real `exit 2` site. The consumer half landed
+with WP7: `cut-release.sh` refuses on **1 AND 2** (`# CUTREL-CADENCE-OVERDUE`
+and `# CUTREL-CADENCE-UNMEASURABLE`, with `# CUTREL-CADENCE-OTHER` catching
+every other code so a new exit value cannot be mistaken for success), so
+"could not determine" blocks a release cut exactly as "overdue" does. The
+mutation proof asserts on the exit code, never on the sentence: deleting the
+one counter line returns the unparseable fixture to "All maintenance cadences
+current" at rc 0.
 
 **The two defects, both reproduced by execution:**
 1. **Fail-open on unparseable dates.** Every cadence verdict sits inside
@@ -8462,7 +8479,18 @@ REPRODUCED by its adversarial review with a two-run fixture)
 **Category:** Gate self-consistency / silent-friction class
 **Severity:** Medium (every generated project at phase 3+: a fully PASSING gate
 run plants the seed of its own next failure)
-**Status:** Open
+**Status:** Closed — merged 2026-08-04 in PR #334 (`70f159a`).
+`:(exclude)docs/snapshots` was added at **all four** call sites — both
+`git status --porcelain` arms of `_cpg_scoped_dirty` in `check-phase-gate.sh`
+and both of the sync sibling `_p3_scoped_dirty` in `run-phase3-validation.sh`,
+marked `# BL-214-SNAPSHOT-EXCLUDE` in each file. Four, not two, because each
+function has a with-results-dir arm and a without-results-dir arm and a fix to
+only one of them leaves the defect live on the other path. The fix also ships
+the thing that keeps it fixed: a new **byte-for-byte sibling-identity check**
+(`tests/test-bl214-gate-snapshot-staleness.sh` row B1) asserts the two
+functions are identical modulo their names, so editing one sibling and not the
+other goes RED — the two files' own comments already claimed that identity, and
+BL-214 exists because nothing was checking the claim.
 
 **The defect, reproduced:** on a clean phase-4 project where `docs/snapshots/`
 is not gitignored, gate run 1 exits 0 and prints
@@ -8483,3 +8511,1618 @@ dirt still does).
 
 **Related:** BL-082 (the staleness contract this trips), BL-105 (the phase-4
 arm whose walk fix surfaced the reproduction fixture that found this).
+
+---
+
+## BL-215: Both boundary lints' CORE set is four globs — `scripts/host-drivers/*.sh` is outside it, so a `core → module` edge planted there passes clean
+
+**Logged:** 2026-08-09 (found by adversarial review of the boundary lints;
+independently RE-EXECUTED with positive controls when the design amendment was
+written — both runs agree)
+**Category:** Enforcement gap / silent-success class — a lint that passes a
+violation it exists to catch
+**Severity:** Medium. Nothing is broken today (no host driver references either
+module), so this is not a live defect — it is an unguarded surface. The cost is
+the same one `# BL-181-UNIT-LANE-PREDICATE` paid: an exemption nobody chose,
+invisible until someone plants the edge, at which point the severability
+property is gone with every check green.
+**Status:** Open
+
+**The gap.** `scripts/lint-delta-boundary.sh` and
+`scripts/lint-module-dependencies.sh` both build their CORE population from a
+literal `CORE_GLOBS` array of **four** entries — `init.sh`, `scripts/*.sh`,
+`scripts/lib/*.sh`, `scripts/hooks/*.sh`. `scripts/host-drivers/*.sh`
+(`github.sh`, `gitlab.sh`, `bitbucket.sh`) is in none of them. Both lints
+disclose the exclusion in their own headers and both defer it to a design
+amendment ("widen it only by amending the design, and then in both places") —
+**that amendment has now landed** and the lints have not moved, so the contract
+is stated in three documents and enforced in neither script.
+
+**The evidence — measured, both directions, on a fixture tree driven with
+`--root`:**
+
+| Plant | Lint | Result |
+|---|---|---|
+| `source "$SCRIPT_DIR/lib/delta-state.sh"` appended to `scripts/host-drivers/github.sh` | `lint-delta-boundary.sh` | **rc=0** — `OK: no core -> delta edge (72 core file(s) scanned against 6 delta-module file(s); seam: scripts/process-checklist.sh)` |
+| `source "$SCRIPT_DIR/lib/scout/scout-phasemap.sh"` appended to `scripts/host-drivers/gitlab.sh` | `lint-module-dependencies.sh` | **rc=0** — `OK: no core -> module edge and no scanner dependency (76 core file(s) scanned against 2 module path(s); …; core allowlist empty)` |
+| *positive control* — the **identical** delta line appended to `scripts/validate.sh` | `lint-delta-boundary.sh` | **rc=1** — `T1 — core file names delta-module path 'delta-state.sh'` |
+| *positive control* — the **identical** scout line appended to `scripts/check-maintenance.sh` | `lint-module-dependencies.sh` | **rc=1** — `T2 — path-shaped module token 'scout/' on an executed line of a core file` |
+
+The positive controls are what make this a population defect rather than a
+predicate defect: the same line, in a file the four globs reach, reds on both
+tiers. **The predicate is sound; the population is short.** Host drivers are
+core by every other measure — `init.sh`, `scripts/lib/host.sh` and
+`scripts/intake-wizard.sh` all source them by path, and `init.sh` ships them
+downstream — so a convenience call added to one fuses a severable module
+exactly as thoroughly as the same call in `check-phase-gate.sh`.
+
+**Fix shape:** add `"$ROOT/scripts/host-drivers"/*.sh` to the `CORE_GLOBS` array
+in **both** lints (they are kept at exact parity by design — change them
+together, like the `# BL-084-TIER-KEY` sync siblings), correct both header
+SETS blocks so they stop describing the four-glob reading as deliberate, and
+mutation-prove it in each lint's behaviour suite: plant the edge in a
+host-driver fixture → RED → remove → GREEN. Assert on the **exit code**, never
+on the printed tier label. Re-measure the vacuity floor's core count after the
+widening so the floor still means what it says.
+
+**Ride-along, same branch (all three touch `.sh`, which the docs-only amendment
+branch could not).** The pre-v1.2 §3.1 sentence is quoted in the **present
+tense** at THREE sites, and §3.1 no longer contains it — it now reads "revert
+**every core consumer of the module**" and carries the six-row consumer table:
+
+1. `tests/test-delta-severability.sh`, header `SPEC:` block — *"delete every
+   delta-module file and revert the seam block in process-checklist.sh"*.
+2. `tests/test-delta-severability.sh`, the `THE ENUMERATION IS THE POINT`
+   banner — *"§3.1 says 'the seam block in process-checklist.sh', singular."*
+3. `tests/full-project-test-suite.sh`, the severability registration comment —
+   the same *"seam block in process-checklist.sh", singular* phrasing.
+
+Sites 2 and 3 were **missed by the first sweep and found by adversarial
+review**; they are listed here so the lint branch fixes all three together
+instead of discovering the remainder later. All three are comment-only —
+nothing executes them and nothing breaks — and the smallest honest fix is to
+put each quote in the **past tense** (it is accurate history: the singular
+spelling is exactly why these tests enumerate by running rather than by
+remembering) rather than to delete it.
+
+**Where the contract is already written** (all three amended 2026-08-09, Karl's
+approval): `docs/designs/2026-08-02-delta-track-v1.md` §3.3 (amendment row
+A-DT-2 in §0.2), `docs/designs/2026-08-02-brownfield-adoption-v1.md` §3.3
+(A-BF-3 in §0.2), and `docs/module-contract.md` M3. All three state the
+five-glob CORE set **and** state that the lints do not yet implement it — this
+entry is the tracker that closes that gap.
+
+**Related:** BL-181 (the executed-lines predicate both lints copy, and the
+worked example of a one-character narrowing re-opening a hole three times while
+passing every PR-blocking check), BL-196 (the citation-integrity lint whose
+"a passing lint that proves nothing is worse than no lint" reasoning both
+boundary lints' vacuity floors inherit), BL-104 (the silent-success family).
+
+---
+
+## BL-216: `x="$(fn …)" || x=fallback` is weaker than it reads — bash 3.2 suspends `set -e` inside the guarded call, so a nested substitution returns a *successful wrong answer*
+
+**Logged:** 2026-08-10 (found while closing the D-B unreadable-ledger blocker;
+the mechanism was independently reproduced by adversarial review on this host)
+**Category:** Language trap / silent-success class — a guard that reads as
+fail-closed and is fail-open on the branch whose callee nests a substitution
+**Severity:** Medium. The *exact* shape that caused the D-B defect is gone
+(`grep -rn '\$(_cutrel_' scripts/ | grep '||'` returns one hit and it is
+**prose inside a comment** recording the rejected spelling). But the surface is
+**not** clear, and the audit below is this entry's actual work item, not a
+formality.
+**Status:** Open
+
+**The trap.** POSIX `set -e` is suspended for a command in a guarded context —
+an `if` condition, a `!`, either side of `&&`/`||`. On bash 3.2 that suspension
+**propagates into the called function's body and into command substitutions
+inside it**. So in
+
+```
+x="$(fn "$@")" || x=fallback
+```
+
+if `fn` performs its own `inner="$(g …)"` and `g` fails, that inner assignment
+**stops aborting**. `fn` runs on to its final statement and returns 0 with a
+normalised, wrong value — and `|| x=fallback` never fires, because nothing ever
+reported failure. A guard that looks fail-closed silently fails open, and only
+on the branch whose reader happens to nest a substitution.
+
+**The measurement that made it concrete** (`scripts/cut-release.sh`, one
+`chmod 000` file, one guard shape, its two ledger readers):
+
+```
+BUGS  branch under a || guard: [unreadable]
+FEAT  branch under a || guard: [none]
+```
+
+`_cutrel_bugs_state` ends in `awk`, so its non-zero status is the function's and
+the guard fires. `_cutrel_features_state` first does
+`blk="$(_cutrel_features_block …)"`; under suspension that returns empty,
+normalises to block 0, and the function answers `none` — **successfully**. Same
+guard, same unreadable file, two different answers, and the wrong one is the
+dangerous one: `none` means "has no row naming it", an assertion about the
+contents of a file nobody could open.
+
+**The mitigation chosen there**, and the recommended shape generally: do not
+infer readability from an exit status at all. Probe it directly and let the
+probe be the single marked guard — `# CUTREL-LEDGER-READGUARD`, which OPENS the
+file (`( : < "$1" ) 2>/dev/null`) rather than asking `[ -r ]` about the
+permission bits, because the question is whether *this process* can open it,
+which is what `awk` is about to attempt. `tests/test-delta-db-ledger-close.sh`
+rows S2/S3 pin both ledgers and m11 pins the guard's deletion.
+
+**A residual the probe shape cannot close, recorded so the surface stays named.**
+A ledger made unreadable *between* the `# CUTREL-LEDGER-READGUARD` probe and the
+read it protects reinstates the original silent death — rc 2 mid-write, no
+message, no tag. It needs an active racer during the run, and there is no fix
+that is not worse: any guard that would *catch* the failed read is the
+`|| fallback` shape this entry is about, which on the FEATURES branch reopens the
+`none` conflation measured above, and guarding those reads would additionally
+mask m11 — the only thing pinning the probe's existence. Left open deliberately,
+not overlooked.
+
+**THE SCAN, AND WHAT IT ACTUALLY FOUND — READ THIS BEFORE ASSUMING THE SURFACE
+IS CLEAR.** The first draft of this entry was going to say "every surviving
+`|| x=` guard wraps an external (`jq`, `awk`, `mktemp`) with nothing internal to
+suspend". **Running the scan disproved that.** Recipe:
+
+```
+grep -rn '="\$(' scripts/ init.sh | grep '||'
+```
+
+Of the hits that wrap a **project function** rather than a binary, **nine
+distinct callees nest further command substitutions of their own** — i.e. they
+are in the suspect shape today — and those nine are reached from **21 guard
+sites**. Read 21 as *guard sites over suspect callees*, **not** as the number of
+project-function hits: re-running the recipe finds roughly twice that many, and
+the extras were checked and dropped. Adversarial review re-ran the recipe
+independently and confirmed every project-function callee omitted from the table
+nests **zero** substitutions (`prompt_choice` — the `helpers-core.sh` definition
+`delta.sh` actually binds — `_seam`, `_manifesto_candidates`, `_rubric_boxes`,
+`soif_currency_sha256`/`_mode`, `soif_adoption_read`, `adopt_obtain_report`,
+`_p3_license_pairs`, `_soif_plan_cmfield`, `soif_currency_file_field`), so the
+worklist below is **complete rather than sampled**.
+
+| callee | nested substitutions | guard sites |
+|---|---|---|
+| `soif_freshness_run` | 11 | 1 |
+| `delta_classify_lines` | 5 | 2 |
+| `delta_retro_rows` | 4 | 1 |
+| `delta_policy_get` | 3 | 10 |
+| `delta_policy_missing_keys` | 3 | 1 |
+| `_brief_path` | 2 | 2 |
+| `delta_classify_risk_matches` | 2 | 1 |
+| `delta_cadence_epoch` | 2 | 1 |
+| `delta_state_read` | 1 | 2 |
+
+Two rows are deliberate **over-inclusion**, not confirmed suspects:
+`delta_classify_risk_matches` and `delta_cadence_epoch` nest only *locally
+`||`-guarded* substitutions rather than bare ones, and `delta_cadence_epoch` is
+fail-closed by design — its digits-only `case "$e" in ''|*[!0-9]*) return 1`
+validates the result before returning it. They stay on the worklist because an
+audit should confirm rather than assume, but they are the two least likely to
+yield anything.
+
+**One family spot-checked, and it is safe BY ACCIDENT rather than by design.**
+`delta_policy_get` (the widest, 10 guard sites) does
+`defaults="$(delta_policy_defaults)"` and `proj="$(_delta_policy_project_doc …)"`
+bare. Under suspension either would yield `""` — and `""` is not valid JSON, so
+the downstream `jq -r -n --argjson d "$defaults" --argjson p "$proj"` fails, its
+own `if ! out="$(jq …)"` catches that, and the function returns 1, so the
+caller's fallback does fire. **Correct outcome, incidental cause**: it holds
+because a later consumer happens to validate the inner result, not because
+anything guards it. Change that jq to tolerate an empty argument and the
+protection disappears with no test moving.
+
+**The remaining 8 callees are UNAUDITED.** That audit is the work item. The only
+question that matters per site: *if the nested substitution silently returns
+empty, does anything downstream still fail?* Where nothing does, replace the
+exit-status guard with a direct probe of the condition, as `cut-release.sh` did.
+
+**Related:** BL-104 (the silent-success family, and the `[WARN]`/`issues`
+mismatch — the same "label and predicate disagree" shape), BL-181 (a
+one-character narrowing re-opening a hole three times while passing every
+PR-blocking check), BL-196 (a passing check that proves nothing is worse than no
+check).
+
+---
+
+## BL-217: `cut-release.sh`'s rc-10 refusal says "Nothing has been written." after invoking a validator that may have written scan summaries
+
+**Logged:** 2026-08-10 (found by adversarial review of the D-B branch; **not**
+introduced by it — WP7-era, and explicitly out of that branch's scope)
+**Category:** Message accuracy / operator trust
+**Severity:** Low. **This is a wording tension, not a write on a refusal path,
+and that distinction is the whole entry** — read the next-but-one paragraph
+before treating it as a §9.2 violation, because it is not one.
+**Status:** Open
+
+**The tension.** The breaking-release arm runs the full Phase 3 validation
+before the tag, and when that run fails it refuses:
+
+```
+_refuse 10 "The full validation re-run did not pass (it exited $REVAL_RC), so the breaking release is refused."
+…
+echo "To clear this: fix what the run above reported, or attest each skipped scanner with a"
+echo "  reason and a sign-off, then run this again. Nothing has been written."
+```
+
+`scripts/run-phase3-validation.sh` archives scan JSON and summaries under
+`RESULTS_DIR="docs/test-results/phase3"`. So by the time that sentence prints,
+files may well have appeared in the project — written by the validator, during
+the run the operator was just told about.
+
+**Why this is NOT a §9.2 violation, stated plainly so nobody hunts one.**
+§9.2's property constrains what **`cut-release.sh`** writes before its refusals,
+and on this path it writes **nothing**: it invokes a component that writes its
+own artefacts, which is exactly why the design puts the revalidation in Phase B
+rather than Phase A. `cut-release.sh`'s own comment says so — "it writes its OWN
+scan summaries, which is why it is here and not in Phase A". The refusal
+ordering is correct. What is inaccurate is one sentence's *scope*: it reads as a
+whole-tree claim and is only true of this script.
+
+`tests/test-delta-db-ledger-close.sh` N1 pins the whole-tree manifest across
+this arm driven against a **stubbed** validator, where the claim is true; that
+row holds and is not affected by this entry.
+
+**The fix when someone picks it up** is a wording change, not a behaviour one —
+something that owns the distinction, e.g. "This release was not cut and no tag
+was created. The validation run above may have written its own scan summaries
+under docs/test-results/phase3." Do **not** "fix" it by suppressing the
+validator's output or by moving the call: both trade an inaccurate sentence for
+a real loss.
+
+**Related:** BL-213 (a closing sentence that disagreed with the work — the same
+family, one severity up), BL-104 (silent success).
+
+---
+
+## BL-218: The ci.yml enforcement detector enumerates ways a file can be wrong; three adversarial rounds say the fork is canonical-shape-or-refuse
+
+**Logged:** 2026-08-10 (found by the third adversarial round on
+`fix/ci-token-enforcement-claim`; every count below was measured on that branch,
+not estimated)
+**Category:** Design fork / detector shape — an enumerating checker on a surface
+whose input space is not enumerable
+**Severity:** Medium. Nothing shipped is wrong today: the three rounds closed
+every hole they found, the four conditions are pinned by 158 rows with a mutant
+per atom, and every remaining gap is recorded in the product with its own
+marker. What is unresolved is whether the SHAPE of the detector can converge.
+**Status:** Open
+
+**The fork.** `cmd_setup_ci_token` in `scripts/check-gate.sh` decides whether a
+project's `.github/workflows/ci.yml` turns a stored secret into enforcement, and
+prints "The next push enforces the check" when it does. It decides that by
+enumeration: read the gate step and its job, and refuse each way the file can
+discard the gate's verdict. Three adversarial rounds each found new spellings
+the enumeration had not reached.
+
+- **Rounds 1-2 found YAML spellings** — CRLF line endings, quoted keys in both
+  quote styles, a space before the colon, merge keys, a lone-dash sequence item,
+  a folded block scalar, duplicate keys, a quoted job id that sent the job
+  locator climbing out of `jobs:` and binding "the job" to `push:` inside `on:`.
+  Every one earned the claim on a file whose effective configuration was a
+  swallow. These are *reachable* by enumeration — each closed for good, each
+  pinned by a marker and a mutant (`# D-A-CRLF-STRIP`, `# D-A-QUOTED-KEY-DQ`,
+  `# D-A-SPACED-KEY`, `# D-A-MERGE-KEY`, `# D-A-LONE-DASH-CLIMB`,
+  `# D-A-FOLDED-RUN`, `# D-A-DUP-KEY-VERDICT`, `# D-A-JOB-ID-CLOSED`).
+- **Round 3 found something different in kind: bash semantics inside the `run:`
+  body.** No amount of YAML parsing reaches it. The scanner inspects lines that
+  NAME the gate script plus a small set of keys; arbitrary shell control flow on
+  any other line is structurally invisible to a detector of this shape. A body
+  reading `set +e` / `bash scripts/check-phase-gate.sh` / `exit 0` runs under the
+  fail-fast default, carries a byte-exact invocation, passes every one of the
+  four conditions, and grades a failed gate green. Measured, not argued —
+  recorded in the product as `# D-A-RESIDUAL-RUN-BODY-DISARM`.
+
+**The decided direction (Karl, 2026-08-10): canonical-shape-or-refuse.** Require
+the gate step to match one shipped shape and tell anyone who deviates *"I cannot
+verify this file — here is the shape I need"*, instead of enumerating the ways a
+file can be wrong. This is the repo's own allowlist-over-blacklist doctrine —
+F-015's invocation allowlist, the `DELTA-INSTALL` fence grammar, and on this very
+branch `# D-A-PARITY-3-STEP-KEYSET` and `# D-A-SHELL-ALLOWLIST` — applied to the
+one part of this surface still doing the opposite. The bl147 sibling already
+works this way (`Cw6-strict-keys` / `-gating` / `-job` / `-trigger` freeze the
+ten templates byte-for-byte), which is why that pin has needed no rounds.
+
+**Why it is not being improvised into a fix round.** It is a product decision
+about how much customisation the framework tolerates, and the risk it carries
+runs the other way: **false reds for users who legitimately customised** — added
+a `working-directory:`, renamed the step, put the gate in a job with a
+`strategy:`. That is the direction that makes people ignore the tool, and it is
+worse than the gap. The four recorded parity asymmetries
+(`# D-A-PARITY-1-INLINE-RUN` … `# D-A-PARITY-4-NO-TRIGGER-PIN`) exist precisely
+because this surface faces a real user's file of unknown vintage rather than the
+ten the framework wrote. Deciding how far that tolerance goes needs a design
+doc, an inventory of the shapes real projects actually carry, and a migration
+story for the ones that would newly red. It does not need a patch.
+
+**What it would subsume, and what survives it.**
+
+| Recorded residual | Subsumed by canonical-shape-or-refuse? |
+|---|---|
+| `# D-A-RESIDUAL-HEREDOC-DATA` — a byte-exact gate line inside a heredoc is DATA and still satisfies the invokes floor | **Yes.** A canonical body has no heredoc; anything else is refused unverified. |
+| `# D-A-RESIDUAL-RUN-BODY-DISARM` — `set +e` … `exit 0` in the body | **Yes**, and this is the residual that motivates the whole entry. |
+| `# D-A-RESIDUAL-ENV-SHADOW` — `maps` is a PRESENCE test, so a step-level `GH_TOKEN` that shadows a workflow-level mapping is invisible (R-CTE-9) | **Partly.** A canonical STEP pins the step's own `env:`, so the shadowing spelling is refused. A secret mapped at job or workflow `env:` is still legitimate and outside any step-shaped canon, so the resolution question survives unless the canon reaches upward too. |
+| `# D-A-RESIDUAL-TAB-SEPARATOR` — a tab-spaced colon hiding `continue-on-error` | **Yes**, trivially: a canonical shape is byte-compared. |
+| `# D-A-RESIDUAL-QUOTED-STEPS-KEY` — a quoted `"steps":` or a flow-style step mapping | Already fails CLOSED; a canon changes the message, not the verdict. |
+| `!!str continue-on-error: true` and the explicit-key form (`? continue-on-error` / `: true`) | **Not a survivor — SETTLED and CLOSED in round 3**, `# D-A-OPAQUE-KEY`. Listed here only so the record shows it was answered rather than deferred. |
+| `# D-A-PARITY-4-NO-TRIGGER-PIN` — a workflow with no `push:` trigger still earns "the next push enforces" | **Yes** — the bl147 sibling freezes the `on:` block for exactly this reason. Still Karl's separate open call today. |
+
+**An input to the false-red measurement, recorded 2026-08-10 (R-CTE-12).**
+GitHub's current documentation **actively recommends YAML anchors and aliases**
+— the reusing-workflow-configurations page carries worked examples anchoring
+whole jobs and `env:` blocks — while `actions/runner` still throws
+`Anchors are not currently supported` from **two** files
+(`src/Sdk/WorkflowParser/Conversion/YamlObjectReader.cs` and its DTPipelines
+sibling). Both halves independently verified by adversarial review.
+
+No verdict changes today: `# D-A-MERGE-VERDICT` fails CLOSED on a merge key
+either way, which is correct under both readings. **The population does.** If
+anchors work in the service, GitHub's own docs are steering users toward exactly
+the shapes this detector refuses — and a plain alias on the gate job or step
+surfaces as a less precise "does not map" or unlocatable refusal rather than the
+merge-key cause bullet. That is the false-red population C must be measured
+against, so it belongs in the inventory below rather than in a session note.
+Round 1 assumed anchors were rare; that assumption is now the thing to check.
+
+**Fix shape (for the design doc, not for a patch).** Decide the canon; decide
+whether it is one shape or a small set (the ten templates are not identical);
+decide whether a non-matching file gets a REFUSAL or an "unverified" third
+verdict distinct from both the OK and the ten cause bullets; measure the false-red
+population before shipping it, because that is the risk. Whatever lands must keep
+the property this branch has: one term per line, one marker per atom, a mutant
+per marker, and no claim that outruns what was measured.
+
+**Related:** BL-181 (a one-character narrowing re-opening the same hole three
+times while passing every PR-blocking check — the reason "enumerate the wrong
+spellings" is treated here as a shape problem rather than a diligence problem),
+BL-104 (label and predicate disagreeing, so the printed word was not the
+verdict), BL-196 (a passing check that proves nothing is worse than no check —
+why every atom on this branch is pinned by a mutant rather than asserted).
+
+---
+
+## BL-219: `cut-release.sh`'s `breaking` marker has no writer — the major-bump lane is built, tested, and production-unreachable
+
+**Logged:** 2026-08-10 (found by the WP9 documentation pass, which set out to
+document the major-bump lane and could not reach it from any operator surface)
+**Category:** Dead lane / a shipped capability with no way to invoke it
+**Severity:** Medium. Nothing is *wrong* — every cut computes a correct bump for
+the classes it can see, and the fail-closed arm (`exit 9`, a class mapping to no
+bump) still fires. What is missing is a whole documented behaviour: **no real
+project can ever cut a major release through the tool.**
+**Status:** Open
+
+**The gap.** `scripts/cut-release.sh` reads a per-row `breaking` boolean out of
+`.claude/delta-state.json::closed[]`:
+
+```
+| [ (.id // "?"), (if (.breaking // false) == true then "breaking" else (.class // "") end) ] | @tsv
+```
+
+`breaking` is what selects the design's §9.1 **major** row and, with it, §8.2's
+full `run-phase3-validation.sh` re-run before the tag is written (the `_refuse 10`
+arm). Both are implemented and both are covered by
+`tests/test-delta-wp7-cut-release.sh`, which drives them from a **hand-written
+fixture state file**.
+
+**Nothing in `scripts/delta.sh` ever sets that field.** Not `--open`, not
+`--confirm`, not `--complete-gate`, not `--close`. There is no flag for it and no
+derivation that produces it. So on any project driven through the shipped
+operator surfaces, `.breaking` is always absent, `// false` always fires, and the
+bump is always minor or patch. Verified by execution during the WP9 pass: a full
+cut over five closed deltas (one feature, three fix/hotfix, one more feature)
+produced `v0.1.0 (a minor release, decided from the classes above)`, and no
+sequence of `delta.sh` calls can produce any other precedence outcome.
+
+**Where the writer belongs.** The close/confirm surface, not here —
+`cut-release.sh` reads state through the seam and must not grow a second writer
+(§7.1's single-writer rule). The natural shape is a confirmed attribute on the
+§4.3 transcript, or a `--breaking` flag on `--close` that routes its write
+through the seam like every other state change. That is a design decision about
+the classification surface, so it is filed rather than improvised.
+
+**Why this entry exists at all — the tracking claim was false.**
+`scripts/cut-release.sh`'s own header says of this gap and of BL-220:
+
+> TWO GAPS THAT ARE TRACKED ELSEWHERE, POINTED AT HERE SO THE NEXT READER OF
+> THIS FILE FINDS THEM RATHER THAN REDISCOVERING THEM … **Filed as a tracked
+> item**
+
+Neither was filed. Checked on `main` at `1943172`: no entry in this file and no
+entry in `solo-orchestrator-followups.md` matches either gap. A reader who
+trusted that sentence would have stopped looking — and the WP9 documentation pass
+nearly propagated the claim into `docs/delta-track.md` before checking it. **A
+"filed as tracked" assertion is a claim like any other and must be verified
+before it is repeated.** This entry and BL-220 make the header true; the header
+sentence should be updated to name them the next time that file is touched
+(product-code edit, deliberately not bundled with a docs-only package).
+
+**Related:** BL-220 (the other half of the same false-tracking sentence),
+BL-104 (a printed label disagreeing with the behaviour behind it), BL-196 (a
+check that proves nothing is worse than no check — the same shape one level up:
+a test that proves a lane no operator can reach).
+
+---
+
+## BL-220: severing the delta module takes `check-maintenance.sh`'s only behaviour coverage with it
+
+**Logged:** 2026-08-10 (WP9 documentation pass; the coupling is stated in
+`scripts/cut-release.sh`'s header and in the delta design's §3.1, and was
+confirmed against the suite estate)
+**Category:** Test-estate coupling / a core script whose only coverage lives in a
+module that is designed to be removable
+**Severity:** Low-Medium. It costs nothing today. It costs exactly one core
+script's entire rc-contract coverage on the day someone exercises the
+severability property the module was built to have.
+**Status:** Open
+
+**The coupling.** `tests/test-delta-wp6-cadence.sh` is a delta-track suite. It is
+also the **only** behavioural coverage of `scripts/check-maintenance.sh`, a CORE
+script — specifically of its three-code exit contract (0 current / 1 overdue /
+2 unmeasurable), including the `undetermined` counter WP6 added to close a
+fail-OPEN hole where an unparseable date was skipped in silence and reported as
+current.
+
+`tests/test-delta-severability.sh`'s `sever_module` deletes
+`tests/test-delta-*.sh` wholesale, by design and for a good reason: a module
+whose own suites stayed behind would leave a suite full of red, which is not
+something "severable" can mean. So the sever removes a delta suite **and** a core
+script's only tests, and the severed tree still passes — because nothing is left
+to fail.
+
+**Why it is not simply "move the test".** The suite genuinely tests both things
+at once: the cadence thresholds it drives are read from
+`.claude/delta-policy.json` (the `# CADENCE-POLICY-READ` line is consumer 4 of
+§3.1's revert set), so a core-only copy would have to either duplicate the policy
+plumbing or test the framework-constant fallback path only — which is not the
+path a real project runs. The honest options are (a) split the suite along the
+seam, with a core half pinning the exit contract against framework constants and
+a delta half pinning the policy override; or (b) accept the coupling and record
+it, which is what the design does today. Either is a decision, not a patch.
+
+**Same false-tracking note as BL-219.** `scripts/cut-release.sh`'s header
+declares this "filed as a tracked item"; it was not, on `main` at `1943172`, in
+this file or in `solo-orchestrator-followups.md`. This entry makes that sentence
+true.
+
+**Related:** BL-219 (the other half of the same sentence), BL-038 /
+`## BL-181:` (test-registration invariants — the same family of "a suite that
+does not run proves nothing", here reached by deletion rather than by
+misregistration).
+
+---
+
+## BL-221: `assert_choosable` fails OPEN on a manifest with no `deployment` key — an adopted organizational project can downgrade its own enforcement
+
+**Logged:** 2026-08-10 (found by adversarial review of the WP9 documentation
+branch, refuting that branch's own "nothing is broken today" note; reproduced
+independently twice before filing)
+**Category:** Enforcement fail-open — a tier predicate defaulting to the
+permissive tier on absent data
+**Severity:** **Real, not cosmetic.** This is a fail-OPEN on the surface that
+decides whether a project is *allowed to weaken its own enforcement*. Every other
+tier reader in the framework fails closed on absent data; this one does not.
+**Status:** Open
+
+**The predicate.** `assert_choosable` in `scripts/lib/enforcement-level.sh`:
+
+```
+deployment=$(jq -r '.deployment // "personal"' "$manifest" 2>/dev/null)
+poc_mode=$(jq -r '.poc_mode // ""' "$manifest" 2>/dev/null)
+if [ "$deployment" = "personal" ]; then
+  return 0
+fi
+```
+
+`// "personal"` makes an **absent** key resolve to the **choosable** tier.
+Contrast its sibling in the same file: `read_enforcement_level` treats a missing
+file or an unreadable one as `strict`, which is the direction the rest of this
+framework fails in.
+
+**The reachable path.** `validate_transition` calls `assert_choosable`;
+`scripts/reconfigure-project.sh` calls `validate_transition`
+(`if ! validate_transition "$PROJECT_ROOT" "$RECONF_LEVEL"; then`); and
+`reconfigure-project.sh` is in the 63-script set `scripts/adopt-project.sh`
+installs into an adopted project. So this is not a library-level curiosity — it is
+reachable from an operator command in every adopted project.
+
+**Why adoption is the trigger.** The two birth paths write different manifests.
+Measured on one tree, same day, a project scaffolded by `init.sh` versus a
+project brought in by `adopt-project.sh`:
+
+| Key | Scaffolded | Adopted |
+|---|---|---|
+| `deployment` | `"personal"` | **absent** |
+| `poc_mode` | `null` | absent |
+| `enforcement_level` | `"strict"` | **absent** |
+
+`.claude/phase-state.json` *is* written correctly by the driver
+(`deployment: "personal"`, `poc_mode: "production"`), so the **commit-time** tier
+predicate — `_bl072_tier_bypassable`, which reads phase-state — behaves
+identically on both paths. It is only the manifest-reading surface that diverges.
+
+**The probe, verbatim, and the decisive third case.** Run against a real adopted
+project with `scripts/lib/enforcement-level.sh` sourced in its own root:
+
+```
+=== A. as adopted (manifest has NO deployment key) ===
+{"deployment":null,"poc_mode":null,"enforcement_level":null}
+adopted: assert_choosable -> 0 (CHOOSABLE)
+adopted: validate_transition '.' no -> 0 (ALLOWED)
+
+=== B. same project, manifest tier keys written as init.sh would for ORGANIZATIONAL ===
+{"deployment":"organizational","poc_mode":"production","enforcement_level":"strict"}
+organizational: assert_choosable -> 1 (forced strict)
+organizational: validate_transition '.' no -> 1 (refused)
+
+=== C. the SAME organizational project with the deployment key DELETED ===
+{"deployment":null,"poc_mode":"production","enforcement_level":"strict"}
+org-minus-key: assert_choosable -> 0 (CHOOSABLE)
+org-minus-key: validate_transition '.' no -> 0 (ALLOWED)
+
+=== E. read_enforcement_level on each (the fail-CLOSED sibling) ===
+adoptee: strict
+adoptee-org: strict
+adoptee-orgless: strict
+```
+
+**Case C is the finding.** One key removed, nothing else changed: a project that
+refuses to move to `enforcement_level: no` starts allowing it. And case E shows
+the two readers in the *same library file* disagree about the same manifest — one
+fails closed, one fails open.
+
+**Two candidate fixes, both real, neither taken here.**
+
+1. **Write the tier keys into the adopted manifest** (WP4's
+   `adopt_write_manifest`, which today writes only `.host` and `.mode`). It
+   closes the divergence at the source and makes the two birth paths produce the
+   same shape. It does **not** fix the predicate for any other cause of an absent
+   key — a hand-edited manifest, or the upstream regenerate path that
+   `soif_adoption_integrity_lost` exists to detect, both reproduce it.
+2. **Default `assert_choosable` closed** — `// ""` with an explicit refusal on the
+   empty value, matching `read_enforcement_level`'s posture. It fixes every
+   cause at once and is the smaller diff. Its cost is that any project whose
+   manifest legitimately predates the key stops being able to reconfigure until
+   it is backfilled, which is a real migration question and the reason this is a
+   decision rather than a patch.
+
+The right answer is plausibly both.
+
+**This is a `# BL-084-TIER-KEY` sync-sibling surface.** CLAUDE.md records that
+the deployment + poc_mode predicate is implemented in `pre-commit-gate.sh`,
+`check-phase-gate.sh`, `init.sh` and `scripts/lib/enforcement-level.sh` and
+**must be changed in sync**. Whichever fix lands, grep that marker first: a
+one-sided change here is exactly the drift the marker exists to prevent.
+
+**Documented, not fixed.** `docs/adoption.md` names the divergence and points
+here, and scopes its "same treatment as a scaffolded project" sentence to the
+commit-time surface it is actually true of. The code is deliberately untouched:
+this is an enforcement-posture change on a sync-sibling surface, and the owner
+decides it.
+
+**Related:** `## BL-084:` (the tier predicate and its sync siblings), BL-104
+(fail-open by a predicate that read as safe), BL-030 (grandfathering by the
+*absence* of a field — the same shape: absent data read as permission).
+
+---
+
+## BL-222: `check-maintenance.sh`'s three named evidence residuals say "Filed as backlog lines" and were never filed
+
+**Logged:** 2026-08-10 (found while filing BL-219/BL-220, by generalising their
+finding instead of fixing only the instance: if one delta-track file asserts
+tracking it does not have, the sibling files are worth the same grep)
+**Category:** False tracking claim, and the evidence weakness it conceals
+**Severity:** Medium for the tracking clause — **but read residual 1 before you
+triage this by the header.** R-WP6-4's operational half is live and was
+reproduced end-to-end by adversarial review: a phase-4 project whose
+`docs/test-results/` holds nothing but `deployment-notes-2026-08-10.md` reports
+`[OK] Deep security scan (dependency audit folded in) current` and **cuts a
+release at rc 0 with the tag written**, having never run a scan. Delete that one
+file and the same project refuses at `check-maintenance` rc 2 and
+`cut-release` rc 5 (refusal 3). The stray note is provably the sole thing
+standing between "refused" and "cut", and any dated file matching the glob
+within the window refreshes the clock indefinitely.
+
+Two properties make this worse than the sibling residuals. It sits on the
+release gate's **only** security clock, because WP6 folded the dependency audit
+into the deep-security cadence — so one match satisfies both. And unlike the
+dated-empty-file residual, which requires someone to fabricate evidence, this
+one requires **no intent whatsoever**: an honest project writing deployment
+notes defeats the clock without ever knowing there was a clock.
+
+Disclosure mitigates the deception, not the hole. The residuals are described
+accurately in the product; what was false is the clause claiming they were
+filed — and because they were not, the weakest of the three sat unexamined
+under a gate that refuses releases.
+**Status:** Open
+
+**The false clause.** `scripts/check-maintenance.sh`'s header, in the block
+introducing the WP6 review's measured residuals:
+
+> THREE SHAPES OF THAT RESIDUAL, MEASURED BY THE WP6 REVIEW AND NAMED HERE SO
+> THE DISCLOSURE IS NOT NARROWER THAN THE BEHAVIOUR. **Filed as backlog lines**;
+> none is changed by this WP…
+
+Checked on `main` at `1943172`: `R-WP6-4`, `R-WP6-5` and `R-WP6-7` appear in
+**neither** `solo-orchestrator-backlog.md` nor `solo-orchestrator-followups.md`,
+and neither does any entry describing the substring-breadth or non-file-artefact
+shapes. This entry is the filing.
+
+**The three residuals, transcribed from the product so this entry stands alone.**
+
+1. **SUBSTRING BREADTH (R-WP6-4) — the one that matters.** The deep-security arm
+   reads the newest dated filename in `docs/test-results/` matching `*snyk*`,
+   `*dep*`, `*audit*`, `*semgrep*` or `*sast*`. `*dep*` matches far more than a
+   dependency audit: a `deployment-notes-2026-08-10.md` satisfies the cadence
+   completely. **The WP6 fold raises the stakes rather than leaving them flat** —
+   the separate 95-day dependency row and the 185-day biannual row became ONE
+   cadence, so a single stray match now satisfies the **whole** deep-security
+   clock, and that clock is what `scripts/cut-release.sh` refuses on
+   (refusal 3, exit 5). A project that never runs a security scan but does write
+   dated deployment notes cuts releases indefinitely.
+2. **NON-FILE ARTEFACTS (R-WP6-7).** A freshly-dated empty **directory**, or a
+   dangling symlink, satisfies it too — `ls` supplies the name and the date is
+   read off the name. One shape wider than "a dated empty file", which is itself
+   the known limit.
+3. **CROSS-HOST DATE DIVERGENCE (R-WP6-5).** `2026-13-45` is refused by both date
+   parsers, but an in-range impossibility like `2026-02-30` **normalises on BSD**
+   (to 2026-03-02) and is refused by GNU. **Both answers refuse a release cut** —
+   measured-and-stale or undetermined — so neither host skips anything silently.
+   Recorded, per the product's own note, so that nobody later "fixes" the
+   divergence by loosening the fail-closed side.
+
+**Scope, stated so this is not read as a bigger claim than it is.** The glob set
+is **inherited verbatim from the pre-WP6 script**; WP6 did not widen it. And the
+framework has never claimed these signals prove a scan happened — both
+`docs/builders-guide.md` § Step 4.4 and `docs/delta-track.md` say in as many
+words that two of the signals are dates parsed out of filenames and that a green
+run means "the calendar is being kept", not "the scan found nothing". What is new
+here is (a) the tracking clause being false, and (b) the fold concentrating the
+consequence onto one clock.
+
+**Fix shape, not decided here.** Options, cheapest first: tighten `*dep*` to a
+narrower stem (`*depaudit*` / `*dependency*`) and accept that existing projects'
+artefacts stop matching until renamed; require the match to be a regular file
+(closes R-WP6-7 outright, one `[ -f ]`); or add a minimum-content check to the
+two filename-derived arms, which is the only option that changes evidence rather
+than naming. The delta design already asks this as its own open question — §13-R14
+and reviewer question 4, *"tighten the clock as decided and log the evidence
+weakness, or tighten the clock and add a minimum-content check"* — so this entry
+is the evidence half of a question already on the record.
+
+**Related:** BL-219 and BL-220 (the same false-tracking clause in
+`scripts/cut-release.sh`, found first; this entry is what generalising that
+finding produced), BL-104 (a check whose printed result outran what it measured),
+BL-196 (a passing check that proves nothing is worse than no check).
+
+---
+
+## BL-223: `soif_parse_shipped_scripts` re-parses `init.sh` once per caller invocation — a single-pass rewrite is worth ~125ms a call, and it is a core lib with three consumers
+
+**Logged:** 2026-08-10 (measured during the WP5b brownfield fix round; filed
+because the follow-up otherwise existed only in a commit-body sentence)
+**Category:** Performance / core-lib hygiene — a hot loop in a shared parser
+**Severity:** Low. Nothing is wrong; it is slower than it needs to be, and the
+cost only became visible when a third consumer started calling it on every
+invocation rather than once per test run.
+**Status:** Open — DEFERRED
+
+**What it is.** `soif_parse_shipped_scripts` in
+`scripts/lib/scaffold-shipped-set.sh` greps `init.sh` for its `cp` lines and
+then spawns **one `sed` subshell per matched line** to extract the path:
+
+```
+grep -E 'cp[[:space:]]+"\$SCRIPT_DIR/scripts/' "$init_file" | while IFS= read -r line; do
+  rel="$(printf '%s\n' "$line" | sed -n 's#...#\1#p')"
+```
+
+With ~60 matched lines that is ~120 process spawns per call.
+
+**Measured, 2026-08-10:** **125 ms per call.** WP5b's
+`scripts/lib/adopt/adopt-test-debt.sh` calls it once per `--check` and once per
+`--write` — **67 invocation sites** across
+`tests/test-brownfield-wp5b-test-debt.sh` — which is the bulk of that suite's
+jump from ~11.4s to ~28.8s. A single-pass `sed -n 's#...#\1p'` over the file
+(no `grep`, no per-line subshell) does the same work in one process.
+
+**Why it was NOT done as a drive-by, and this is the load-bearing half of the
+entry.** It is a **core lib with NINE calling files**, each with its own
+correctness story. *A first draft of this entry said three, naming only the ones
+this work package had touched; adversarial review counted the rest. Derive the
+list, do not remember it —* `git grep -ln soif_parse_shipped_scripts -- 'scripts/*' 'tests/*'`
+*minus the lib itself:*
+
+| Consumer | What breaks if the parse changes |
+|---|---|
+| `tests/test-scaffold-source-closure.sh` | the BL-088 source-closure check — its whole claim is that the derived set is byte-identical to init.sh's real copy list |
+| `scripts/upgrade-project.sh --sync-framework` | BL-099 SLICE-A copies exactly this set framework→project |
+| `scripts/lib/adopt/adopt-test-debt.sh` | the test-debt census's framework exclusion; a set that shrinks silently re-opens the ledger poisoning the WP5b fix round closed |
+| `scripts/lib/adopt/adopt-state.sh` | the adoption **install** set — the same derivation the exclusion above subtracts, which is *why* they cannot diverge |
+| `scripts/adopt-project.sh` | the driver's own set reference |
+| `scripts/lib/currency-manifest.sh` | the currency manifest's shipped-file inventory |
+| `scripts/lib/plan-staging.sh` | plan staging iterates the set |
+| `tests/test-currency-birth-stamp.sh` | asserts against the derived set |
+| `tests/test-delta-wp8-intake.sh` | asserts against the derived set |
+
+The parser's own header says its full-line matching "mirrors the original inline
+parser in `tests/test-scaffold-source-closure.sh` **byte-for-byte** so both
+consumers observe an identical set". A rewrite has to preserve the glob-expansion
+branch (`host-drivers/`) and the sort/dedup, and it needs its own mutation proof
+that the emitted set is unchanged on the real `init.sh` — not a passing suite,
+which a *smaller* set also produces.
+
+**Acceptance:** the rewritten parser emits a byte-identical set to the current
+one on the real `init.sh` (diff of both outputs, asserted, not eyeballed); **every
+calling file's suite stays green — re-derive the list at the time, do not trust
+the table above**; a mutation that drops the glob-expansion branch reds.
+Re-measure and record the per-call cost.
+
+The byte-identical criterion is what makes the under-count survivable: it
+protects every caller regardless of whether the table names them. That is the
+reason to keep it even if a future rewrite looks obviously safe.
+
+**Related:** `## BL-088:` (source closure), `## BL-099:` (framework sync). The
+WP5b consumer arrived 2026-08-10 with the brownfield test-debt ledger.
+Measured cost: 125 ms/call on the implementer's run, 144 ms on the reviewer's —
+same magnitude, and the spread is why the entry says re-measure rather than
+quoting one number.
+
+---
+
+## BL-224: `lint-no-live-remote-in-tests.sh` reds any test that WRITES an `init.sh` carrying a `#!/usr/bin/env` shebang — the shebang string satisfies its own `env …` alternation
+
+**Logged:** 2026-08-10 (hit while building the WP5b brownfield fix round's
+incomplete-clone fixtures; reproduced and reduced to one line before filing)
+**Category:** Lint false positive — a hermetic-tests check firing on a file that
+is written, never executed
+**Severity:** Low, with one aggravating property: the workaround a contributor
+reaches for first is to SPELL AROUND the lint, which is the dodging pathology
+this repo already has scar tissue for on the unit-lane predicate.
+**Status:** Open — DEFERRED
+
+**The reproduction, one line.** In any `tests/test-*.sh`:
+
+```
+printf '#!/usr/bin/env bash\n# no copy lines\n' > "$m/init.sh" || true
+```
+
+**The trailing `|| true` is load-bearing and was missing from the first draft of
+this entry** — rule B requires `[[:space:]]` *after* the init token, so the bare
+redirect does not red (measured: rc 0, zero hits) and a future fixer running the
+recipe verbatim would conclude the bug was already gone. The real `mk_mirror`
+shape that first fired it ends `|| return 1 ;;`. Reproduce, then fix; the entry
+that sends you looking is only as good as its recipe.
+
+reds as:
+
+```
+lint-no-live-remote: init.sh run can reach LIVE remote creation — add --no-remote-creation …
+```
+
+Delete the shebang from the printf and the same line passes. Nothing is
+executed either way.
+
+**Why.** `line_is_init_exec`'s rule B is
+
+```
+(^|[(;&|]|&&|env[[:space:]][^;&|]*)[[:space:]]*"?<init-token>"?[[:space:]]
+```
+
+The `env[[:space:]][^;&|]*` alternative exists to catch `env FOO=bar "$INIT" …`.
+The literal text `/usr/bin/env bash\n# no copy lines\n' > ` also satisfies it —
+`env`, a space, then a run with no `;`/`&`/`|` — after which `"$m/init.sh"`
+matches the init token in apparent command position. The lint cannot tell a
+redirect TARGET from a command word here, and a shebang inside a single-quoted
+string is not code at all.
+
+**Scope, measured on the tree of 2026-08-10:** one occurrence, in
+`tests/test-brownfield-wp5b-test-debt.sh`'s `mk_mirror`, worked around by
+omitting the shebang from a stub that is only ever parsed. The stub's header
+says why in as many words, so the next reader does not "fix" it back.
+
+**Candidate fixes, none taken here.** (a) Require the init token to be preceded
+by a command terminator that is not inside a quoted string — a real shell-aware
+parse, and a large change to a lint with its own suite. (b) Exclude logical
+lines whose init token is immediately preceded by a redirect operator (`>`,
+`>>`) — narrow, cheap, and covers *the redirect class* exactly. (c) Anchor the
+`env` alternative so it must be at command position too.
+
+**Whichever is taken needs its own mutation proof** that a genuine
+`env FOO=bar "$INIT"` still reds, because the risk of narrowing a hermeticity
+lint is a live `gh repo create` — which this repo has already leaked once
+(2026-07-06).
+
+**(b) is NOT sufficient — two more over-broad shapes, measured by adversarial
+review 2026-08-10.** The first draft of this entry called (b) "the smallest
+honest fix"; that was written from one instance rather than from a survey.
+Rule B also reds:
+- a **heredoc body** line — `uses env FOO=bar "$m/init.sh" here` inside a
+  `<<'DOC'` block reds at rc 1, though nothing there is a command at all;
+- a **mid-word `env`** — `run_getenv "$m/init.sh" now` fires, because the
+  `env[[:space:]]` alternative has no left word-boundary.
+
+**(b) covers neither. (c) covers all three**, which makes command-position
+anchoring the fix to price rather than the redirect exclusion. Negative controls
+behaved correctly and should be kept as the preservation half of the proof:
+comments are stripped, an `scripts/env-setup.sh`-style path passes (`env`
+followed by `-`), and the genuine `env SOIF_FAKE=1 "$m/init.sh" --whatever`
+still reds.
+
+**Related:** `## BL-076:` (the lint itself). Sibling shape:
+`## BL-181:`, where narrowing a predicate by one character re-opened a hole
+three times.
+
+---
+
+## BL-225: The adoption driver writes 78 files into an adoptee, STAGES 64 of them, then discovers their `.gitignore` refuses one — no preflight, no rollback, no `git reset`, and a refusal that says "nothing has been committed"
+
+**Logged:** 2026-08-10 (found by adversarial review of the brownfield WP6
+branch; the WP6-local instances of the same class were fixed there, this is the
+residual one level down)
+**Category:** Fail-loud-but-late — a refusal that arrives after the mutation it
+should have prevented
+**Severity:** Real, not cosmetic. The failure direction is safe (nothing leaks,
+git names the culprit) but the adoptee is left half-written with no way back
+except by hand.
+**Status:** Open
+
+**What happens.** `scripts/adopt-project.sh` stages every recorded path in ONE
+`git add`, and `git add` on a gitignored path FAILS. WP6 fixed this for the
+paths it owns — the collision archive's entries, both MANIFESTs and the audit
+ledger all route through `_adopt_record_if_stageable`, which withholds an
+ignored path and says so. **Withholding is not available for the rest.** The
+framework-owned paths recorded unconditionally in `adopt-state.sh` and
+`adopt-core.sh` — the shipped script set, `.claude/phase-state.json`,
+`.claude/manifest.json`, `PROJECT_INTAKE.md`, the kept scan report — are the
+files the adoption *is*; skipping one produces a broken install rather than a
+disclosed omission.
+
+**Reproduced, hermetically, on an adoptee whose `.gitignore` is the single line
+`.claude/`** (framework clone at `feat/brownfield-wp6-collision-archive`, host
+git config neutralised; the adoptee carries the ordinary AI-layer surfaces, so
+the collision archive has entries to write):
+
+```
+adopt rc                 : 1
+HEAD subject             : chore: their history   <- their own, not adoption's
+files WRITTEN (delta)    : 78
+  of which under .claude : 14    <- hidden from `git status` by their own rule
+git status 'A ' (staged) : 64
+git status '??'          : 0
+paths in INDEX vs HEAD   : 64
+```
+
+⚠ **Amended: an earlier revision of this entry said "64 untracked". Both halves
+of that were wrong** — the number was the staged count, and nothing was
+untracked at all. The experiment was right and the *reading* of it was not; the
+correction is recorded rather than silently overwritten because misreading a
+measurement is the same defect class as not taking one. On a bare adoptee with
+no AI-layer surfaces the written total is **69** (5 under `.claude/`); the
+78/14 figures are the realistic shape, where the archive has files to write.
+
+**The 64 are STAGED, not stray, and that is the hazard.** The partially-failed
+`git add` stages every non-ignored path *before* erroring on `.claude`, and the
+refusal path does no `git reset`. So the operator is left with 64 framework
+files pre-loaded in their index. Measured consequence — their next innocent
+commit:
+
+```
+$ echo 'a routine edit' >> README.md && git add README.md && git commit -m "docs: a routine edit of my own"
+files in that commit     : 65
+  framework scripts in it: 63
+```
+
+**Three things make the aftermath worse than the abort itself.**
+
+1. The refusal says **"Adoption did not complete. Nothing has been committed."**
+   Literally true, and it reads as "nothing happened" — while 78 files sit in
+   the tree and 64 are staged. It should distinguish *committed* from *written*
+   from *staged*.
+2. Git names the culprit (`.claude`) in a hint on stderr, and the driver's own
+   line then **asks the question git just answered**: *"are any of them ignored
+   by .gitignore?"*. The information is present and the framework declines to
+   use it.
+3. Cleanup guidance is absent, and `git reset` is the first step of it — without
+   it the residue is not merely untidy, it is armed.
+
+**The right shape** is a preflight `git check-ignore` over the whole write-set
+BEFORE anything is written, with a legible refusal naming the offending
+patterns and the paths they cover — the same information the post-hoc git error
+carries, delivered while it is still actionable. `adopt_written_paths` already
+knows the set for the withheld half; the preflight needs the framework-owned
+half enumerated before the run rather than accumulated during it.
+
+**Not in scope for WP6**, which owns §7's archive. Filing rather than fixing
+because the write-set enumeration is a driver-skeleton change (WP4's surface)
+and deserves its own TDD pass.
+
+**Related:** BL-221 (the other adoption-path fail-direction finding), and
+`# BF-ADOPT-STAGE-EXPLICIT` for the staging call this refuses at.
+
+---
+
+## BL-226: Adoption tells the operator their files were "moved" when for most of them nothing moved
+
+**Logged:** 2026-08-10 (found during the brownfield WP6 build; carried forward
+by review rather than resolved, because the wording is design-mandated)
+**Category:** Honest-output defect — spec-conformant text contradicted by the
+program's own per-entry data
+**Severity:** Cosmetic in mechanism, not in consequence: it is the sentence an
+operator reads while deciding whether to trust the tool with their repository.
+**Status:** Open
+
+**The contradiction.** §7.3 mandates the disclosure sentence *"moved to ensure
+the framework operates properly"*, and `MANIFEST.md` repeats it. Both ship. But
+§7.1's other half — install the framework's clean set over the archived
+original — **is not built for the AI-layer surfaces**, because `init.sh` writes
+`.claude/settings.json` inline inside `create_project()` with no extractable
+emitter, and §8.1 forbids the driver from reaching into that function. So the
+archive COPIES and leaves the originals in place and in charge.
+
+The program already knows this and records it correctly: every entry carries a
+`disposition`, and every value is `kept` except `.git/hooks/commit-msg`, which
+is `composed`. **Nothing is `replaced`.** The per-entry field and the headline
+sentence disagree, and the sentence is the one a person reads first.
+
+**Options, none taken here:** (a) build the replacement half for the AI layer,
+which needs an extractable settings emitter and is a real piece of work;
+(b) re-word the disclosure to match the dispositions, which contradicts a
+verbatim design mandate and so is Karl's call, not an implementer's; (c) print
+the mandated sentence scoped to the entries it is true of, and a different one
+for `kept`. The WP6 build chose to ship the mandate and file the contradiction
+rather than quietly re-word a design-decided string.
+
+**Related:** BL-225 (the other WP6-adjacent residual), and
+docs/designs/2026-08-02-brownfield-adoption-v1.md §7.1/§7.3/§7.5.
+
+---
+
+## BL-227: seven inline `jq '. + [$r]'` appends bypass `bypass_audit_append` entirely — and a live doc sentence says none do
+
+**Logged:** 2026-08-10 (found by adversarial review while verifying WP6's
+appender-level fix; the count was then re-derived and came out one higher than
+the review's)
+**Category:** Chokepoint that is not one / silent-success class — the guard that
+makes ledger corruption loud is installed at a door six of the seven writers do
+not use
+**Severity:** Medium. Pre-existing and outside WP6's diff, so nothing shipped
+today regressed. But WP6 fixed a real silent-loss defect **at the library** on
+the stated rationale that "every caller that trusts the rc" is protected there —
+and that rationale is bounded by this entry.
+**Status:** Open
+
+**The claim that is refuted.** `docs/audit-log-lifecycle.md` § Ledger states:
+
+> **Writer:** every writer goes through
+> `scripts/lib/bypass-audit.sh::bypass_audit_append`. Direct edits are not part
+> of the contract.
+
+`git grep -c "jq --argjson r" -- 'scripts/*' 'init.sh'`, minus the library
+itself, returns **seven sites in five files**:
+
+| file | sites |
+|---|---|
+| `init.sh` | 1 |
+| `scripts/detect-out-of-band-commits.sh` | 1 |
+| `scripts/install-filesystem-gates.sh` | 1 |
+| `scripts/reconfigure-project.sh` | 2 |
+| `scripts/upgrade-project.sh` | 2 |
+
+**Derive this number, do not quote it.** The review that found the class named
+**six**, omitting `install-filesystem-gates.sh`; re-running the grep at filing
+time produced seven. The recipe is in this paragraph precisely so the next
+reader re-runs it rather than trusting either figure.
+
+**Why it matters, measured.** Each site is the identical
+`jq '. + [$r]' "$f" > tmp && mv` shape whose behaviour on a **zero-byte** ledger
+was measured during WP6 round 3: jq runs the filter over zero input documents,
+emits nothing, and **exits 0** — the append "succeeds", writes an empty file
+over an empty file, and drops the row. A `null` ledger is worse: `null + [$r]`
+evaluates to `[$r]`, so the corrupt state a reader would have investigated is
+silently **repaired away**. So, e.g., `detect-out-of-band-commits.sh` can print
+that it recorded a bypass to `.claude/bypass-audit.json` having written nothing.
+
+`bypass_audit_append` now refuses all of empty / `null` / multi-document /
+non-array with a loud failure and an untouched file
+(`jq -es 'length == 1 and (.[0] | type == "array")'`). **None of the seven
+inline sites inherits that.**
+
+**Fix shape.** Route all seven through `bypass_audit_append`. Two constraints
+worth knowing before starting: some sites run in contexts where the library is
+not sourced (`init.sh` scaffolds *into* a project rather than running inside
+one), so this is a real refactor rather than a sed; and the archived BL-029 /
+BL-030 plans already scheduled these rewrites and they did not happen, which is
+itself evidence that "route it through the library later" does not survive
+contact with a work package.
+
+**The weaker alternative, if the refactor is not taken:** correct the
+`audit-log-lifecycle.md` sentence to say what is true. A doc that overstates a
+chokepoint is worse than no doc, because the next author reads it and installs
+their guard at the door nobody uses — which is exactly what WP6 nearly did.
+
+**Related:** `## BL-225:` (the other WP6-adjacent residual), `## BL-029:` /
+`## BL-030:` (the archived plans that scheduled this), and BL-104's
+silent-success family.
+
+---
+
+## BL-228: `language` is a single-select scalar, so a polyglot project cannot be described — and nothing ever asks for the system architecture
+
+**Logged:** 2026-08-11 (Karl, from a concrete case: a client/server product whose
+frontend is C++ with a couple of Python modules and whose backend is Rust over
+PostgreSQL. Today that project must claim to be one language.)
+**Category:** Product gap / intake expressiveness — the scaffold models a
+single-language project, and real projects routinely are not one
+**Severity:** Medium-High. Nothing is broken for the projects the model fits, and
+the escape hatch (`other`) keeps a polyglot project *working*. But everything
+downstream that is language-derived is then derived from a fiction: the operator
+picks the language they care most about, and the tooling, the CI lane and the
+generated docs quietly serve that one.
+**Status:** Open
+
+### What exists today, measured on `main` @ `b24627c`
+
+**The selection is singular, at one site.** `init.sh` asks
+`prompt_choice "Primary language:"` (grep `Primary language:` — one occurrence),
+and the answer is written to `.claude/manifest.json` as a **scalar**:
+
+```
+  "language": "typescript",
+```
+
+The word *Primary* is doing real work in that prompt: it already concedes there
+may be others, and then offers nowhere to put them.
+
+**15 files read it**, as of `b24627c`:
+
+```
+git grep -l '\.language\b\|LANGUAGE\|\$language' -- scripts/ init.sh templates/ | wc -l
+```
+
+**Re-derive it; do not quote it.** The first draft of this entry said *14* — the
+author miscounted their own grep output while writing the sentence that tells you
+not to trust the number. That is the fourth wrong enumeration in this backlog
+inside a week (the delta consumer table said six and was eight, `## BL-223:` said
+three and was nine, `## BL-227:` said six and was seven), which is the whole
+reason the recipe is printed here instead of the answer.
+
+The load-bearing consumers:
+
+| consumer | what the single value decides |
+|---|---|
+| `scripts/resolve-tools.sh` | which tools are required. Filters the tool matrix at the `.languages` predicate |
+| `templates/pipelines/ci/github/*.yml` | **one template per language** — `csharp`, `dart`, `go`, `java`, `kotlin`, `python`, `rust`, `swift`, `typescript`, and `other` |
+| `scripts/lib/hook-templates.sh` | the emitted pre-commit hook's test/lint invocations |
+| `scripts/run-phase3-validation.sh` | which scanners run |
+| `scripts/lib/render-project-docs.sh`, `templates/generated/claude-md.tmpl` | what the generated project tells its own agent it is written in |
+
+**Half the data model is already plural.** Every tool-matrix row carries
+`"languages"` as a **list** (`jq '.tools[0] | keys' templates/tool-matrix/common.json`),
+and `resolve-tools.sh` matches against it. So the *catalogue* is polyglot-ready;
+it is the *selection* that is scalar. That asymmetry is the cheapest place to
+start and it is why this is not a rewrite.
+
+**The CI lane is the hard part, and it should be scoped honestly.** One template
+per language means the C++/Python/Rust example gets exactly one lane. Whether the
+answer is a composed multi-job workflow, per-component lanes, or a documented
+limitation is a design question, not an implementation detail — and `other.yml`
+exists precisely because this was already known to be lossy.
+
+**Nothing asks for the system architecture.** `scripts/intake-wizard.sh` § 6.4 is
+titled "Architecture Preferences", and what it actually asks is *data storage*,
+*authentication strategy*, and then per-platform *frontend framework* / *UI
+framework* / *hosting*. Those are **component choices**. Nowhere does the intake
+ask — or offer to suggest — the **shape** of the system: monolith, client/server,
+N-tier, microservices, event-driven, serverless, or a hybrid. A project's
+architecture drives its phase plan, its test strategy, its deployment surface and
+its Phase 3 validation scope, and today the framework infers none of it.
+
+### What is wanted
+
+1. **Multiple languages, with roles.** Not a flat list — the example is
+   structured: a C++ *frontend client* with Python *modules*, a Rust *backend*, a
+   PostgreSQL *datastore*. A flat `["cpp","python","rust"]` loses which is which,
+   and the CI and tooling questions are answerable only with the structure.
+   Whether that is components-with-languages or languages-with-roles is the first
+   design decision.
+2. **Architecture asked, and suggested.** The intake should ask for the system
+   shape and be able to **propose** one from what it already knows (platform,
+   deployment tier, the component set above) — as a *suggestion the operator
+   confirms or overrides*, never a silent default. The house pattern for this
+   already exists: `# BL-204-PREFILL-READ` (offer what is known as evidence, with
+   its provenance, and let "change it" fall through to the full question), and
+   the brownfield chooser's rule that a judgement the framework has never made
+   gets **no default and no skip**.
+3. **Backward compatibility is not optional.** Every existing project has a
+   scalar `"language"`. A plural model has to read those without a migration
+   step, and `scripts/upgrade-project.sh` has to carry existing projects forward.
+
+### Constraints whoever takes this should know before designing
+
+- **`# BL-084-TIER-KEY` is the cautionary tale.** A predicate spread across four
+  scripts had to be kept in sync by hand; a fifth spelling would be a defect on
+  arrival. A polyglot model touches *more* consumers than that one does — so the
+  read path wants to be a single accessor from the start, not four `jq` calls
+  that drift.
+- **`BL-221` is the live example of what a widened schema does to a reader that
+  did not widen with it**: `jq -r '.deployment // "personal"'` turns a *missing*
+  key into a *permissive* answer. Any `.language` reader that meets a `languages`
+  array — or vice versa — must fail closed and loud, never quietly pick a
+  default.
+- **Do not let the scaffold and the tool matrix disagree.** The matrix's
+  `languages` list is the existing plural vocabulary; a second, differently
+  spelled list in the manifest is the drift shape this repo keeps paying for.
+
+### Fix shape
+
+Design doc first — this is a schema change with 14 consumers, a CI story that has
+no obvious answer, and a new intake section. Not a work package that starts by
+editing `init.sh`.
+
+**Related:** `## BL-204:` (the prefill-with-provenance pattern the architecture
+question should reuse), `## BL-084:` (the sync-siblings cautionary tale),
+`## BL-221:` (what a schema change does to an un-widened reader),
+`## BL-095:` (centralize state parsing — a polyglot `language` is exactly the
+field that argues for it).
+
+---
+
+## BL-229: the Phase 3→4 release-pipeline check hardcodes the GitHub path, so on GitLab and Bitbucket it silently never fires
+
+**Logged:** 2026-08-11 (found while verifying `workflow.html` against the tree —
+the page described the check, and describing it required reading it)
+**Category:** Silent-success / host-parity — a gate that does not gate, and says
+nothing about it
+**Severity:** Medium-High. Not a wrong answer: an **absent** answer, on two of
+the three supported hosts, with no output distinguishing "checked and clean" from
+"never looked".
+**Status:** Open
+
+**The gap, measured on `main` @ `b709576`.** `scripts/check-phase-gate.sh`
+guards the release-TODO check on a literal path:
+
+```
+if [ -f ".github/workflows/release.yml" ]; then
+  todo_count=$(grep -c "TODO" .github/workflows/release.yml 2>/dev/null) || todo_count=0
+```
+
+`init.sh` writes that file **per host** (grep `target_file="$target_dir/release.yml"`):
+
+| host | path init.sh writes |
+|---|---|
+| github | `.github/workflows/release.yml` |
+| **gitlab** | **`.gitlab-ci/release.yml`** |
+| **bitbucket** | **`bitbucket-pipelines/release.yml`** |
+| unknown | falls back to the GitHub path, with a warning |
+
+On a GitLab or Bitbucket project the `-f` test is false, the block is skipped
+entirely, and **nothing is printed** — so a release pipeline still full of
+unconfigured `TODO` items passes the 3→4 gate on those hosts without comment.
+
+**Why this is the wave's own defect class.** The failure is not a false verdict,
+it is a **missing** one that is indistinguishable from a clean one. It is the
+same shape as `## BL-222:` (the security clock a filename satisfies) and the
+`# BL-112-SAST-NOTRUN` doctrine's whole point: *"the scanner did not run" must
+never be silently equivalent to "the scanner found nothing."* That doctrine is
+already written down in this repo and this check predates its application here.
+
+**Fix shape.** Resolve the release path the way `init.sh` does — from the
+recorded host — and then **fail closed on absence rather than skipping**: if the
+project's expected release file is missing, say so. Two constraints:
+
+- **Do not just add three `-f` tests.** The host→path mapping would then exist in
+  two places, which is the `# BL-084-TIER-KEY` sync-siblings trap that this repo
+  has paid for repeatedly. Read the host from the manifest and derive the path
+  once, or expose `init.sh`'s mapping as a shared accessor.
+- **Mind the `[WARN]` trap.** The existing arm prints `[WARN]` and increments
+  `issues`, so it **blocks** today on GitHub. Whatever replaces it must decide
+  deliberately whether a missing release file blocks, and pin that decision with
+  a dual-direction mutation proof — the label is cosmetic, the `issues`
+  increment is the behaviour.
+
+**Proof it should carry.** A GitLab fixture with a TODO-bearing
+`.gitlab-ci/release.yml` must be caught; the same fixture with the TODOs removed
+must pass; and a mutation reverting the path resolution must make the first
+fixture pass silently again — because "it passed" and "it was never examined"
+are the two states this entry exists to separate.
+
+**Related:** `## BL-222:` (a clock satisfied by a filename — same class, same
+silence), `## BL-084:` (the sync-siblings trap the two-places fix would walk
+into), `## BL-104:` (the `[WARN]`/`issues` mismatch), and `## BL-112:` (the
+"did not run ≠ found nothing" doctrine this check should inherit).
+
+---
+
+## BL-230: `workflow.html` cites 18 code markers and 7 doc paths and sits outside every lint surface — nothing can tell you when it rots
+
+**Logged:** 2026-08-11 (found by adversarial review of the `workflow.html`
+refresh, **by mutation** — the reviewer corrupted a link and a marker and watched
+both lints stay green)
+**Category:** Silent-success / unguarded surface — the file whose entire value is
+that an operator can trust it has no mechanism that notices when it stops being
+true
+**Severity:** Medium. Nothing is wrong today: the page was just verified
+claim-by-claim against the tree. That is exactly why this is worth filing —
+**the accuracy has no way of surviving.** It went six weeks and ~40 PRs out of
+date last time, and the only thing that caught it was a human asking.
+**Status:** Open
+
+**Measured on the refresh branch.** The page cites **18 distinct code markers**
+(`BL-070-GATE-CHECK`, `BL-071-WRITE`, `BL-073-ESCALATE`, `BL-104-MANIFEST-ARM`,
+`BL-115-DATE-CELL`, `BL-170-APPEND-DESIGN`, `BF-ADOPT-BOUND`,
+`BF-ADOPT-GATE-ISSUES`, `CUTREL-TAG-FORMAT`, `CADENCE-DEFAULT-ROUTINE`,
+`CADENCE-DEFAULT-DEEP`, `CADENCE-POLICY-READ`, `DELTA-OPEN-ERA-GUARD`, …) and
+**7 relative doc links**. Re-derive both:
+
+```
+grep -oE '(BL|BF|CUTREL|CADENCE|DELTA|WALK)-[A-Z0-9]+(-[A-Z0-9]+)*' workflow.html | sort -u
+grep -oE 'href="(docs/[^"]+|[A-Za-z][^":]*\.md)"' workflow.html | sort -u
+```
+
+**Neither lint can see the file, and the reason is structural in both:**
+
+- `scripts/lint-doc-anchors.sh` walks `find "$DOCS_DIR" -type f -name '*.md'` —
+  `workflow.html` is neither `*.md` nor under `docs/`.
+- `scripts/lint-bl-markers.sh`'s live prose surface is `CLAUDE.md`, `README.md`,
+  `CONTRIBUTING.md`, `solo-orchestrator-backlog.md` and `docs/**`. A root-level
+  `.html` is in none of them.
+
+**The proof is a mutation, not an argument.** Adversarial review broke a relative
+link (`docs/scout.md` → a nonexistent path) **and** corrupted a cited marker
+(`BF-ADOPT-GATE-ISSUES` → `…ISSUEZ`) in the page, then ran both lints: **rc 0
+both times.** So the marker half of the CITATION RULE — which `## BL-196:` made
+lint-enforced precisely because line cites rot — does not reach the one document
+most likely to be read by someone who will act on it.
+
+**Two live specimens of the rot class, found during the same review**, offered as
+evidence that this is not hypothetical: `scripts/resume.sh` now has **four**
+branches, and both `CLAUDE.md` and `resume.sh`'s **own header** still say three
+(`# DELTA-RESUME-BEGIN` is literally labelled "THE FOURTH BRANCH"). Prose lags
+code by default; a lint is the only thing that makes lag visible.
+
+**Fix shape.** Extend both lints' surfaces to include `workflow.html`
+specifically — not `*.html` wholesale, because `templates/uat/**` ships HTML
+fixtures that are *meant* to carry placeholder paths and would red immediately.
+Two constraints:
+
+- **`lint-bl-markers.sh` counts a citation only when prose marks it as code**
+  (backticked or `#`-prefixed, per CLAUDE.md). The page uses `<code>` tags, not
+  backticks, so the prose-surface reader needs an HTML-aware arm or the marker
+  half will pass **vacuously** — green because it found nothing to check. Give
+  that arm a **vacuity floor** (assert it finds ≥ N citations) or it is the same
+  defect one level up.
+- The page's footer carries a "Verified against the tree on YYYY-MM-DD" stamp.
+  A lint that checks the stamp's **age** against the file's last-modified commit
+  would catch staleness the marker check cannot — a cited marker can still exist
+  while the sentence around it has become false.
+
+**Related:** `## BL-196:` (made the marker half lint-enforced, and named exactly
+this rot), `## BL-181:` (a green lint that was not proof), `## BL-227:` (a doc
+sentence refuted by a grep), and `## BL-222:` (a check satisfied without looking).
+
+---
+
+## BL-231: redo Qdrant so it is forced to work — today a dead database satisfies the gate, and the half that builds the memory is never enforced
+
+**Logged:** 2026-08-12 (Karl: *"redo the qdrant so it's forced to work
+properly"* — after asking whether the semantic-memory setup was doing the
+context-reduction job it was built for. It is not, and every claim below was
+measured, including a live call to the database.)
+**Category:** Silent-success, end to end — "configured" is treated as
+"reachable", "invoked" is treated as "succeeded", and the write half is
+advisory
+**Severity:** High. Nothing crashes; that is the problem. The gate reports
+satisfied, writes are unblocked, and **zero prior context is retrieved**. The
+feature's entire purpose — call the database instead of re-loading context — is
+silently not happening, and no surface anywhere says so.
+**Status:** Open — **the fix is owned by `## BL-233:`** (the shared enforcement
+mechanism). This entry is the evidence; do not patch it in isolation, because a
+fix here leaves the mechanism intact.
+
+### What exists, and it is the right intent
+
+`scripts/session-mcp-gate.sh` is a PreToolUse hook on `Write`/`Edit` whose own
+reason string is *"qdrant-find (retrieve prior session context before starting
+work)"*. Its header states the goal plainly: *"session-start MCP requirements
+were advisory only. This hook makes them mechanical — the agent cannot produce
+output until it has loaded prior context."* `scripts/session-end-qdrant-reminder.sh`
+is the Stop-hook counterpart. Both ship via `init.sh`. Landed in `0352ef3`
+(PR #3) and `92190bf`.
+
+**The design is what it should be. The enforcement is not.**
+
+### Measured on `main` @ `9060d31` — the chain, end to end
+
+1. **The database is not running.** MCP config points at `http://localhost:6333`,
+   collection `solo-orchestrator`. Ports 6333/6334 closed, no containers. A live
+   call returns:
+   ```
+   qdrant-find("architecture decisions solo orchestrator")
+   → Error: All connection attempts failed
+   ```
+2. **Detection asks the wrong question.** `session-test-gate-check.sh` sets
+   `QDRANT_CONFIGURED=true` by matching a server *named* `qdrant` in the MCP
+   settings. It never probes reachability. A dead database is "configured".
+3. **A FAILED call satisfies the gate.** `scripts/track-tool-usage.sh` reads
+   `.tool_name` from the PostToolUse payload and sets `qdrant_find_called = true`
+   on the **name alone** — it never inspects `.tool_response` for an error. So
+   the call above, which connected to nothing, would mark the requirement met.
+4. **The gate then latches.** `session-mcp-gate.sh` writes
+   `mcp_gate_satisfied = true` and every later `Write`/`Edit` takes the fast path.
+
+**Net: the agent "loads prior context" from a database that is not there, is told
+it succeeded, and proceeds.**
+
+### And it is fail-open at four more layers
+
+| layer | line | behaviour |
+|---|---|---|
+| tracking file absent | `session-mcp-gate.sh` — `[ ! -f "$TOOL_USAGE" ] && exit 0` | no file ⇒ **no enforcement**, silently |
+| `jq` absent | `command -v jq &>/dev/null \|\| exit 0` | no jq ⇒ **no enforcement**, silently |
+| **the requirement key is missing from the seed** | `init.sh`'s `tool-usage.json` heredoc contains **no `mcp_requirements` object at all** (verified: 0 occurrences) | `.mcp_requirements.qdrant_required // false` ⇒ **false** ⇒ Qdrant not required |
+| tracker re-seed | `track-tool-usage.sh:55` writes `"qdrant_required": false` | a re-created file turns the requirement **off** |
+
+The third row is `## BL-221:` exactly — a **missing key defaulting to the
+permissive answer**. The requirement is only ever switched on later, by
+`session-test-gate-check.sh`, and only if that hook runs.
+
+### The deepest problem: the half that builds the memory is not enforced
+
+`qdrant-store` **satisfies nothing, anywhere** — not the session gate, not
+`pre-commit-gate.sh`. Retrieval is mandatory; accumulation is a Stop-hook
+suggestion, delivered *after* the work is done and the session is ending.
+
+**You cannot retrieve what was never stored.** The only enforced half depends
+entirely on the unenforced half having happened, which makes the whole thing a
+ratchet with nothing behind it — and explains why it never reduced context bloat
+even before the database went down.
+
+### What "forced to work properly" has to mean
+
+1. **Probe reachability, do not infer it from configuration.** A named server is
+   not a running one. `# BL-112-SAST-NOTRUN`'s shipped doctrine is the precedent
+   and it is already this repo's law: *"the scanner did not run" must never be
+   silently equivalent to "the scanner found nothing."*
+2. **Verify the call succeeded, not that it was made.** Read `.tool_response`.
+   This session alone produced four siblings of this bug — `jq` exiting 0 without
+   reading a document (`## BL-227:`), `sed` reporting success without editing,
+   a mutant scored as killed that was never applied, a gate satisfied by a
+   filename (`## BL-222:`). **An exit code is not a receipt.**
+3. **Enforce the write half**, or state plainly that the memory is
+   operator-curated and stop implying otherwise. A session that made source
+   commits and stored nothing is the case to decide about.
+4. **Fail closed, loudly, when Qdrant is required and unreachable** — and make
+   that distinguishable from "not configured". Three states, not two:
+   configured-and-reachable, configured-and-down, not-configured.
+5. **Seed `mcp_requirements` in `init.sh`** so the default is not silence.
+6. **Register the hooks in this repo.** They are wired into *generated* projects
+   only; solo-orchestrator has no `.claude/settings.json`, so none of this fires
+   where the framework is actually built. Same gap as the version-check hook.
+
+### Traps for whoever does it
+
+- **Do not make it unbypassable without an escape.** A gate that cannot be
+  satisfied when the operator is offline, or on a plane, is one people delete —
+  the `## BL-149:` false-FAIL doctrine. The BL-072 TDD gate is the model: hard
+  block, with an attested escape that must be **durably recorded**, and a refusal
+  if the record cannot be written.
+- **Mind the latch.** `mcp_gate_satisfied` is written into a file the agent can
+  edit. Decide deliberately whether a satisfied gate should survive `/compact`,
+  `/clear` and a new session — `5b1a081` already had to fix this file's
+  merge-vs-overwrite behaviour once.
+- **Any fix needs a dual-direction mutation proof**: unreachable database ⇒ RED;
+  reachable database ⇒ GREEN; and the proof must fail if the probe is deleted.
+  A test that passes because the tool was *called* is the bug, restated.
+
+**Related:** `## BL-221:` (missing key ⇒ permissive default), `## BL-222:` (a
+gate satisfied without looking), `## BL-227:` (an exit code that is not a
+receipt), `## BL-112:` ("did not run" ≠ "found nothing"), `## BL-149:` (a gate
+people route around is worse than none), `## BL-230:` (the sibling
+"nothing watches this" finding filed the same week).
+
+---
+
+## BL-232: the Context7 session gate is satisfied by looking up a library ID and never reading a document
+
+**Logged:** 2026-08-12 (Karl: *"validate the use of context7 as a reference
+before each build session"* — filed with `## BL-231:`, which covers the Qdrant
+half of the same gate. Everything below measured on `main` @ `9060d31`,
+including a live call.)
+**Category:** Proxy that does not measure the thing — the gate's own reason
+string names documentation, and documentation is never required
+**Severity:** Medium-High. Unlike its Qdrant sibling, **Context7 is genuinely
+reachable and working** (verified: `resolve-library-id` returned five Qdrant
+libraries with snippet counts and reputation scores). So this is not a dead
+dependency — it is a live one whose gate does not check what it says it checks.
+**Status:** Open — **the fix is owned by `## BL-233:`** (the shared enforcement
+mechanism). This entry is the evidence; do not patch it in isolation, because a
+fix here leaves the mechanism intact.
+
+### The gate, and what it says it is for
+
+`scripts/session-mcp-gate.sh` blocks `Write`/`Edit` until Context7 has been
+called, with this reason, verbatim:
+
+> `context7 resolve-library-id or query-docs (verify library documentation is
+> current before writing).`
+
+### The defect specific to Context7
+
+`scripts/track-tool-usage.sh` sets `context7_called = true` when the tool name
+matches `grep -q "context7"`. Both MCP tools match:
+
+| tool | satisfies the gate? | returns documentation? |
+|---|---|---|
+| `mcp__context7__resolve-library-id` | **yes** | **no — a list of library IDs** |
+| `mcp__context7__query-docs` | yes | yes |
+
+**`resolve-library-id` fetches no documentation at all.** It answers "what is
+this library's Context7 ID?" — a lookup step whose entire purpose is to produce
+an argument for the call that *does* fetch docs. So the gate that exists to
+ensure the agent read current documentation is satisfied by an act that reads
+none, and the agent is then free to write code against remembered APIs.
+
+The same call also resets `commits_since_last_context7 = 0`, so an ID lookup
+silences the commit-time staleness nudge as well.
+
+This is `## BL-222:`'s shape on a different surface: a check that measures a
+**proxy** for the thing it is named after, where the proxy is satisfiable
+without the thing happening.
+
+### Everything BL-231 documents applies here too — same gate, same layers
+
+`.mcp_requirements.context7_required // false` (missing key ⇒ **not required**);
+`init.sh`'s `tool-usage.json` seed contains **no `mcp_requirements` object**;
+`track-tool-usage.sh:56` re-seeds `"context7_required": false`; absent tracking
+file or absent `jq` ⇒ silent no-enforcement; and `mcp_gate_satisfied` latches
+after the first pass. **And `context7_called` is set from the tool NAME, never
+from `.tool_response`** — so a Context7 call that errors satisfies the gate
+exactly as a Qdrant one does.
+
+### The commit-time half does not block
+
+`scripts/pre-commit-gate.sh` checks `commits_since_last_context7 >= 2` and
+appends to `WARNINGS`, which is emitted with
+`"permissionDecision": "allow"` — **explicitly non-blocking**. So after the
+session-start gate is satisfied once, Context7 staleness never stops anything;
+it is a nudge, and a nudge an ID lookup resets.
+
+### What "validated before each build session" should mean
+
+1. **Require the call that actually fetches documentation.** `query-docs` should
+   satisfy the gate; `resolve-library-id` alone should not — it is the argument
+   step, not the reference step. If the pair must be allowed, require **both**,
+   in that order.
+2. **Verify the response, not the invocation** (`## BL-231:` item 2). Read
+   `.tool_response`; an error must not count.
+3. **Decide what "before each build session" means when no library is involved.**
+   A session that touches only shell scripts has nothing to look up, and a gate
+   that cannot be satisfied honestly is one people route around — `## BL-149:`.
+   The likely shape is: required when the change touches a language with
+   dependencies, skippable-with-a-reason otherwise, and the skip recorded.
+4. **Seed `mcp_requirements` in `init.sh`** so the default is not silence.
+
+### Worth knowing before designing it
+
+What actually causes Context7 to be consulted today is **not this gate** — it is
+a prompt-level instruction in the operator's own Claude configuration, outside
+this repo. That is why the feature appears to work in practice while the
+enforcement measured above does essentially nothing. A redesign should not
+mistake the prompt's effect for the gate's.
+
+**Related:** `## BL-231:` (the Qdrant half of the same gate — read them
+together), `## BL-222:` (a check satisfied by a proxy), `## BL-149:` (a gate
+people route around is worse than none), `## BL-112:` ("did not run" must never
+read as "found nothing").
+
+---
+
+## BL-233: the MCP enforcement mechanism records DECLARATIONS, never OUTCOMES — one root cause behind BL-231 and BL-232, and the fix belongs here
+
+**Logged:** 2026-08-12 (Karl, on reading `## BL-231:` and `## BL-232:`:
+*"This is the same as qdrant. We need to fix enforcement."* He is right, and
+they are not two bugs. They are two faces of one mechanism.)
+**Category:** Enforcement architecture — a gate whose every layer asks whether
+something was *declared* rather than whether it *happened*
+**Severity:** High. This entry owns the fix. `## BL-231:` and `## BL-232:`
+document the two visible symptoms and should be read first for the evidence;
+neither should be fixed on its own, because a patch to either leaves the
+mechanism intact.
+**Status:** Open
+
+### The mechanism
+
+Three files, 435 lines total, registered by `init.sh` into generated projects:
+
+| file | role |
+|---|---|
+| `scripts/session-test-gate-check.sh` | SessionStart — decides what is *required* |
+| `scripts/track-tool-usage.sh` | PostToolUse — records what was *done* |
+| `scripts/session-mcp-gate.sh` | PreToolUse on `Write`/`Edit` — *blocks* until satisfied |
+
+The intent is sound and its own header says so: *"session-start MCP requirements
+were advisory only. This hook makes them mechanical — the agent cannot produce
+output until it has loaded prior context and verified library documentation."*
+
+### The single root cause
+
+**At every layer the mechanism substitutes a declaration for an outcome.** Once
+that frame is applied, the seven separately-filed defects collapse into one:
+
+| layer | what it asks | what it should ask |
+|---|---|---|
+| availability | is a server **named** `qdrant`/`context7` listed in settings? | does it **answer**? |
+| satisfaction | was a tool **whose name matches** called? | did the call **return usefully**? |
+| sufficiency | was *any* matching tool called? | was the tool that **does the work** called (`query-docs`, not `resolve-library-id`) |
+| requirement | is `mcp_requirements.X_required` **present and true**? | absent must not mean **no** |
+| persistence | was the gate satisfied **once**? | is it satisfied **now**, this session? |
+| dependency | did the agent **read** memory? | was anything ever **written** for it to read? |
+| degradation | is the tracking file / `jq` **present**? | absent must **fail closed**, not exit 0 |
+
+Every row is the same substitution. That is why patching Qdrant and Context7
+separately would produce two patches and no fix.
+
+### What the redesign has to do
+
+1. **Probe, do not infer.** Availability is a round trip, not a config key. Three
+   states, distinguishable in output: reachable / configured-but-unreachable /
+   not-configured. `# BL-112-SAST-NOTRUN` is the shipped precedent — *"did not
+   run" must never read as "found nothing."*
+2. **Read `.tool_response`.** The PostToolUse payload carries the result; the
+   tracker currently reads only `.tool_name`. An error must not satisfy anything.
+3. **Name the tool that does the work.** `resolve-library-id` is the argument
+   step. Require `query-docs` (or require both, in order).
+4. **Seed `mcp_requirements` in `init.sh`.** A missing key must not be a silent
+   opt-out — `## BL-221:` is the same shape one subsystem over.
+5. **Decide the latch deliberately.** `mcp_gate_satisfied` lives in a file the
+   agent can edit, and `5b1a081` already had to fix this file's
+   merge-vs-overwrite behaviour across `/resume`, `/compact` and `/clear`.
+6. **Decide whether the write half is enforced** — see `## BL-231:`. A retrieval
+   requirement with no accumulation requirement is a ratchet with nothing
+   behind it.
+7. **Register the hooks in this repo.** None of this fires in
+   solo-orchestrator; `init.sh` wires it into generated projects only, and the
+   framework repo has no `.claude/settings.json`. The same gap hides the
+   version-check hook.
+
+### The constraint that decides the design
+
+**A gate people cannot satisfy honestly is a gate they delete** (`## BL-149:`).
+Offline work, a session that touches no libraries, a project with no prior
+memory — all are legitimate, and all must have an honest path through.
+
+The model already in the tree is the BL-072 TDD gate: **hard block, with an
+attested escape that must be durably recorded, and a refusal if the record
+cannot be written** (`SOLO_TDD_ATTESTED=1` plus a reason; the commit is refused
+if the attestation cannot be logged). Copy that shape. An escape that leaves no
+trace is the advisory posture this entry exists to replace.
+
+### Proof it must carry
+
+Dual-direction, per requirement, and the failing direction is the one that
+matters:
+- unreachable server ⇒ **RED**; reachable ⇒ GREEN;
+- an **erroring** tool call ⇒ **RED** (this is the test that would have caught
+  today's behaviour, where a call returning *"All connection attempts failed"*
+  satisfied the gate);
+- `resolve-library-id` alone ⇒ **RED**;
+- a tracking file with **no** `mcp_requirements` key ⇒ **RED**, not silently
+  unenforced;
+- deleting the tracking file, or `jq` ⇒ **RED**, not exit 0;
+- and each proof must itself fail if the probe is removed.
+
+**A test that passes because a tool was *called* is this bug, restated in the
+test suite.** That failure mode has appeared five times in one week —
+`## BL-227:` (`jq` exiting 0 having read nothing), a `sed` reporting success
+having edited nothing, a mutant scored as killed that was never applied,
+`## BL-222:` (a clock satisfied by a filename), and this. **An exit code is not
+a receipt.**
+
+**Related:** `## BL-231:` and `## BL-232:` (the two symptoms and their measured
+evidence — read first), `## BL-221:` (missing key ⇒ permissive default),
+`## BL-222:` (a proxy that does not measure the thing), `## BL-112:` and
+`## BL-149:` (the two doctrines that bound the design), `## BL-104:` (the
+`[WARN]`/`issues` mismatch — the label is never the behaviour).

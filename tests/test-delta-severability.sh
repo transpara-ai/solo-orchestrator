@@ -2,18 +2,32 @@
 # tests/test-delta-severability.sh — Delta Track §3.1's severability test.
 #
 # SPEC: docs/designs/2026-08-02-delta-track-v1.md §3.1 ("delete every
-# delta-module file and revert the seam block in process-checklist.sh, and the
+# delta-module file and revert EVERY CORE CONSUMER OF THE MODULE, and the
 # full suite must pass — that is the property 'severable' means operationally;
 # §11-WP7 makes it a test"), §3.3 (the dependency-direction lint this protects),
 # §0.3-C10 (the seam and the single writer are the same file, which is what
 # makes the edge cardinality ONE), §11-WP7.
 #
+# THAT IS THE v1.2 WORDING. Through v1.1 the same sentence SAID "revert the seam
+# block in process-checklist.sh", SINGULAR, and this header quoted it in the
+# present tense for as long as that was true. The old spelling is kept below in
+# the PAST tense rather than deleted, because it is not a stale detail — it is
+# the reason this file has the shape it has. A design that named one consumer is
+# what made enumerating by RUNNING the only trustworthy method; delete the quote
+# and the next reader has no explanation for the banner that follows.
+#
 # ═════════════════════════════════════════════════════════════════════════════
 # THE ENUMERATION IS THE POINT — AND IT IS DONE BY RUNNING, NOT BY REMEMBERING
 #
-# §3.1 says "the seam block in process-checklist.sh", singular. By the time WP7
-# arrived the revert was FOUR core files, and each one arrived in a different
-# work package with its own good reason:
+# §3.1 SAID "the seam block in process-checklist.sh", singular — the v1.0/v1.1
+# wording, and running this test is what refuted it. §3.1 v1.2 now says "revert
+# every core consumer of the module" and carries a consumer table, so the
+# singular is history; it is quoted here in the past tense, and kept, because it
+# is the premise of everything below. A design sentence that named ONE consumer
+# is precisely why this test enumerates by RUNNING rather than by remembering,
+# and the enumeration outran the design twice after that sentence was corrected.
+# By the time WP7 arrived the revert was FOUR core files, and each one arrived
+# in a different work package with its own good reason:
 #
 #   1. scripts/process-checklist.sh   the DELTA-SEAM fence (WP2) — the seam
 #                                     itself, and the only allowlisted edge
@@ -22,12 +36,35 @@
 #   3. scripts/validate.sh            _postmvp_era_assertion + its call site
 #                                     (WP3's §10.1 report-only assertion)
 #   4. scripts/check-maintenance.sh   the cadence policy read (WP6)
+#   5. scripts/resume.sh              the §10.5 fourth branch (WP8) — the
+#                                     `# DELTA-RESUME-BEGIN`/`-END` fence,
+#                                     another core->core seam delegation
+#   6. init.sh                        the WP8 copy list — the
+#                                     `# DELTA-INSTALL-BEGIN`/`-END` fences
+#                                     (TWO of them: the scripts block and the
+#                                     template block) that ship the module to
+#                                     generated projects
+#
+# CONSUMERS 5 AND 6 ARRIVED IN WP8 AND WERE FOUND BY THIS FILE, not by anyone
+# remembering. V1 named both by path the first time the suite ran against the
+# WP8 tree — which is the completeness sweep doing exactly the job the rest of
+# this header claims for it, and is the reason the revert list is allowed to be
+# a list at all.
+#
+# CONSUMER 6 IS A DIFFERENT SHAPE FROM 1-5 AND IS WORTH THE SENTENCE. The
+# scaffolder does not CALL the module; it copies its bytes. It has to name each
+# file literally, because scripts/lib/scaffold-shipped-set.sh derives the
+# shipped set by parsing those cp lines. Post-sever there is nothing to copy, so
+# the fence goes as a whole block — and scripts/lint-delta-boundary.sh accepts
+# it in the intact tree only inside that fence and only for cp/chmod/mkdir
+# statements (its DELTA-BOUNDARY-INSTALLER fence, cardinality one, asserted the
+# same way the seam's is).
 #
 # ...and TWO more that are not scripts at all:
 #
-#   5. .github/workflows/lint.yml    the `delta-boundary-lint` job, which runs
+#   7. .github/workflows/lint.yml    the `delta-boundary-lint` job, which runs
 #                                    scripts/lint-delta-boundary.sh (WP1)
-#   6. tests/full-project-test-suite.sh
+#   8. tests/full-project-test-suite.sh
 #                                    `run_child_suite "scripts/lint-delta-boundary.sh"`
 #                                    — the aggregator invoking the module's
 #                                    lint DIRECTLY, not through a tests/ path
@@ -306,7 +343,26 @@ _drop_fn() {
   return 0
 }
 
-# sever_seam <tree> — STEP 2: THE REVERT. Four core files, enumerated in this
+# _drop_fenced_block <file> <NAME> — remove every `# <NAME>-BEGIN` … `#
+#   <NAME>-END` block, markers included. EVERY pair, not the first: init.sh
+#   carries two DELTA-INSTALL fences (the scripts block and the template
+#   block), and a first-pair-only drop would leave the second one behind for
+#   V1 to find — which is the same "a multi-line construct is dropped as a
+#   construct or not at all" lesson the YAML job and the aggregator call each
+#   taught from their own direction.
+_drop_fenced_block() {
+  local f="$1" name="$2" tmp
+  [ -f "$f" ] || return 0
+  tmp="$(mktemp)"
+  awk -v name="$name" '
+    $0 ~ "^[[:space:]]*#.*" name "-BEGIN" { skip = 1; next }
+    skip == 1 { if ($0 ~ "^[[:space:]]*#.*" name "-END") skip = 0; next }
+    { print }
+  ' "$f" > "$tmp" && mv "$tmp" "$f"
+  return 0
+}
+
+# sever_seam <tree> — STEP 2: THE REVERT. Six core files, enumerated in this
 #   file's header and kept honest by V1's completeness sweep.
 sever_seam() {
   local d="$1" tmp
@@ -328,6 +384,17 @@ sever_seam() {
   tmp="$(mktemp)"
   sed -e 's|^.*# CADENCE-POLICY-READ.*$|    v=""|' "$d/scripts/check-maintenance.sh" > "$tmp" \
     && mv "$tmp" "$d/scripts/check-maintenance.sh"
+  # (5) resume.sh — WP8's §10.5 fourth branch. A whole-block drop like the
+  #     seam's, and for the same reason: the branch is contiguous between its
+  #     markers precisely so that the sever is one operation. Dropping the
+  #     single seam-delegation LINE would leave an `if` whose body reads a
+  #     document nothing produces, which is not a severed greeting — it is a
+  #     branch that always falls through while still claiming to be there.
+  _drop_fenced_block "$d/scripts/resume.sh" "DELTA-RESUME"
+  # (6) the scaffolder — WP8's copy list, BOTH fences. Post-sever there is
+  #     nothing to copy: the module files were deleted in step 1, so a
+  #     surviving cp line is a scaffolder that fails on every run.
+  _drop_fenced_block "$d/$INIT_FILE" "DELTA-INSTALL"
   return 0
 }
 

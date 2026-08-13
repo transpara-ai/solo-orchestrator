@@ -690,6 +690,86 @@ run_child_suite "tests/test-brownfield-wp3-regenerate-path.sh" \
   "Adoption stamp regenerate path (loud detection of an unpreventable loss)" \
   "Adoption WP3 regenerate-path tests FAILED (run tests/test-brownfield-wp3-regenerate-path.sh for details)"
 
+# Brownfield adoption WP4: tests/test-brownfield-wp4-driver.sh — the DRIVER
+# (scripts/adopt-project.sh), the scenario chooser, scenario placement and
+# reverse intake.
+# THREE PROPERTIES CARRY THE WEIGHT AND EACH IS PINNED TWICE.
+# (1) The chooser is Karl's sentence VERBATIM and is a DECISION, not a
+#     phrasing: pinned by STRING EQUALITY against a literal spelled
+#     independently in the suite, again as a whole line of the real
+#     transcript, and — because §4.2 explicitly rejects presenting a guess as
+#     a default for the most consequential answer in the flow — by withholding
+#     the answer and requiring the run to STOP rather than choose.
+# (2) The floor rule is ONE-DIRECTIONAL: both directions are asserted (an
+#     interview that lowers the placement does, one that raises it does not)
+#     and the mutation neuters the floor so the SAME interview raises S2 from
+#     2 to 4.
+# (3) The state-creation order is phase-state -> intake -> manifest because
+#     the failure directions are ASYMMETRIC. Every interruption point is
+#     executed, and the safe row is asserted through BOTH of §8.4's surfaces —
+#     the gate's exit code AND read_enforcement_level — never a label.
+#     Reversing the order makes the unsafe row reachable: a manifest, no
+#     phase-state, and a gate that skips entirely at rc 0.
+# Data classification's non-skippability is asserted THROUGH THE GATE that
+# makes it mechanical: the mutant completes a run without it and the resulting
+# project then FAILS its own Phase 1->2 ZDR backstop, with a positive control
+# so that failure cannot be vacuous. The TDD bound WP3 shipped is proved END TO
+# END on the adopted project, running the project's OWN installed gate, and the
+# blocked direction asserts exit 3 — the BL-072 TDD arm specifically — rather
+# than merely non-zero. Mutants run against a scratch framework MIRROR, so a
+# failure here can never leave this repository mutated. Never invokes the
+# scaffolder (it copies init.sh into the mirror; it does not run it) -> both lanes.
+run_child_suite "tests/test-brownfield-wp4-driver.sh" \
+  "Adoption driver (chooser verbatim, floor rule, reverse intake, fail-safe write order)" \
+  "Adoption WP4 driver tests FAILED (run tests/test-brownfield-wp4-driver.sh for details)"
+
+# Brownfield adoption WP5b: tests/test-brownfield-wp5b-test-debt.sh — the
+# TEST-DEBT LEDGER (.claude/test-debt.json) and its tier ratchet, which is
+# kind (c)'s forward equivalent: the ordering of pre-adoption commits is not a
+# re-runnable fact, so what is enforced instead is that the untested set may
+# not GROW and that a ledgered file which is TOUCHED must leave the set.
+# THE SECOND MUTATION DIRECTION IS THE POINT. Neutering an arm and watching
+# the untested set grow silently is the obvious half. The other half — neuter
+# the TIER FLOOR and watch the arm refuse a `no`-tier project — is the one
+# that usually gets skipped, and a ratchet that blocks a poc_mode project is
+# not a stricter ratchet, it is the shape that makes an operator disable the
+# framework (the false-FAIL doctrine of BL-122/BL-149). Both directions are
+# proved for BOTH arms: M1/M2 neuter the arms, M3/M4 neuter the floor and
+# observe it through each arm's own fixture, M5 promotes the `light` row so
+# the identical WARN becomes a block (the `[WARN]` trap, asserted as an exit
+# code and never as a label).
+# The tier read consumes read_enforcement_level and assert_choosable and
+# RAISES ONLY, so `## BL-221:`'s live fail-open — `.deployment // "personal"`
+# resolving an ABSENT key to the choosable tier — cannot lower anything; M6
+# deletes the key-presence guard and the same manifest buys silence.
+# Never invokes the scaffolder -> both lanes.
+run_child_suite "tests/test-brownfield-wp5b-test-debt.sh" \
+  "Adoption test-debt ledger + tier ratchet (non-growth, touch-repays, both mutation directions)" \
+  "Adoption WP5b test-debt tests FAILED (run tests/test-brownfield-wp5b-test-debt.sh for details)"
+# Brownfield adoption WP6: tests/test-brownfield-wp6-collision-archive.sh — the
+# COLLISION ARCHIVE (§7.2's layout and MANIFEST), the disclosure, the re-add
+# warning and its audit row, and §7.3's archive-secrets refusal.
+# THE SECURITY HALF IS THE POINT. Archiving a `.git/hooks/` file promotes an
+# UNTRACKED file into version control, so adoption can commit a credential that
+# was never committed before. The suite plants a BASE32-valid AWS key in the
+# fixture's pre-commit hook and asserts, IN THIS ORDER: that the plant is live
+# and the scan found it (a dud plant makes every later assertion vacuous — the
+# §6.5 lesson applied to a different surface); that the matching entry refuses
+# to stage while its CLEAN SIBLING in the same archive still commits; and that
+# the plant reaches zero bytes of the committed tree, the MANIFEST, the
+# transcript and the ledger. Every absence has a positive control, including
+# the `git grep HEAD` probe, which must find a token that IS committed.
+# Three mutations: neuter the pre-staging scan (the secret is committed);
+# suppress the re-add audit row (the file is still restored and nothing is
+# recorded — a SILENT re-add); and drift the emitter's type literal by one
+# character, which the REAL T6 predicate — extracted from
+# tests/test-bl029-integration.sh rather than re-typed — must reject.
+# Never invokes the scaffolder (it copies init.sh into a mutation mirror; it
+# does not run it) -> both lanes.
+run_child_suite "tests/test-brownfield-wp6-collision-archive.sh" \
+  "Collision archive (layout, MANIFEST, disclosure, re-add audit, archive-secrets refusal)" \
+  "Adoption WP6 collision-archive tests FAILED (run tests/test-brownfield-wp6-collision-archive.sh for details)"
+
 # ----------------------------------------------------------------
 # TEST 0g: INTAKE WIZARD + RECONFIGURE FIELD HANDLERS
 # ----------------------------------------------------------------
@@ -1106,6 +1186,21 @@ run_child_suite "tests/test-bl144-selfapproval-silent-arms.sh" \
 # with a count floor. Content-pin, hermetic. No init.sh -> both lanes.
 run_child_suite "tests/test-bl147-ci-template-integrity.sh" \
   "tests/test-bl147-ci-template-integrity.sh"
+
+# F-015 (Karl, 2026-08-09 — "Harden it"): the detector-of-the-detector for the
+# bl147 Cw6-strict tamper-pin, which BUG-009's confirm review (R-C1) proved was
+# a blacklist that `|| exit 0` walked straight through. The pin is now an
+# ALLOWLIST at three levels — the phase-gate step (body, keys, if:), the JOB
+# that holds it, and the workflow's on: trigger. This suite drives the REAL
+# bl147 suite against tampered mirrors of the REAL templates and proves SEVEN
+# unenumerated step-level swallow shapes go red, plus review R-F015-1's three
+# level-up cases (job `if: false`, job `if: ${{ …always-false }}`, `on:` gutted
+# to workflow_dispatch — each of which passed all 82 checks at rc=0 before the
+# pins existed); that the ten shipped templates stay green; that an inert
+# comment is still tolerated; and — dual direction, four times — that a neutered
+# verdict lets the tamper through. No init.sh -> both lanes.
+run_child_suite "tests/test-f015-tamper-pin-allowlist.sh" \
+  "tests/test-f015-tamper-pin-allowlist.sh"
 
 # BL-139 (Dogfood-3 F-DF3-004): a subject-less --check-commit-ready no
 # longer presumes feat — framework-gate's pre-commit call cannot know the
@@ -1861,21 +1956,64 @@ run_child_suite "tests/test-delta-wp7-cut-release.sh" \
   "tests/test-delta-wp7-cut-release.sh"
 
 # Delta Track §3.1's SEVERABILITY test (WP7). Builds a real severed tree —
-# every §3.1 module file deleted, the seam reverted in all FOUR core consumers
+# every §3.1 module file deleted and every core consumer of the module reverted
 # — and proves the framework still parses, still behaves, and carries not one
 # dangling reference. The module inventory is READ OUT OF
 # scripts/lint-delta-boundary.sh's own manifest rather than retyped, so the two
-# can never disagree about what "the module" is. §3.1 says the revert is "the
-# seam block in process-checklist.sh", singular; running this test enumerates
-# the real set (process-checklist.sh, upgrade-project.sh, validate.sh,
-# check-maintenance.sh) and V1's completeness sweep is what keeps that list
-# honest when a fifth consumer arrives. The §11-WP7 mutation — delete a module
+# can never disagree about what "the module" is. §3.1 SAID the revert was "the
+# seam block in process-checklist.sh", singular, and by WP7 the real set was
+# four core files (process-checklist.sh, upgrade-project.sh, validate.sh,
+# check-maintenance.sh) — that quote is kept in the past tense because it is
+# WHY this suite delegates the enumeration instead of restating it. Running the
+# test is what produced the real set, and consumers beyond those four were
+# found by V1's completeness sweep rather than by anyone remembering, so the
+# live list is the banner in tests/test-delta-severability.sh and no count is
+# repeated here to go stale. The §11-WP7 mutation — delete a module
 # file but NOT the seam revert — is killed by V1 and ONLY by V1, and m1
 # measures why: every consumer fails soft by design, so the probes stay
 # identical to the intact tree and no functional arm could ever see it.
 # Never executes the init script -> both lanes.
 run_child_suite "tests/test-delta-severability.sh" \
   "tests/test-delta-severability.sh"
+
+# Delta Track WP8 — the three intake paths (§6.1), the brief template (§6.2),
+# identity and the SLUG REFUSAL (§6.3), the manifesto bridge as a read (§10.4),
+# resume.sh's fourth branch (§10.5) — plus Karl's two decisions of 2026-08-09:
+# SHIPPING the module to generated projects (the scaffolder carried the string
+# zero times, so the whole track reached nobody) and writing the hotfix audit
+# trace as a REAL BUGS.md row rather than only a state-document stamp. Because
+# the copy list moves the derived shipped set, this suite also re-runs the
+# source-closure gate and the boundary lint and builds a mutant that drops a cp
+# line to prove that gate is load-bearing. Reads the init script STATICALLY and
+# never executes it (its basename is spelled split for the unit-lane predicate,
+# as tests/test-delta-severability.sh does) -> both lanes.
+run_child_suite "tests/test-delta-wp8-intake.sh" \
+  "tests/test-delta-wp8-intake.sh"
+
+# Delta Track D-B (Karl, 2026-08-09) — THE RELEASE CUT CLOSES THE LEDGER ROWS IT
+# SHIPPED. `delta.sh --open` writes a real row for every class and NOTHING ever
+# flipped one, so every post-1.0 fix left a permanent apparently-open SEV-N row
+# in BUGS.md. Marking it at `--close` was rejected on the merits — close is not
+# ship, and a closed delta has reached nobody — so the flip lives in
+# cut-release.sh's PHASE B, after `shipped_in` and before the tag. Both classes
+# WP8 writes are handled (BUGS.md and FEATURES.md) and the rows under test are
+# written by the PRODUCT, not retyped, so the writer's shape cannot drift away
+# from the closer's matcher with this suite still green. §6.3's hard constraint
+# is asserted structurally: the version rides the EXISTING Fix Reference column,
+# every table row still splits into nine, and the gate's own four `SEV-N.*`
+# greps still read the file. The honesty half is WP8's `_ledger_write` lesson
+# one layer up — the ONLY thing that promotes a row to "closed" is a RE-READ of
+# the file, never the writer's exit code — and the forced-failure arm proves an
+# unwritable ledger is named specifically, claims nothing, and still lets the
+# release complete at rc 12 rather than a clean 0. Mutation-proved (m1-m5, each
+# mutant built, `bash -n`-checked and run): suppress the flip -> the row stays
+# Open -> L1 RED; suppress the honesty arm -> a failed flip reports a clean cut
+# -> F1 RED; promote without re-reading -> a failed flip is CLAIMED -> F1 RED;
+# drop the version append -> the row names no release -> L1 RED; route feature
+# to the wrong ledger -> the block never closes, silently -> L2 RED.
+# Never executes the scaffolder -> both lanes.
+run_child_suite "tests/test-delta-db-ledger-close.sh" \
+  "tests/test-delta-db-ledger-close.sh"
 run_child_suite "tests/test-check-phase-gate.sh" "tests/test-check-phase-gate.sh"
 
 # BL-214 — the gate stalled its own next run. create_gate_snapshot writes into

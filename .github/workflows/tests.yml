@@ -399,6 +399,7 @@ jobs:
             tests/test-bl165-dast-hardened-serve.sh
             tests/test-bl169-gitignore-anchor.sh
             tests/test-bl147-ci-template-integrity.sh
+            tests/test-f015-tamper-pin-allowlist.sh
             tests/test-bl089-doc-foundations.sh
             tests/test-bl137-ci-tools-scope.sh
             tests/test-walk006-ci-protection-scope.sh
@@ -437,6 +438,8 @@ jobs:
             tests/test-delta-wp5-hotfix-retro.sh
             tests/test-delta-wp6-cadence.sh
             tests/test-delta-wp7-cut-release.sh
+            tests/test-delta-wp8-intake.sh
+            tests/test-delta-db-ledger-close.sh
             tests/test-delta-severability.sh
             tests/test-docs-cluster-six-pack.sh
             tests/test-enforcement-level-lib.sh
@@ -510,6 +513,9 @@ jobs:
             tests/test-walk-phase-lifecycle.sh
             tests/test-brownfield-wp2-scout-sections.sh
             tests/test-brownfield-wp3-adoption-arms.sh
+            tests/test-brownfield-wp4-driver.sh
+            tests/test-brownfield-wp5b-test-debt.sh
+            tests/test-brownfield-wp6-collision-archive.sh
             tests/host-drivers/error-translate.test.sh
           )
 
@@ -564,6 +570,47 @@ jobs:
             tests/test-pre-commit-gate-lints.sh        # 122s — runs 4 lint copies inside fixture projects
             tests/test-upgrade-sync-framework.sh       #  37s
             tests/test-plan-staging.sh                 #  34s
+            # ── Re-pinned 2026-08-09, measured from runs 31332638444 (main @
+            #    faffd7a, complement leg 626s/720s) and 31332771622 (WP8 branch,
+            #    complement leg CANCELED at 736s). Nothing failed on that run —
+            #    the cap fired. Per the doctrine above, that is the RE-PIN
+            #    signal, not a reason to raise the cap.
+            tests/test-delta-wp5-hotfix-retro.sh       # 181s — THE long pole of the whole wave, and 3x the next one. It opens and closes deltas dozens of times, and each open now also renders a brief and seeds a ledger row, so it got slower as the feature landed rather than as the test grew
+            tests/test-brownfield-wp1-scout.sh         #  55s — the second pole. Moved WITH the first deliberately: the first alone left the complement leg at ~77% of the cap, which is the same "approaching" state the sast note below was written about, and the complement has taken a new suite in nearly every work package this wave
+            # ── Re-pinned 2026-08-10. Not a long pole in itself — it is the
+            #    GROWTH that moved it. Measured locally: 87s at 125 rows before
+            #    the D-A round-3 work, 118s at 158 rows after (~0.75s/row), and
+            #    the file gained rows in all three adversarial rounds. The
+            #    complement leg was already at 598s/720s on PR #341. A first
+            #    draft of this note called the unpinned landing point "roughly
+            #    10.5m" by adding only the GROWTH to 598s; review corrected it —
+            #    that 598s was measured on MAIN's tree, which carries the 785-line
+            #    pre-branch copy of this file, not the branch's 3379-line one. The
+            #    real landing point is 598 - t(main's copy) + 118, i.e. ~11.2-11.9m
+            #    against the 720s cap. The error ran in the safe direction, but it
+            #    understated the case: this pin is closer to necessary than
+            #    optional. Per the doctrine above, approaching the cap is the
+            #    RE-PIN signal.
+            #    The specific cost of not acting: on this stack a complement
+            #    cancellation ALREADY hid two real CI-only failures once (a
+            #    host-reading probe and a mutant that did not mutate), so a
+            #    timeout here does not merely delay the answer — it replaces a
+            #    red with a cancellation and the failures go unread.
+            tests/test-walk006-ci-protection-scope.sh  # 118s at 158 rows — see note above
+            # ── Re-pinned 2026-08-10, the second time today. The complement is
+            #    at 93% of the cap and the two brownfield suites are why.
+            #    Derived from the shard history rather than a local stopwatch,
+            #    because the pin doctrine is keyed to MEASURED CI TIME and this
+            #    host runs both suites in roughly half:
+            #      PR #343 (neither)          rest = 561s
+            #      PR #344 (+ wp5b)           rest = 606s   → wp5b ~45s
+            #      PR #345 (+ wp5b + wp6)     rest = 667s   → wp6  ~61s
+            #    Moving both: rest ~561s (78%), slow-misc ~584s (81%). Neither
+            #    leg is then the one to watch, which is the point — pinning only
+            #    the larger would have left the complement at 87% and bought one
+            #    work package of headroom.
+            tests/test-brownfield-wp5b-test-debt.sh          #  ~45s in CI (30s local)
+            tests/test-brownfield-wp6-collision-archive.sh   #  ~61s in CI (36s local)
           )
 
           # The ONLY thing that maps a roster name to a pin array. Both the
